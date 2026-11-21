@@ -57,10 +57,10 @@ const STR: Record<string, [string, string]> = {
   sound: ["Sound", "Звук"],
   alsoHere: ["Also play on this device", "Играть звук и на этом устройстве"],
   screen: ["Screen", "Экран"],
-  dim: ["Turn off the Deck screen while mirroring", "Гасить экран Deck при показе"],
+  dim: ["Turn off the Deck screen while mirroring", "Выключать экран Deck при показе"],
   dimOff: [
-    "Goes dark 4 s after the menus close; lights up when you open a menu or stop the mirror",
-    "Гаснет через 4 с после закрытия меню; включается при открытии меню и остановке показа",
+    "The backlight turns off 4 s after the menus close. Press Steam or ··· to turn it on; it also comes back when the mirror stops",
+    "Подсветка выключается через 4 с после закрытия меню. Нажмите Steam или «···», чтобы включить; при остановке показа она включается сама",
   ],
   alsoHereOff: [
     "Off: the Deck stays silent while mirroring",

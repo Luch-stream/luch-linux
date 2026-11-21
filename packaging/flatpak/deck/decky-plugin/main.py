@@ -31,7 +31,7 @@ HELPER_DIR = os.path.join(decky.DECKY_PLUGIN_DIR, "helper")
 _helper = None
 _dimmer_task = None
 
-# The built-in screen goes dark this long after the last Steam menu closed, while a mirror runs.
+# The built-in screen goes off this long after the last Steam menu closed, while a mirror runs.
 DIM_AFTER = 4.0
 CEF = "http://127.0.0.1:8080"
 MENU_WINDOWS = ("QuickAccess", "MainMenu")   # the "···" panel and the Steam button menu
@@ -43,23 +43,18 @@ def _backlight():
 
 
 def _dim(dark: bool):
-    """Backlight to 0 (the picture is still captured), or back to what it was. No-op when already so."""
+    """Backlight off (bl_power 4) or on. The display output stays active, so the picture is still captured.
+    The brightness setting is not touched, so there is nothing to restore after a crash: _main turns it on."""
     bl = _backlight()
-    data = _load()
     if not bl:
         return
+    want = "4" if dark else "0"
     try:
-        if dark and "saved_brightness" not in data:
-            with open(bl + "brightness") as f:
-                data["saved_brightness"] = int(f.read())
-            _save(data)   # remembered on disk: a crash must not leave the screen black
-            with open(bl + "brightness", "w") as f:
-                f.write("0")
-        elif not dark and "saved_brightness" in data:
-            with open(bl + "brightness", "w") as f:
-                f.write(str(data["saved_brightness"]))
-            del data["saved_brightness"]
-            _save(data)
+        with open(bl + "bl_power") as f:
+            if f.read().strip() == want:
+                return
+        with open(bl + "bl_power", "w") as f:
+            f.write(want)
     except OSError as e:
         decky.logger.error(f"backlight: {e}")
 
@@ -101,23 +96,26 @@ async def _menu_open(http):
 
 async def _dim_loop():
     quiet = None
+    mirroring, checked = False, 0.0
     async with aiohttp.ClientSession() as http:
         while True:
             enabled = _load().get("dim_screen", False)
+            now = time.monotonic()
             try:
-                active = enabled and await asyncio.to_thread(_mirroring)
-                if active and not await _menu_open(http):
-                    quiet = quiet or time.monotonic()
-                    if time.monotonic() - quiet >= DIM_AFTER:
+                if enabled and now - checked >= 1.5:   # busctl is the slow part, the menus are polled faster
+                    mirroring, checked = await asyncio.to_thread(_mirroring), now
+                if enabled and mirroring and not await _menu_open(http):
+                    quiet = quiet or now
+                    if now - quiet >= DIM_AFTER:
                         _dim(True)
                 else:
                     quiet = None
                     _dim(False)
             except Exception as e:
-                quiet = None
+                quiet, mirroring = None, False
                 _dim(False)
                 decky.logger.error(f"dimmer: {e}")
-            await asyncio.sleep(1 if enabled else 2)
+            await asyncio.sleep(0.4 if enabled and mirroring else 2 if not enabled else 1)
 
 
 def _busctl(*args, timeout=20):
