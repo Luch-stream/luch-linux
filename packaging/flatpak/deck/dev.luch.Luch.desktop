@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Luch: Steam Deck setup
+Name[ru]=Луч: настройка Steam Deck
+Comment=Install the Luch plugin for Decky Loader and start Luch with your session
+Exec=luch-setup
+Terminal=true
+Icon=video-display
+Categories=Utility;

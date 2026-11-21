@@ -1,0 +1,88 @@
+#!/bin/bash
+# Sets Luch up on a Steam Deck (or another SteamOS-like system with Decky Loader): the Decky plugin with the
+# fast-mode helper, and luchd as a service of your session. What needs root runs on the host through pkexec.
+#   luch-setup            install or update
+#   luch-setup --remove   take everything it installed away
+#   luch-setup --list     what it puts where
+#   luch-setup --dry-run  show what it would do, change nothing
+# If Decky Loader is missing, it is installed first (the plugin cannot run without it), with Decky's own
+# installer, after you confirm.
+set -euo pipefail
+
+DRY=0
+DECKY_INSTALLER=https://github.com/SteamDeckHomebrew/decky-installer/releases/latest/download/install_release.sh
+
+PLUGINS=${DECKY_PLUGINS:-$HOME/homebrew/plugins}
+PLUGIN_DIR=$PLUGINS/Luch
+UNIT=$HOME/.config/systemd/user/luchd-flatpak.service
+
+list() {
+    cat <<EOF
+$PLUGIN_DIR   the Decky Loader plugin and the fast-mode helper (needs root: the folder belongs to Decky)
+$UNIT   starts luchd with your session
+EOF
+}
+
+host() {
+    if [ "$DRY" = 1 ]; then echo "[dry-run] host: $*"; return 0; fi
+    flatpak-spawn --host "$@"
+}
+
+case "${1:-}" in
+    --dry-run) DRY=1 ;;
+    --list) list; exit 0 ;;
+    --remove)
+        host pkexec sh -c "rm -rf '$PLUGIN_DIR'; systemctl restart plugin_loader" || true
+        host sh -c "systemctl --user disable --now luchd-flatpak.service 2>/dev/null; rm -f '$UNIT'; systemctl --user daemon-reload"
+        echo "Luch removed (the Flatpak stays: flatpak uninstall dev.luch.Luch)"
+        exit 0 ;;
+esac
+
+if [ "$DRY" = 1 ] || ! host test -d "$PLUGINS"; then
+    echo "Decky Loader is not installed on this system ($PLUGINS is missing). Luch's plugin needs it."
+    echo "Luch can install it for you with Decky's own installer:"
+    echo "  curl -L $DECKY_INSTALLER | sh     (from github.com/SteamDeckHomebrew, see https://decky.xyz)"
+    if [ "$DRY" = 1 ]; then
+        echo "[dry-run] would ask, then run the installer"
+    else
+        read -r -p "Install Decky Loader now? [y/N] " ans
+        [ "$ans" = y ] || [ "$ans" = Y ] || { echo "Cancelled: without Decky Loader the plugin cannot run."; exit 1; }
+        host sh -c "curl -fsSL '$DECKY_INSTALLER' | sh"
+        host test -d "$PLUGINS" || { echo "Decky Loader did not install ($PLUGINS missing)."; exit 1; }
+    fi
+fi
+
+echo "Luch will put on this system:"; list; echo
+
+# Where this Flatpak lives on the host: the plugin and the helper are copied from there.
+if [ "$DRY" = 1 ]; then LOC="<flatpak location>"; else LOC=$(host flatpak info --show-location dev.luch.Luch); fi
+
+host pkexec sh -c "
+    set -e
+    rm -rf '$PLUGIN_DIR'
+    mkdir -p '$PLUGIN_DIR/helper'
+    cp -a '$LOC/files/share/luch/decky-plugin/.' '$PLUGIN_DIR/'
+    cp -a '$LOC/files/share/luch/helper/.' '$PLUGIN_DIR/helper/'
+    chmod 755 '$PLUGIN_DIR/helper/luch-kms'
+    systemctl restart plugin_loader
+"
+
+host sh -c "
+    set -e
+    mkdir -p \"\$(dirname '$UNIT')\"
+    cat > '$UNIT' <<UNIT
+[Unit]
+Description=Luch sender daemon (Flatpak)
+
+[Service]
+ExecStart=/usr/bin/flatpak run dev.luch.Luch
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+UNIT
+    systemctl --user daemon-reload
+    systemctl --user enable --now luchd-flatpak.service
+"
+
+echo "Done. Open the Quick Access menu (···), the Decky tab, Luch."

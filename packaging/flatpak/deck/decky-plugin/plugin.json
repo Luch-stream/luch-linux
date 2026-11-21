@@ -1,0 +1,11 @@
+{
+  "name": "Luch",
+  "author": "plafonlinux",
+  "flags": ["root"],
+  "api_version": 1,
+  "publish": {
+    "tags": ["streaming", "utility"],
+    "description": "Mirror the Steam Deck screen to a TV or projector with Luch: pick a receiver, a mode and a size from the Quick Access menu.",
+    "image": "https://opengraph.githubassets.com/1/Toxblh/luch-linux"
+  }
+}
