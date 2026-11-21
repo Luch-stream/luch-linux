@@ -43,24 +43,43 @@ def _backlight():
 
 
 def _dim(dark: bool):
-    """Backlight off (bl_power 4) or on. The display output stays active, so the picture is still captured.
-    The brightness setting is not touched, so there is nothing to restore after a crash: _main turns it on."""
+    """Brightness to the minimum, or back to what it was. The display output stays active, so the picture is still
+    captured. The old brightness is kept on disk: a crash must not leave the screen dark (_main puts it back)."""
     bl = _backlight()
     if not bl:
         return
-    want = "4" if dark else "0"
+    data = _load()
     try:
-        with open(bl + "bl_power") as f:
-            if f.read().strip() == want:
-                return
-        with open(bl + "bl_power", "w") as f:
-            f.write(want)
+        if dark and "saved_brightness" not in data:
+            with open(bl + "brightness") as f:
+                data["saved_brightness"] = int(f.read())
+            _save(data)
+            with open(bl + "brightness", "w") as f:
+                f.write("0")
+        elif not dark:
+            if _read(bl + "bl_power") != "0":   # an earlier version switched the backlight power off
+                with open(bl + "bl_power", "w") as f:
+                    f.write("0")
+            if "saved_brightness" in data:
+                with open(bl + "brightness", "w") as f:
+                    f.write(str(data.pop("saved_brightness")))
+                _save(data)
     except OSError as e:
         decky.logger.error(f"backlight: {e}")
 
 
+def _read(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
 def _kill_stale_helpers():
-    """Decky restarts leave the previous run's helper alive (KillMode=process): one helper is enough."""
+    """Decky restarts leave the previous run's helper alive (KillMode=process): one helper is enough.
+    Returns how many were stopped: the streams they carried are gone with them."""
+    n = 0
     exe = os.path.join(HELPER_DIR, "luch-kms")
     for pid in filter(str.isdigit, os.listdir("/proc")):
         try:
@@ -68,8 +87,20 @@ def _kill_stale_helpers():
                 argv = f.read().split(b"\0")
             if argv[0].decode() == exe and b"--serve" in argv:
                 os.kill(int(pid), 15)
+                n += 1
         except (OSError, ValueError):
             pass
+    return n
+
+
+def _stop_all():
+    """End every running session, so the panel does not claim a mirror that no longer exists."""
+    try:
+        for row in _call("Receivers")["data"][0]:
+            if row[7]:
+                _call("StopMirror", "s", row[0])
+    except Exception as e:
+        decky.logger.info(f"stop sessions: {e}")
 
 
 def _mirroring():
@@ -206,7 +237,8 @@ class Plugin:
         _dim(False)   # a screen left dark by a crash comes back
         _dimmer_task = asyncio.create_task(_dim_loop())
         exe = os.path.join(HELPER_DIR, "luch-kms")
-        _kill_stale_helpers()
+        if _kill_stale_helpers():
+            await asyncio.to_thread(_stop_all)
         if os.path.isfile(exe):
             env = dict(os.environ, LD_LIBRARY_PATH=HELPER_DIR)
             _helper = subprocess.Popen([exe, "--serve", SOCKET, "--uid", str(UID)], env=env)
@@ -221,6 +253,7 @@ class Plugin:
             _dimmer_task = None
         _dim(False)
         if _helper:
+            await asyncio.to_thread(_stop_all)
             _helper.terminate()
             _helper = None
         decky.logger.info("Luch plugin unloaded")
