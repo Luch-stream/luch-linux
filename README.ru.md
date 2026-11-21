@@ -24,6 +24,7 @@ Sunshine/Moonlight: служба находит приёмники в локал
 | `luchctl` | Командная строка и интерактивный экран в терминале. |
 | `gnome-extension/` | Переключатель «Луч» в быстрых настройках GNOME Shell. |
 | `docs/dbus.ru.md` | Описание D-Bus API. |
+| `macos/` | Отправитель для macOS: захват ScreenCaptureKit, H.264 или HEVC через VideoToolbox с выбором по взвешенной оценке, системный звук Opus, размер под экран клиента, приложение в меню-баре и `luchctl`. См. [macos/README.md](macos/README.md). |
 
 ![luchctl: приёмники и задержка в реальном времени](docs/img/luchctl.png)
 
