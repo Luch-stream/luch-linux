@@ -87,13 +87,38 @@ const choose = callable("choose");
 const start = callable("start");
 const stop = callable("stop");
 const setLocalAudio = callable("set_local_audio");
-const SOURCE_TITLES = {
-    fast: "Mirror, lowest latency",
-    fast169: "Mirror without bars (16:9)",
-    monitor: "Choose a screen…",
-    window: "One window",
-    virtual: "Second screen",
+// Steam UI language: Russian if the Deck is set to Russian, English otherwise.
+const isRu = (() => {
+    const l = window.LocalizationManager?.m_rgLocalesToUse?.[0] ?? navigator.language ?? "";
+    return /^(ru|russian)/i.test(String(l));
+})();
+const STR = {
+    receivers: ["Receivers", "Приёмники"],
+    none: ["No receivers found on this network.", "В сети не найдено приёмников."],
+    notRunning: [
+        "Luch is not running. Start the luchd service (flatpak run dev.luch.Luch).",
+        "Луч не запущен. Запустите службу luchd (flatpak run dev.luch.Luch).",
+    ],
+    mirroring: ["Mirroring — press to stop", "Идёт показ — нажмите, чтобы остановить"],
+    connected: ["Connected", "Подключён"],
+    mode: ["Mode", "Режим"],
+    size: ["Size", "Размер"],
+    sound: ["Sound", "Звук"],
+    alsoHere: ["Also play on this device", "Играть звук и на этом устройстве"],
+    alsoHereOff: [
+        "Off: the Deck stays silent while mirroring",
+        "Выключено: во время показа Deck молчит",
+    ],
 };
+const t = (k) => STR[k][isRu ? 1 : 0];
+const SOURCE_TITLES = {
+    fast: ["Fast mirror", "Быстрое зеркало"],
+    fast169: ["Mirror 16:9", "Зеркало 16:9"],
+    monitor: ["Pick a screen", "Выбор экрана"],
+    window: ["One window", "Одно окно"],
+    virtual: ["Second screen", "Второй экран"],
+};
+const srcTitle = (v) => SOURCE_TITLES[v]?.[isRu ? 1 : 0] ?? v;
 function Content() {
     const [s, setS] = SP_REACT.useState({ up: false, receivers: [] });
     const refresh = async () => setS(await state());
@@ -103,12 +128,12 @@ function Content() {
         return () => clearInterval(t);
     }, []);
     if (!s.up) {
-        return (window.SP_REACT.createElement(DFL.PanelSection, { title: "Luch" },
-            window.SP_REACT.createElement(DFL.PanelSectionRow, null, "Luch is not running. Start the luchd service (flatpak run dev.luch.Luch).")));
+        return (window.SP_REACT.createElement(DFL.PanelSection, { title: isRu ? "Луч" : "Luch" },
+            window.SP_REACT.createElement(DFL.PanelSectionRow, null, t("notRunning"))));
     }
     return (window.SP_REACT.createElement(window.SP_REACT.Fragment, null,
-        window.SP_REACT.createElement(DFL.PanelSection, { title: "Receivers" },
-            s.receivers.length === 0 && window.SP_REACT.createElement(DFL.PanelSectionRow, null, "No receivers found on this network."),
+        window.SP_REACT.createElement(DFL.PanelSection, { title: t("receivers") },
+            s.receivers.length === 0 && window.SP_REACT.createElement(DFL.PanelSectionRow, null, t("none")),
             s.receivers.map((r) => (window.SP_REACT.createElement("div", { key: r.id },
                 window.SP_REACT.createElement(DFL.PanelSectionRow, null,
                     window.SP_REACT.createElement(DFL.ButtonItem, { layout: "below", onClick: async () => {
@@ -117,29 +142,29 @@ function Content() {
                             else
                                 await start(r.id, r.source, r.size);
                             refresh();
-                        }, description: r.mirroring ? "Mirroring — press to stop" : r.connected ? "Connected" : r.model },
+                        }, description: r.mirroring ? t("mirroring") : r.connected ? t("connected") : r.model },
                         r.mirroring ? "■ " : "▶ ",
                         r.name)),
                 window.SP_REACT.createElement(DFL.PanelSectionRow, null,
-                    window.SP_REACT.createElement(DFL.DropdownItem, { label: "Mode", rgOptions: (s.sources ?? []).map((v) => ({ data: v, label: SOURCE_TITLES[v] ?? v })), selectedOption: r.source, onChange: async (o) => {
+                    window.SP_REACT.createElement(DFL.DropdownItem, { label: t("mode"), rgOptions: (s.sources ?? []).map((v) => ({ data: v, label: srcTitle(v) })), selectedOption: r.source, onChange: async (o) => {
                             await choose(r.id, o.data, r.size);
                             refresh();
                         } })),
                 window.SP_REACT.createElement(DFL.PanelSectionRow, null,
-                    window.SP_REACT.createElement(DFL.DropdownItem, { label: "Size", rgOptions: (s.sizes ?? []).map((v) => ({ data: v, label: v.replace("x", "×") })), selectedOption: r.size, onChange: async (o) => {
+                    window.SP_REACT.createElement(DFL.DropdownItem, { label: t("size"), rgOptions: (s.sizes ?? []).map((v) => ({ data: v, label: v.replace("x", "×") })), selectedOption: r.size, onChange: async (o) => {
                             await choose(r.id, r.source, o.data);
                             refresh();
                         } })))))),
-        window.SP_REACT.createElement(DFL.PanelSection, { title: "Sound" },
+        window.SP_REACT.createElement(DFL.PanelSection, { title: t("sound") },
             window.SP_REACT.createElement(DFL.PanelSectionRow, null,
-                window.SP_REACT.createElement(DFL.ToggleField, { label: "Also play on this device", description: "Off: the Deck stays silent while mirroring", checked: s.local_audio ?? true, onChange: async (on) => {
+                window.SP_REACT.createElement(DFL.ToggleField, { label: t("alsoHere"), description: t("alsoHereOff"), checked: s.local_audio ?? true, onChange: async (on) => {
                         await setLocalAudio(on);
                         refresh();
                     } })))));
 }
 var index = definePlugin(() => ({
     name: "Luch",
-    titleView: window.SP_REACT.createElement("div", { className: DFL.staticClasses.Title }, "Luch"),
+    titleView: window.SP_REACT.createElement("div", { className: DFL.staticClasses.Title }, isRu ? "Луч" : "Luch"),
     content: window.SP_REACT.createElement(Content, null),
     icon: window.SP_REACT.createElement(FaVideo, null),
     onDismount() { },

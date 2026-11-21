@@ -35,13 +35,40 @@ const start = callable<[string, string, string], void>("start");
 const stop = callable<[string], void>("stop");
 const setLocalAudio = callable<[boolean], void>("set_local_audio");
 
-const SOURCE_TITLES: Record<string, string> = {
-  fast: "Mirror, lowest latency",
-  fast169: "Mirror without bars (16:9)",
-  monitor: "Choose a screen…",
-  window: "One window",
-  virtual: "Second screen",
+// Steam UI language: Russian if the Deck is set to Russian, English otherwise.
+const isRu = (() => {
+  const l = (window as any).LocalizationManager?.m_rgLocalesToUse?.[0] ?? navigator.language ?? "";
+  return /^(ru|russian)/i.test(String(l));
+})();
+
+const STR: Record<string, [string, string]> = {
+  receivers: ["Receivers", "Приёмники"],
+  none: ["No receivers found on this network.", "В сети не найдено приёмников."],
+  notRunning: [
+    "Luch is not running. Start the luchd service (flatpak run dev.luch.Luch).",
+    "Луч не запущен. Запустите службу luchd (flatpak run dev.luch.Luch).",
+  ],
+  mirroring: ["Mirroring — press to stop", "Идёт показ — нажмите, чтобы остановить"],
+  connected: ["Connected", "Подключён"],
+  mode: ["Mode", "Режим"],
+  size: ["Size", "Размер"],
+  sound: ["Sound", "Звук"],
+  alsoHere: ["Also play on this device", "Играть звук и на этом устройстве"],
+  alsoHereOff: [
+    "Off: the Deck stays silent while mirroring",
+    "Выключено: во время показа Deck молчит",
+  ],
 };
+const t = (k: string) => STR[k][isRu ? 1 : 0];
+
+const SOURCE_TITLES: Record<string, [string, string]> = {
+  fast: ["Fast mirror", "Быстрое зеркало"],
+  fast169: ["Mirror 16:9", "Зеркало 16:9"],
+  monitor: ["Pick a screen", "Выбор экрана"],
+  window: ["One window", "Одно окно"],
+  virtual: ["Second screen", "Второй экран"],
+};
+const srcTitle = (v: string) => SOURCE_TITLES[v]?.[isRu ? 1 : 0] ?? v;
 
 function Content() {
   const [s, setS] = useState<State>({ up: false, receivers: [] });
@@ -55,9 +82,9 @@ function Content() {
 
   if (!s.up) {
     return (
-      <PanelSection title="Luch">
+      <PanelSection title={isRu ? "Луч" : "Luch"}>
         <PanelSectionRow>
-          Luch is not running. Start the luchd service (flatpak run dev.luch.Luch).
+          {t("notRunning")}
         </PanelSectionRow>
       </PanelSection>
     );
@@ -65,8 +92,8 @@ function Content() {
 
   return (
     <>
-      <PanelSection title="Receivers">
-        {s.receivers.length === 0 && <PanelSectionRow>No receivers found on this network.</PanelSectionRow>}
+      <PanelSection title={t("receivers")}>
+        {s.receivers.length === 0 && <PanelSectionRow>{t("none")}</PanelSectionRow>}
         {s.receivers.map((r) => (
           <div key={r.id}>
             <PanelSectionRow>
@@ -77,7 +104,7 @@ function Content() {
                   else await start(r.id, r.source, r.size);
                   refresh();
                 }}
-                description={r.mirroring ? "Mirroring — press to stop" : r.connected ? "Connected" : r.model}
+                description={r.mirroring ? t("mirroring") : r.connected ? t("connected") : r.model}
               >
                 {r.mirroring ? "■ " : "▶ "}
                 {r.name}
@@ -85,8 +112,8 @@ function Content() {
             </PanelSectionRow>
             <PanelSectionRow>
               <DropdownItem
-                label="Mode"
-                rgOptions={(s.sources ?? []).map((v) => ({ data: v, label: SOURCE_TITLES[v] ?? v }))}
+                label={t("mode")}
+                rgOptions={(s.sources ?? []).map((v) => ({ data: v, label: srcTitle(v) }))}
                 selectedOption={r.source}
                 onChange={async (o) => {
                   await choose(r.id, o.data, r.size);
@@ -96,7 +123,7 @@ function Content() {
             </PanelSectionRow>
             <PanelSectionRow>
               <DropdownItem
-                label="Size"
+                label={t("size")}
                 rgOptions={(s.sizes ?? []).map((v) => ({ data: v, label: v.replace("x", "×") }))}
                 selectedOption={r.size}
                 onChange={async (o) => {
@@ -108,11 +135,11 @@ function Content() {
           </div>
         ))}
       </PanelSection>
-      <PanelSection title="Sound">
+      <PanelSection title={t("sound")}>
         <PanelSectionRow>
           <ToggleField
-            label="Also play on this device"
-            description="Off: the Deck stays silent while mirroring"
+            label={t("alsoHere")}
+            description={t("alsoHereOff")}
             checked={s.local_audio ?? true}
             onChange={async (on) => {
               await setLocalAudio(on);
@@ -127,7 +154,7 @@ function Content() {
 
 export default definePlugin(() => ({
   name: "Luch",
-  titleView: <div className={staticClasses.Title}>Luch</div>,
+  titleView: <div className={staticClasses.Title}>{isRu ? "Луч" : "Luch"}</div>,
   content: <Content />,
   icon: <FaVideo />,
   onDismount() {},
