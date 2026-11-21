@@ -87,6 +87,7 @@ const choose = callable("choose");
 const start = callable("start");
 const stop = callable("stop");
 const setLocalAudio = callable("set_local_audio");
+const setDimScreen = callable("set_dim_screen");
 // Steam UI language: Russian if the Deck is set to Russian, English otherwise.
 const isRu = (() => {
     const l = window.LocalizationManager?.m_rgLocalesToUse?.[0] ?? navigator.language ?? "";
@@ -105,6 +106,12 @@ const STR = {
     size: ["Size", "Размер"],
     sound: ["Sound", "Звук"],
     alsoHere: ["Also play on this device", "Играть звук и на этом устройстве"],
+    screen: ["Screen", "Экран"],
+    dim: ["Turn off the Deck screen while mirroring", "Гасить экран Deck при показе"],
+    dimOff: [
+        "Goes dark 4 s after the menus close; lights up when you open a menu or stop the mirror",
+        "Гаснет через 4 с после закрытия меню; включается при открытии меню и остановке показа",
+    ],
     alsoHereOff: [
         "Off: the Deck stays silent while mirroring",
         "Выключено: во время показа Deck молчит",
@@ -159,6 +166,12 @@ function Content() {
             window.SP_REACT.createElement(DFL.PanelSectionRow, null,
                 window.SP_REACT.createElement(DFL.ToggleField, { label: t("alsoHere"), description: t("alsoHereOff"), checked: s.local_audio ?? true, onChange: async (on) => {
                         await setLocalAudio(on);
+                        refresh();
+                    } }))),
+        window.SP_REACT.createElement(DFL.PanelSection, { title: t("screen") },
+            window.SP_REACT.createElement(DFL.PanelSectionRow, null,
+                window.SP_REACT.createElement(DFL.ToggleField, { label: t("dim"), description: t("dimOff"), checked: s.dim_screen ?? false, onChange: async (on) => {
+                        await setDimScreen(on);
                         refresh();
                     } })))));
 }

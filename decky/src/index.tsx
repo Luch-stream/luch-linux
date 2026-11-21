@@ -27,6 +27,7 @@ type State = {
   sources?: string[];
   sizes?: string[];
   local_audio?: boolean;
+  dim_screen?: boolean;
 };
 
 const state = callable<[], State>("state");
@@ -34,6 +35,7 @@ const choose = callable<[string, string, string], void>("choose");
 const start = callable<[string, string, string], void>("start");
 const stop = callable<[string], void>("stop");
 const setLocalAudio = callable<[boolean], void>("set_local_audio");
+const setDimScreen = callable<[boolean], void>("set_dim_screen");
 
 // Steam UI language: Russian if the Deck is set to Russian, English otherwise.
 const isRu = (() => {
@@ -54,6 +56,12 @@ const STR: Record<string, [string, string]> = {
   size: ["Size", "Размер"],
   sound: ["Sound", "Звук"],
   alsoHere: ["Also play on this device", "Играть звук и на этом устройстве"],
+  screen: ["Screen", "Экран"],
+  dim: ["Turn off the Deck screen while mirroring", "Гасить экран Deck при показе"],
+  dimOff: [
+    "Goes dark 4 s after the menus close; lights up when you open a menu or stop the mirror",
+    "Гаснет через 4 с после закрытия меню; включается при открытии меню и остановке показа",
+  ],
   alsoHereOff: [
     "Off: the Deck stays silent while mirroring",
     "Выключено: во время показа Deck молчит",
@@ -143,6 +151,19 @@ function Content() {
             checked={s.local_audio ?? true}
             onChange={async (on) => {
               await setLocalAudio(on);
+              refresh();
+            }}
+          />
+        </PanelSectionRow>
+      </PanelSection>
+      <PanelSection title={t("screen")}>
+        <PanelSectionRow>
+          <ToggleField
+            label={t("dim")}
+            description={t("dimOff")}
+            checked={s.dim_screen ?? false}
+            onChange={async (on) => {
+              await setDimScreen(on);
               refresh();
             }}
           />
