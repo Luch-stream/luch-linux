@@ -4,5 +4,5 @@
   "description": "Ultra-low-latency screen mirroring to Luch receivers (Android TV) from Quick Settings. Needs luchd from https://github.com/Toxblh/luch-linux.",
   "shell-version": ["46", "47", "48", "49", "50"],
   "url": "https://github.com/Toxblh/luch-linux",
-  "version-name": "0.1.0"
+  "version-name": "0.2.0"
 }

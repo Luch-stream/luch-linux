@@ -34,9 +34,12 @@ Measured on an Intel Arrow Lake laptop → XGIMI MoGo 4 Laser over Wi‑Fi, full
 | `fast` | whole primary monitor from KMS scanout, cursor composited, EGL → NV12 → VA-API (HEVC or H.264, as the receiver's decoder benchmark prefers) | ≈ 5–6 ms |
 | `monitor` | screencast portal (PipeWire, DMA-BUF, zero copy) | ≈ 15–25 ms |
 | `window` | one window through the portal | as `monitor` |
-| `virtual` | extend the desktop: GNOME creates a virtual monitor | as `monitor` |
+| `virtual` | extend the desktop: GNOME creates a monitor at the receiver’s display resolution, to the right | as `monitor` |
 
-Sound (Opus, 5 ms frames) is captured from the default output in every mode. Planned: media mode
+Sound (Opus, 5 ms frames) is captured from the default output in every mode. Any browser with WebCodecs
+(including compatible TV browsers) is also a receiver: open the HTTPS `WebUrl` the daemon serves
+(see `docs/dbus.md`), accept the local certificate and press Watch — handy where no Android receiver
+can be installed. Certificate trust support depends on the TV browser. Planned: media mode
 (send a URL/file and control playback like Chromecast), photo mode, presentation mode with a
 presenter view.
 
@@ -123,6 +126,7 @@ estimated latency. On the TV, press OK on the remote to show the statistics over
 ```sh
 luchctl                                   # interactive: list, f<N> fast, m<N> screen, w<N> window, e<N> extend, s<N> stop
 luchctl list
+luchctl refresh                           # rescan now; updates arrive asynchronously in TUI/watch
 luchctl mirror                            # fast mode; the receiver name is optional when there is only one
 luchctl mirror "XGIMI MoGo 4 Laser" window # or monitor | window | virtual
 luchctl stats                             # live latency, fps, bitrate

@@ -4,6 +4,7 @@ pub const VERSION: u32 = 0;
 pub const RECEIVER_TYPE: &str = "_luch._tcp";
 pub const SENDER_TYPE: &str = "_luchsrc._tcp";
 pub const CONTROL_PORT: u16 = 47800;
+pub const WEB_PORT: u16 = 47801; // built-in browser receiver: page + websocket
 pub const MAX_LINE: usize = 64 * 1024;
 pub const APP: &str = concat!("luchd/", env!("CARGO_PKG_VERSION"));
 

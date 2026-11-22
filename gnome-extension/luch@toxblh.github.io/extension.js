@@ -8,14 +8,17 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import {QuickMenuToggle, SystemIndicator} from 'resource:///org/gnome/shell/ui/quickSettings.js';
+import VirtualCursor from './cursor.js';
 
 const IFACE = `<node>
   <interface name="dev.luch.Luch1">
     <method name="Receivers"><arg type="a(sssssqbb)" direction="out"/></method>
+    <method name="Refresh"/>
     <method name="Mirror"><arg name="id" type="s" direction="in"/><arg name="source" type="s" direction="in"/></method>
     <method name="StopMirror"><arg name="id" type="s" direction="in"/></method>
     <method name="Disconnect"><arg name="id" type="s" direction="in"/></method>
     <method name="Stats"><arg name="id" type="s" direction="in"/><arg type="s" direction="out"/></method>
+    <property name="WebUrl" type="s" access="read"/>
     <signal name="ReceiversChanged"/>
   </interface>
 </node>`;
@@ -37,6 +40,8 @@ const T = RU ? {
     stop: 'Остановить',
     disconnect: 'Отключиться',
     receivers: n => `Приёмников: ${n}`,
+    web: 'Веб-приёмник — откройте в браузере ТВ',
+    webOpen: 'Открыть в браузере этого компьютера',
 } : {
     title: 'Luch',
     header: 'Screen mirroring',
@@ -49,6 +54,8 @@ const T = RU ? {
     stop: 'Stop',
     disconnect: 'Disconnect',
     receivers: n => `${n} receiver${n === 1 ? '' : 's'}`,
+    web: 'Web receiver — open in the TV\u2019s browser',
+    webOpen: 'Open in this computer\u2019s browser',
 };
 
 const LuchToggle = GObject.registerClass(
@@ -65,6 +72,10 @@ class LuchToggle extends QuickMenuToggle {
         this.menu.addMenuItem(this._section);
 
         this.connect('clicked', () => this._onClicked());
+        this._menuId = this.menu.connect('open-state-changed', (_menu, open) => {
+            if (open)
+                this._discover();
+        });
 
         this._proxy = new LuchProxy(Gio.DBus.session, 'dev.luch.Luch1', '/dev/luch/Luch1', (proxy, error) => {
             if (error) {
@@ -72,13 +83,20 @@ class LuchToggle extends QuickMenuToggle {
                 return;
             }
             this._signalId = proxy.connectSignal('ReceiversChanged', () => this._refresh());
-            this._ownerId = proxy.connect('notify::g-name-owner', () => this._refresh());
-            this._refresh();
+            this._ownerId = proxy.connect('notify::g-name-owner', () => this._discover());
+            this._propId = proxy.connect('g-properties-changed', () => this._refresh());
+            this._discover();
         }, null, Gio.DBusProxyFlags.DO_NOT_AUTO_START);
     }
 
     get _mirroring() {
         return this._rows.filter(r => r[7]);
+    }
+
+    _discover() {
+        if (this._proxy?.g_name_owner)
+            this._proxy.RefreshAsync().catch(e => logError(e, 'Luch: refresh discovery'));
+        this._refresh(); // Show the cache immediately; ReceiversChanged supplies new results.
     }
 
     async _refresh() {
@@ -125,6 +143,24 @@ class LuchToggle extends QuickMenuToggle {
             if (connected)
                 add(T.disconnect, () => this._proxy.DisconnectAsync(id));
             this._section.addMenuItem(sub);
+        }
+
+        // Built-in web receiver: the URL for the TV; opening it on the PC is a quick test.
+        const url = this._proxy?.WebUrl ?? '';
+        if (url) {
+            const web = new PopupMenu.PopupSubMenuMenuItem(T.web, true);
+            web.icon.gicon = ICON;
+            web.menu.addAction(T.webOpen, () => {
+                try {
+                    Gio.AppInfo.launch_default_for_uri(url, null);
+                } catch (e) {
+                    logError(e, 'Luch');
+                }
+            });
+            const item = new PopupMenu.PopupMenuItem(url, {reactive: false});
+            item.label.add_style_class_name('monospace');
+            web.menu.addMenuItem(item);
+            this._section.addMenuItem(web);
         }
 
         if (mirroring.length > 0) {
@@ -178,8 +214,12 @@ class LuchToggle extends QuickMenuToggle {
 
     destroy() {
         this._stopStats();
+        if (this._menuId)
+            this.menu.disconnect(this._menuId);
         if (this._signalId)
             this._proxy.disconnectSignal(this._signalId);
+        if (this._propId)
+            this._proxy.disconnect(this._propId);
         if (this._ownerId)
             this._proxy.disconnect(this._ownerId);
         this._proxy = null;
@@ -210,9 +250,12 @@ export default class LuchExtension extends Extension {
         ICON = Gio.icon_new_for_string(`${this.path}/luch-symbolic.svg`);
         this._indicator = new LuchIndicator();
         Main.panel.statusArea.quickSettings.addExternalIndicator(this._indicator);
+        this._cursor = new VirtualCursor();
     }
 
     disable() {
+        this._cursor?.destroy();
+        this._cursor = null;
         this._indicator?.destroy();
         this._indicator = null;
         ICON = null;

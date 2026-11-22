@@ -17,6 +17,11 @@ Receivers seen only on point-to-point links (VPN tunnels) are ignored. If one ap
 interfaces, the one on the main LAN interface wins. Every socket to a receiver is bound to the
 interface it was discovered on, so a full-tunnel VPN never carries the stream.
 
+Avahi's `ItemNew`/`ItemRemove` events drive the list. Every minute the daemon re-enumerates
+the advertised services and resolves their SRV/TXT/address records again, including previous
+timeouts. A temporary resolution failure preserves the last known receiver; `ItemRemove`
+removes it and cancels any pending lookup.
+
 ## Methods
 
 ### `Receivers() → a(sssssqbb)`
@@ -34,12 +39,24 @@ Returns every known receiver as a tuple:
 | 6 | `b` | a control channel is open |
 | 7 | `b` | mirroring is running |
 
+### `Refresh()`
+
+Requests an immediate Avahi rescan and resolution of advertised services. Returns immediately;
+read `Receivers()` for the current cache and listen for `ReceiversChanged()` for updates.
+Overlapping requests share in-flight lookups. This does not connect to receivers or interrupt
+active streams. The GNOME menu calls it when opened; the TUI calls it on entry and on `r`/Enter.
+The CLI also exposes `luchctl refresh`.
+
 ### `Connect(s id) → s`
 
 Opens the control channel (TCP, JSON lines) and keeps it alive with a ping every second.
 Returns the receiver's `welcome` message as a JSON string: decoders, maximum size, hardware
 passport (`hw`) and decoder benchmark (`bench`). `Mirror` connects by itself, so calling this is
 optional.
+
+Before connecting, resolves the selected receiver again to obtain its current address and port,
+sharing an existing lookup if one is running. A resolution error fails the connection attempt
+but keeps the last known entry in the list.
 
 Errors: `org.freedesktop.DBus.Error.InvalidArgs` for an unknown id, `org.freedesktop.DBus.Error.Failed`
 if already connected or the handshake fails.
@@ -58,13 +75,46 @@ up. `source` selects how the screen is captured:
 | `fast` | KMS scanout via the `luch-kms` helper, EGL→NV12, VA-API encode | lowest (≈5–6 ms on the sender) | whole primary monitor; `luch-kms` needs `CAP_SYS_ADMIN` |
 | `monitor` | screencast portal (PipeWire, DMA-BUF) | ≈15–25 ms on the sender | GNOME asks which screen once, then remembers it |
 | `window` | screencast portal | as `monitor` | a single window |
-| `virtual` | screencast portal, virtual monitor | as `monitor` | extends the desktop with a new display |
+| `virtual` | screencast portal, virtual monitor | as `monitor` | extends the desktop with a new display. Under Niri with virtual outputs (`niri-virtual`): a headless output of exactly the stream size is created for the session and removed afterwards, recorded through Niri's ScreenCast without a picker |
+| `fast169` | as `fast` | as `fast` | Niri only: the monitor is switched to a 16:9 mode (the closest one at least as wide as the stream) for the session and restored afterwards, also after a `luchd` crash or restart; no letterbox, no scaling |
 
 The codec follows the receiver's decoder benchmark (`welcome.bench.prefer`): HEVC when it is
 faster there, otherwise H.264. Audio (Opus, 5 ms frames) is captured from the default output's
 monitor in every mode.
 
+In `virtual` mode, the receiver’s display size is used for the virtual monitor, capture and
+encoded stream. Android receivers supply physical display modes (`hw.display.modes`, the largest
+resolution wins); browser receivers supply screen dimensions in physical pixels. Decoder `max`
+is not used as the display size. Older receivers without display information fall back to
+1920×1080; NV12 dimensions are rounded down to even pixels. GNOME places the new monitor to the
+right of the rightmost active monitor, aligned at its top edge, using a temporary configuration.
+The GNOME extension draws the real cursor texture over this monitor to work around missing
+cursor repaints in Mutter, while keeping capture and encoding on the GPU. The stream stats
+identify this connector as `sender.virtual_monitor` (null for other capture modes).
+GNOME 50 still labels portal-created monitors `MetaVendor`: its API has no display-name setter.
+
 Errors: `InvalidArgs` for a bad `source` or unknown id, `Failed` if already mirroring.
+
+While a session runs, `luchd` holds `org.freedesktop.ScreenSaver.Inhibit` (KDE, GNOME and Steam answer it), so the
+screen does not go to sleep under the stream: a sleeping screen has nothing to capture. Nothing happens where nothing
+answers that interface.
+
+### `MirrorSized(s id, s source, u width, u height)`
+
+Like `Mirror`, with the stream size in pixels (even numbers, 320x240 to 7680x4320). `Mirror` is
+`MirrorSized` with 0x0, which means the default size (`LUCH_SIZE` when set; otherwise the receiver’s native display size for `virtual`, 1920x1080 for other modes). The video bitrate grows with the square root of the pixel count (4K gets
+twice the 1080p rate). The sizes a receiver can show are in `welcome.hw.display.modes` and
+`welcome.hw.video`; a receiver's decoder may not keep up with 4K at 60 fps, so check `Stats`.
+
+### `Sources() → as`
+
+Capture sources usable on this machine, best first: `fast` (only when `luch-kms` is installed),
+`fast169` (Niri), `virtual` (Niri with virtual outputs, otherwise the portal one), `monitor`, `window`. Front-ends should offer just these.
+
+### `Capabilities(s id) → s`
+
+The receiver's last `welcome` as JSON (`hw`, `bench`, decoders), `{}` until the control channel has
+been opened once (`Connect` or `Mirror`). It never connects by itself.
 
 ### `StopMirror(s id)`
 
@@ -93,15 +143,43 @@ The same sender numbers are sent to the receiver (`sender_stats`) for its on-scr
 
 ### `ReceiversChanged()`
 
-Emitted when a receiver appears or disappears, or a connection or mirroring session starts or ends.
+Emitted when a receiver appears, disappears or changes its metadata, or a connection or mirroring session starts or ends.
 Call `Receivers()` again to get the new state.
 
 ## Properties
+
+### `LocalAudio` (`b`, read/write, default `true`)
+
+Whether the sender keeps playing sound itself while mirroring. Set to `false`: while a session runs, the
+sender's sound goes to a null sink (`luch_cast`), `luchd` records its monitor, the receiver plays it and the
+sender stays silent (no echo with the receiver, no Bluetooth delay or A2DP artefacts). The default sink and the
+streams that were on it are put back when the session ends, and after a crash on the next `luchd` start. It
+applies at once to a running session. Saved in `~/.config/luch/local-audio`. Needs `pactl`; without it nothing changes.
 
 ### `SenderId` (`s`, read)
 
 This machine's id (UUID kept in `~/.config/luch/id`). It is also announced as `_luchsrc._tcp`, so
 receivers can show which senders are nearby.
+
+### `WebUrl` (`s`, read)
+
+`https://<lan-ip>:47801/` — the built-in web receiver, or an empty string with no default route.
+Open it in any browser with WebCodecs (a TV browser will do); the page connects back over a
+secure websocket, appears in `Receivers()` like any other receiver and starts mirroring after pressing Watch
+(add `?mode=none` to stay manual, `?mode=monitor|window|virtual` to pick the source).
+
+HTTPS runs locally without a domain or internet access. On first opening, the browser warns about
+the self-signed certificate; proceed if the browser allows it. Some browsers require importing the
+certificate as trusted before enabling WebCodecs; if the TV cannot do that, use the Android receiver.
+Plain LAN HTTP cannot enable WebCodecs and redirects to HTTPS.
+The certificate and private key live in `~/.config/luch/web-cert.pem` and `web-key.pem`
+(or `$XDG_CONFIG_HOME/luch/`). The key is owner-only. The certificate survives restarts; connecting
+through a new IP reissues it with the same key, so the browser may ask for trust again.
+To check the certificate fingerprint on the laptop:
+
+```sh
+openssl x509 -in "${XDG_CONFIG_HOME:-$HOME/.config}/luch/web-cert.pem" -noout -fingerprint -sha256
+```
 
 ## Examples
 
@@ -133,5 +211,6 @@ proxy.connectSignal('ReceiversChanged', () => { /* refresh */ });
 |-----------------|---------|
 | `~/.config/luch/id` | sender id |
 | `~/.config/luch/restore-token` | screencast portal restore token (no picker after the first time) |
+| `LUCH_KMS_SOCKET` | a privileged `luch-kms --serve SOCKET [--uid N]` that `luchd` uses for the `fast` mode instead of running `luch-kms` itself (default `$XDG_RUNTIME_DIR/luch/kms.sock`, used when it exists): for a `luchd` in a sandbox (Flatpak), where file capabilities do not work. The socket is owned by `--uid`, mode 0600 |
 | `LUCH_KMS_CARD`, `LUCH_KMS_RENDER` | DRM card and render node for `luch-kms` (default `/dev/dri/card1`, `/dev/dri/renderD128`) |
 | `LUCH_PROBE=1` | per-stage latency probes in the `luchd` log |
