@@ -1,4 +1,4 @@
-const manifest = {"name":"Luch"};
+const manifest = {"name":"Luch Streaming"};
 const API_VERSION = 2;
 const internalAPIConnection = window.__DECKY_SECRET_INTERNALS_DO_NOT_USE_OR_YOU_WILL_BE_FIRED_deckyLoaderAPIInit;
 if (!internalAPIConnection) {
@@ -324,7 +324,15 @@ function Content() {
     // the mode, codec and size of a receiver are folded away until its arrow is pressed
     const [open, setOpen] = SP_REACT.useState({});
     const [qrOpen, setQrOpen] = SP_REACT.useState(false);
-    const refresh = async () => setS(await state());
+    // a failed call counts as "down" too, so that the start timer (and the Start button after it) still runs
+    const refresh = async () => {
+        try {
+            setS(await state());
+        }
+        catch {
+            setS({ up: false, receivers: [] });
+        }
+    };
     SP_REACT.useEffect(() => {
         refresh();
         const t = setInterval(refresh, 2000);

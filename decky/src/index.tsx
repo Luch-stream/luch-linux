@@ -82,7 +82,14 @@ function Content() {
   const [open, setOpen] = useState<Record<string, boolean>>({});
   const [qrOpen, setQrOpen] = useState(false);
 
-  const refresh = async () => setS(await state());
+  // a failed call counts as "down" too, so that the start timer (and the Start button after it) still runs
+  const refresh = async () => {
+    try {
+      setS(await state());
+    } catch {
+      setS({ up: false, receivers: [] });
+    }
+  };
   useEffect(() => {
     refresh();
     const t = setInterval(refresh, 2000);
