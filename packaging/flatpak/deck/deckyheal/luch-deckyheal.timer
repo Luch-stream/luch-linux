@@ -1,0 +1,9 @@
+[Unit]
+Description=Luch Decky self-heal check
+
+[Timer]
+OnBootSec=90
+OnUnitInactiveSec=15min
+
+[Install]
+WantedBy=timers.target

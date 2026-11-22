@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Install Luch
+Name[ru]=Установить Луч
+Comment=Downloads and installs Luch (the screen and sound of this Steam Deck on a TV, projector or phone)
+Comment[ru]=Скачивает и устанавливает Луч (экран и звук Steam Deck на ТВ, проектор или телефон)
+Exec=sh -c "(curl -fsSL -m 30 https://altlinux.space/plafonlinux/luch-linux/releases/download/deck-latest/install.sh || curl -fsSL -m 30 https://github.com/plafonlinux/luch-linux/releases/download/deck-latest/install.sh) | bash"
+Icon=system-software-install
+Terminal=false
+Categories=Utility;

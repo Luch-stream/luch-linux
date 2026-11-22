@@ -5,12 +5,11 @@
 #   luch-setup --remove   take everything it installed away
 #   luch-setup --list     what it puts where
 #   luch-setup --dry-run  show what it would do, change nothing
-# If Decky Loader is missing, it is installed first (the plugin cannot run without it), with Decky's own
-# installer, after you confirm; an outdated loader is offered an update the same way.
+# Decky Loader is installed if missing and updated if outdated, with Decky's own installer. Besides, luch-deckyheal
+# (a root timer it sets up) puts the plugin back and restarts or reinstalls Decky Loader if an update breaks them.
 set -euo pipefail
 
 DRY=0
-DECKY_INSTALLER=https://github.com/SteamDeckHomebrew/decky-installer/releases/latest/download/install_release.sh
 
 PLUGINS=${DECKY_PLUGINS:-$HOME/homebrew/plugins}
 PLUGIN_DIR=$PLUGINS/Luch
@@ -20,6 +19,9 @@ list() {
     cat <<EOF
 $PLUGIN_DIR   the Decky Loader plugin and the fast-mode helper (needs root: the folder belongs to Decky)
 $UNIT   starts luchd with your session
+~/.local/share/plasma/plasmoids/toxblh.luch.panel   the Luch widget for the system tray (a popup to pick the receiver and the mode)
+/etc/systemd/system/luch-deckyheal.{service,timer}, /var/lib/luch/, /etc/luch/   the self-heal: at boot and every 15 minutes it
+    puts the plugin back and restarts or reinstalls Decky Loader if an update broke them (journalctl -u luch-deckyheal)
 EOF
 }
 
@@ -28,74 +30,263 @@ host() {
     flatpak-spawn --host "$@"
 }
 
+# Started from the application menu (no terminal): a native KDE window (kdialog) shows the progress, after the password
+# dialog. In a terminal the same progress is drawn as an animation.
+MODE=direct
+[ -t 1 ] || [ $# -ne 0 ] || MODE=menu
+
 case "${1:-}" in
     --dry-run) DRY=1 ;;
     --list) list; exit 0 ;;
     --remove)
-        host pkexec sh -c "rm -rf '$PLUGIN_DIR'; systemctl restart plugin_loader" || true
-        host sh -c "systemctl --user disable --now luchd-flatpak.service 2>/dev/null; rm -f '$UNIT'; systemctl --user daemon-reload"
-        echo "Luch removed (the Flatpak stays: flatpak uninstall dev.luch.Luch)"
+        host pkexec sh -c "systemctl disable --now luch-deckyheal.timer 2>/dev/null; rm -rf /etc/systemd/system/luch-deckyheal.service /etc/systemd/system/luch-deckyheal.timer /etc/luch /var/lib/luch; systemctl daemon-reload; rm -rf '$PLUGIN_DIR'; systemctl restart plugin_loader" || true
+        host sh -c "systemctl --user disable --now luchd-flatpak.service 2>/dev/null; rm -f '$UNIT'; systemctl --user daemon-reload
+            rm -rf \$HOME/.local/share/plasma/plasmoids/toxblh.luch.panel
+            qdbus6 org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript 'for (var p of panels()) for (var w of p.widgets()) if (w.type==\"org.kde.plasma.systemtray\") { w.currentConfigGroup=[\"General\"]; [\"extraItems\",\"shownItems\",\"hiddenItems\"].forEach(function(k){ var a=w.readConfig(k).toString().split(\",\").filter(function(i){ return i!=\"toxblh.luch.panel\" && i!=\"toxblh.luch.Luch\" && i!=\"toxblh.luch.Luch.desktop\" }); w.writeConfig(k, a.join(\",\")) }); w.reloadConfig() }' >/dev/null 2>&1; true"
+        echo "Luch removed (the Flatpak stays: flatpak uninstall toxblh.luch.Luch)"
         exit 0 ;;
 esac
 
-if [ "$DRY" = 1 ] || ! host test -d "$PLUGINS"; then
-    echo "Decky Loader is not installed on this system ($PLUGINS is missing). Luch's plugin needs it."
-    echo "Luch can install it for you with Decky's own installer:"
-    echo "  curl -L $DECKY_INSTALLER | sh     (from github.com/SteamDeckHomebrew, see https://decky.xyz)"
-    if [ "$DRY" = 1 ]; then
-        echo "[dry-run] would ask, then run the installer"
-    else
-        read -r -p "Install Decky Loader now? [y/N] " ans
-        [ "$ans" = y ] || [ "$ans" = Y ] || { echo "Cancelled: without Decky Loader the plugin cannot run."; exit 1; }
-        host sh -c "curl -fsSL '$DECKY_INSTALLER' | sh"
-        host test -d "$PLUGINS" || { echo "Decky Loader did not install ($PLUGINS missing)."; exit 1; }
-    fi
+# --- the install itself, with a progress screen ---------------------------------------------------------------------
+case "${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}" in ru*) RU=1 ;; *) RU=0 ;; esac
+export LC_ALL=C.UTF-8
+t() { if [ "$RU" = 1 ]; then echo "$2"; else echo "$1"; fi; }
+TITLE=$(t "Installing Luch on your Steam Deck" "Установка Луча на ваш Steam Deck")
+DONE_MSG=$(t "Luch is installed and ready to use" "Луч успешно установлен и готов к работе")
+STAGES=("$(t 'Updating Decky Loader' 'Обновление DeckyLoader')" "$(t 'Installing the plugin' 'Установка плагина')"
+        "$(t 'Installing Luch' 'Установка Луча')" "$(t 'Checking that it works' 'Проверка работоспособности')")
+
+if [ "$DRY" = 1 ]; then
+    echo "[dry-run] would install Decky Loader if missing, or update it if a newer release exists (ALS mirror, then GitHub)"
+    echo "Luch will put on this system:"; list; exit 0
 fi
 
-# An old Decky Loader can stop injecting its interface into a newer Steam client (v3.2.6 did): the plugin is
-# loaded by the loader, yet no Decky tab appears. If a newer release exists, offer the update (same installer).
-if [ "$DRY" != 1 ]; then
-    cur=$(host cat "$HOME/homebrew/services/.loader.version" 2>/dev/null || true)
-    new=$(curl -fsSL --max-time 15 https://api.github.com/repos/SteamDeckHomebrew/decky-loader/releases/latest 2>/dev/null |
-        sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -n1 || true)
-    if [ -n "$cur" ] && [ -n "$new" ] && [ "$cur" != "$new" ]; then
-        echo "Decky Loader $cur is installed, $new is available. An old loader may not show plugins in a new Steam client."
-        read -r -p "Update Decky Loader to $new now? [y/N] " ans
-        if [ "$ans" = y ] || [ "$ans" = Y ]; then host sh -c "curl -fsSL '$DECKY_INSTALLER' | sh"; fi
-    fi
-fi
+LOG=${XDG_CACHE_HOME:-$HOME/.cache}/luch-setup.log
+mkdir -p "$(dirname "$LOG")"; : > "$LOG"
+STF=${XDG_RUNTIME_DIR:-/tmp}/luch-setup.progress
+LOC=$(host flatpak info --show-location toxblh.luch.Luch)
+USER_NAME=$(id -un)
+LOGO="$LOC/files/share/luch/luch.png"
+# The dialogs show the Luch icon by name; the session may not look in the Flatpak exports yet, so tell kdialog where they are.
+kd() { host env XDG_DATA_DIRS="$HOME/.local/share/flatpak/exports/share:/var/lib/flatpak/exports/share:/usr/local/share:/usr/share" kdialog --icon toxblh.luch.Luch "$@"; }
 
-echo "Luch will put on this system:"; list; echo
+cur=$(host cat "$HOME/homebrew/services/.loader.version" 2>/dev/null || true)
+new=$(host env LUCH_USER="$USER_NAME" bash "$LOC/files/share/luch/deckyheal/luch-decky-install.sh" latest 2>/dev/null || true)
+need_decky=0
+if [ -z "$cur" ] || ! host test -d "$PLUGINS" || { [ -n "$new" ] && [ "$cur" != "$new" ]; }; then need_decky=1; fi
 
-# Where this Flatpak lives on the host: the plugin and the helper are copied from there.
-if [ "$DRY" = 1 ]; then LOC="<flatpak location>"; else LOC=$(host flatpak info --show-location dev.luch.Luch); fi
-
-host pkexec sh -c "
+# All the root work is one pkexec (one password prompt). It prints a line after each stage it finishes.
+ROOT_SCRIPT="
     set -e
+    echo start
+    mkdir -p /var/lib/luch /etc/luch
+    install -m755 '$LOC/files/share/luch/deckyheal/luch-decky-install.sh' /var/lib/luch/luch-decky-install.sh
+    if [ $need_decky = 1 ]; then LUCH_USER='$USER_NAME' /var/lib/luch/luch-decky-install.sh; fi
+    echo decky
     rm -rf '$PLUGIN_DIR'
-    mkdir -p '$PLUGIN_DIR/helper'
+    mkdir -p '$PLUGIN_DIR/helper' /var/lib/luch /etc/luch
     cp -a '$LOC/files/share/luch/decky-plugin/.' '$PLUGIN_DIR/'
     cp -a '$LOC/files/share/luch/helper/.' '$PLUGIN_DIR/helper/'
     chmod 755 '$PLUGIN_DIR/helper/luch-kms'
+    rm -rf /var/lib/luch/plugin; cp -a '$PLUGIN_DIR' /var/lib/luch/plugin
+    install -m755 '$LOC/files/share/luch/deckyheal/luch-deckyheal.sh' /var/lib/luch/luch-deckyheal.sh
+    install -m644 '$LOC/files/share/luch/deckyheal/luch-deckyheal.service' '$LOC/files/share/luch/deckyheal/luch-deckyheal.timer' /etc/systemd/system/
+    echo 'LUCH_USER=$USER_NAME' > /etc/luch/heal.conf
+    systemctl daemon-reload; systemctl enable --now luch-deckyheal.timer
     systemctl restart plugin_loader
+    echo plugin
 "
 
-host sh -c "
-    set -e
-    mkdir -p \"\$(dirname '$UNIT')\"
-    cat > '$UNIT' <<UNIT
+user_part() {
+    host sh -c "
+        set -e
+        # the app used to be called dev.luch.Luch: stop it and take it away so that two daemons do not fight for the bus name
+        systemctl --user stop luchd-flatpak.service 2>/dev/null || true
+        flatpak uninstall --user -y dev.luch.Luch >/dev/null 2>&1 || true
+        mkdir -p \"\$(dirname '$UNIT')\"
+        cat > '$UNIT' <<UNIT
 [Unit]
 Description=Luch sender daemon (Flatpak)
 
 [Service]
-ExecStart=/usr/bin/flatpak run dev.luch.Luch
+ExecStartPre=-/usr/bin/pkill -x luchd
+ExecStart=/usr/bin/flatpak run toxblh.luch.Luch
+ExecStop=-/usr/bin/pkill -x luchd
 Restart=on-failure
 
 [Install]
 WantedBy=default.target
 UNIT
-    systemctl --user daemon-reload
-    systemctl --user enable --now luchd-flatpak.service
-"
+        systemctl --user daemon-reload
+        systemctl --user enable --now luchd-flatpak.service
+        # The Luch widget for the system tray (Plasma): the package, then the tray settings (shown always; the entry
+        # Plasma makes by itself for the background daemon is hidden, the widget replaces it). Plasma restarts only when the tray changed.
+        W=\$HOME/.local/share/plasma/plasmoids/toxblh.luch.panel
+        rm -rf \$W; mkdir -p \$W; cp -a '$LOC/files/share/luch/plasmoid/.' \$W/
+        changed=\$(qdbus6 org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell.evaluateScript 'var c=\"no\"; for (var p of panels()) for (var w of p.widgets()) if (w.type==\"org.kde.plasma.systemtray\") { w.currentConfigGroup=[\"General\"]; [[\"extraItems\",\"toxblh.luch.panel\"],[\"shownItems\",\"toxblh.luch.panel\"],[\"hiddenItems\",\"toxblh.luch.Luch\"],[\"hiddenItems\",\"toxblh.luch.Luch.desktop\"]].forEach(function(kv){ var v=w.readConfig(kv[0]).toString(); var a=v==\"\"?[]:v.split(\",\"); if (a.indexOf(kv[1])<0) { a.push(kv[1]); w.writeConfig(kv[0], a.join(\",\")); c=\"yes\" } }); w.reloadConfig() } print(c)' 2>/dev/null) || true
+        [ \"\$changed\" = yes ] && systemctl --user restart plasma-plasmashell.service || true
+    "
+}
 
-echo "Done. Open the Quick Access menu (···), the Decky tab, Luch."
+verify() {
+    host sh -c '
+        for i in $(seq 1 20); do
+            systemctl is-active --quiet plugin_loader &&
+                busctl --user call dev.luch.Luch1 /dev/luch/Luch1 dev.luch.Luch1 Receivers >/dev/null 2>&1 && exit 0
+            sleep 1
+        done; exit 1'
+}
+
+# --- screen: the colours of the Luch site, light or dark like the system ---
+# One frame is built in a variable and written in one go (no flicker); no subshells in the loop.
+hexc() { printf -v "$1" '\e[%d;2;%d;%d;%dm' "$2" $((16#${3:0:2})) $((16#${3:2:2})) $((16#${3:4:2})); }
+THEME=
+set_theme() { # dark | light: the same tokens as the site (src/css/01-theme.css)
+    [ "$1" = "$THEME" ] && return 1
+    THEME=$1
+    local bg txt mut acc line g1 g2 i r g b
+    if [ "$1" = light ]; then bg=fbf6ea txt=231a3a mut=5b5675 acc=b85a0c line=e3d8bd g1=ff8f3a g2=b85a0c
+    else bg=151b36 txt=f3eee2 mut=aab3d4 acc=ffb547 line=38406a g1=ff8f3a g2=ffd98a; fi
+    hexc C_BG 48 $bg; hexc C_TXT 38 $txt; hexc C_MUT 38 $mut; hexc C_ACC 38 $acc; hexc C_LINE 38 $line
+    OFF=$'\e[0m'$C_BG$C_TXT; BOLD=$'\e[1m'
+    BAR_ON=(); for ((i = 0; i < 30; i++)); do
+        r=$(( 16#${g1:0:2} + (16#${g2:0:2} - 16#${g1:0:2}) * i / 29 )); g=$(( 16#${g1:2:2} + (16#${g2:2:2} - 16#${g1:2:2}) * i / 29 ))
+        b=$(( 16#${g1:4:2} + (16#${g2:4:2} - 16#${g1:4:2}) * i / 29 ))
+        BAR_ON+=("$(printf '\e[38;2;%d;%d;%dm█' $r $g $b)")
+    done
+    return 0
+}
+# The system's choice: the desktop portal's color-scheme (1 = dark, 2 = light), else the Plasma window colour.
+system_theme() {
+    local v bgrgb
+    v=$(host busctl --user call org.freedesktop.portal.Desktop /org/freedesktop/portal/desktop \
+        org.freedesktop.portal.Settings Read ss org.freedesktop.appearance color-scheme 2>/dev/null | grep -o '[0-9]*$')
+    case "$v" in 1) echo dark; return ;; 2) echo light; return ;; esac
+    bgrgb=$(host sed -n '/^\[Colors:Window\]/,/^\[/{s/^BackgroundNormal=//p}' "$HOME/.config/kdeglobals" 2>/dev/null | head -n1)
+    if [ -n "$bgrgb" ] && [ "${bgrgb%%,*}" -gt 140 ] 2>/dev/null; then echo light; else echo dark; fi
+}
+FRAMES=(⠋ ⠙ ⠹ ⠸ ⠼ ⠴ ⠦ ⠧ ⠇ ⠏)
+tty=0; [ -t 1 ] && tty=1
+cleanup() { [ $tty = 1 ] && printf '\e[0m\e[?25h\n'; rm -f "$STF"; }
+trap cleanup EXIT
+ROWS=24; COLS=80
+size() { local r c; read -r r c < <(stty size 2>/dev/null) && ROWS=$r COLS=$c || true; }
+size; trap 'size; repaint' WINCH
+repaint() { [ $tty = 1 ] && printf '%s\e[2J' "$OFF"; }
+[ $tty = 1 ] && set_theme "$(system_theme)"
+[ $tty = 1 ] && { printf '\e[?25l'; repaint; }
+
+# The kdialog progress window: the stage list as the label, the bar as the value (updated over D-Bus, only when it changes).
+GREF=; GST=; GPCT=
+gui_text() { # $1 = stage; rich text: the Luch logo on the left, the heading and the stage list on the right
+    local i rows=
+    for ((i = 0; i < 4; i++)); do
+        if [ $i -lt $1 ]; then rows+="<tr><td>✓</td><td>${STAGES[$i]}</td></tr>"
+        elif [ $i -eq $1 ]; then rows+="<tr><td>▶</td><td><b>${STAGES[$i]}</b></td></tr>"
+        else rows+="<tr><td></td><td><font color=gray>${STAGES[$i]}</font></td></tr>"; fi
+    done
+    printf '%s' "<table cellspacing=16><tr><td><img src=\"$LOGO\" width=96 height=96></td><td><big><b>$TITLE</b></big><table cellspacing=5>$rows</table></td></tr></table>"
+}
+gui_draw() { # same arguments as draw
+    [ "$1" -lt 0 ] && return 0
+    [ "$1" = "$GST" ] && [ "$3" = "$GPCT" ] && return 0
+    if [ "$1" != "$GST" ] && [ "$1" -lt 4 ]; then host qdbus $GREF setLabelText "$(gui_text "$1")" >/dev/null; fi
+    host qdbus $GREF Set "" value "$3" >/dev/null
+    GST=$1; GPCT=$3
+}
+
+F=
+line() { local pad; printf -v pad '%*s' $(( (COLS - $2) / 2 )) ''; F+="$OFF$pad$1$OFF"$'\e[K\n'; }  # $1 text with colours, $2 its visible width
+blank() { F+="$OFF"$'\e[K\n'; }
+
+# $1 = stage being worked on (0..3, 4 = all done, -1 = waiting for the password), $2 = tick, $3 = percent, $4 = status line
+draw() {
+    if [ "$MODE" = gui ]; then gui_draw "$@"; return; fi
+    [ $tty = 1 ] || return 0
+    local i n=$(( $3 * 30 / 100 )) maxlen=0 top bar= glyph pad
+    for i in "${STAGES[@]}"; do [ ${#i} -gt $maxlen ] && maxlen=${#i}; done
+    for ((i = 0; i < 30; i++)); do if [ $i -lt $n ]; then bar+=${BAR_ON[$i]}; else bar+="$C_LINE█"; fi; done
+    top=$(( (ROWS - 11) / 2 )); [ $top -lt 0 ] && top=0
+    F=$'\e[H'; for ((i = 0; i < top; i++)); do blank; done
+    line "$BOLD$TITLE" ${#TITLE}; blank
+    line "$bar$OFF  $C_ACC$BOLD$3%" $(( 34 + ${#3} ))
+    blank
+    printf -v pad '%*s' $(( (COLS - maxlen - 2) / 2 )) ''
+    for ((i = 0; i < 4; i++)); do
+        if [ $i -lt $1 ]; then F+="$OFF$pad${C_ACC}✓$OFF ${STAGES[$i]}"$'\e[K\n'
+        elif [ $i -eq $1 ]; then glyph=${FRAMES[$(( $2 % 10 ))]}; F+="$OFF$pad$C_ACC$glyph$OFF $BOLD${STAGES[$i]}$OFF"$'\e[K\n'
+        else F+="$OFF$pad$C_MUT  ${STAGES[$i]}$OFF"$'\e[K\n'; fi
+    done
+    blank
+    line "$C_MUT$4" ${#4}
+    F+=$'\e[J'
+    printf '%s' "$F"
+}
+
+# Animates until the root job has printed its "exit:N" line. With FIXED unset the stage follows the lines the job
+# prints to $STF: the first ("start") means the password was accepted, nothing moves before that.
+tick=0; frac=0; stage=-1; FIXED=
+job_over() { grep -q '^exit:' "$STF" 2>/dev/null; }
+animate() { # $1 = pid of a background job to wait for, or empty to wait for the root job's "exit:N" line
+    local s lines
+    while true; do
+        mapfile -t lines < "$STF"
+        if [ -n "$1" ]; then kill -0 "$1" 2>/dev/null || break; elif [ ${#lines[@]} -gt 0 ] && [[ "${lines[${#lines[@]}-1]}" == exit:* ]]; then break
+        elif ! kill -0 "$JOB" 2>/dev/null; then echo "exit:1" >> "$STF"; break; fi
+        tick=$((tick + 1))
+        if [ $tty = 1 ] && [ $((tick % 14)) = 0 ]; then size; if set_theme "$(system_theme)"; then repaint; fi; fi
+        if [ -n "$FIXED" ]; then s=$FIXED; else s=$(( ${#lines[@]} - 1 )); fi
+        if [ "$s" != "$stage" ]; then stage=$s; frac=0; fi
+        if [ "$stage" -lt 0 ]; then draw -1 "$tick" 0 "$(t 'Enter your password in the window that appeared' 'Введите пароль в появившемся окне')"
+        else [ $frac -lt 90 ] && frac=$((frac + 1)); draw "$stage" "$tick" $(( (stage * 100 + frac) / 4 )) ""; fi
+        sleep 0.15
+    done
+}
+
+fail() {
+    if [ "$MODE" = gui ]; then
+        host qdbus $GREF close >/dev/null 2>&1
+        kd --title "$TITLE" --error "$(t 'Setup failed at' 'Установка не удалась на этапе'): $1"$'\n\n'"$(tail -n 6 "$LOG")"$'\n\n'"$(t 'Full log' 'Полный лог'): $LOG"
+        exit 1
+    fi
+    [ $tty = 1 ] && printf '\e[0m\e[?25h\e[2J\e[H'
+    printf '%s: %s\n' "$(t 'Setup failed at' 'Установка не удалась на этапе')" "$1"
+    tail -n 8 "$LOG"; echo "$(t 'Full log' 'Полный лог'): $LOG"; exit 1
+}
+
+# Stages 1-2: Decky Loader and the plugin (root, one password prompt). The job prints "start" when the password is
+# accepted, a line per stage, and "exit:N" at the end.
+: > "$STF"
+( host pkexec sh -c "$ROOT_SCRIPT" >> "$STF" 2>> "$LOG"; echo "exit:$?" >> "$STF" ) & JOB=$!
+if [ "$MODE" = menu ]; then
+    # Nothing but the system's password dialog is on the screen until the password is accepted.
+    until grep -q '^start' "$STF" || job_over; do sleep 0.3; done
+    grep -q '^start' "$STF" || exit 1                                  # cancelled
+    if flatpak-spawn --host sh -c 'command -v kdialog && command -v qdbus' >/dev/null 2>&1; then
+        MODE=gui
+        GREF=$(kd --title "$TITLE" --progressbar "$(gui_text 0)" 100)
+        host qdbus $GREF showCancelButton false >/dev/null     # the root part cannot be stopped half-way
+    fi
+fi
+animate ""
+code=$(sed -n 's/^exit://p' "$STF" | tail -n1)
+if [ "$code" != 0 ]; then
+    mapfile -t lines < <(grep -v "^exit:" "$STF")
+    [ ${#lines[@]} -eq 0 ] && { [ $tty = 1 ] && printf '\e[0m\e[?25h\e[2J\e[H'; echo "$(t 'Setup cancelled: the password was not entered' 'Установка отменена: пароль не введён')"; exit 1; }
+    fail "${STAGES[$(( ${#lines[@]} - 1 ))]:-${STAGES[0]}}"
+fi
+
+# Stage 3: Luch itself (the daemon as a service of the session). Stage 4: does it work.
+FIXED=2; frac=0; stage=2
+user_part >> "$LOG" 2>&1 & pid=$!; animate $pid; wait $pid || fail "${STAGES[2]}"
+FIXED=3; frac=0
+verify >> "$LOG" 2>&1 & pid=$!; animate $pid; wait $pid || fail "${STAGES[3]}"
+
+HINT=$(t 'Switch to Game Mode, press the ··· button, open the Decky tab, then Luch.' 'Перейдите в игровой режим, нажмите «···», вкладка Decky, Луч.')
+if [ "$MODE" = gui ]; then
+    host qdbus $GREF Set "" value 100 >/dev/null; host qdbus $GREF close >/dev/null 2>&1
+    kd --title "$TITLE" --ok-label "$(t 'Finish' 'Завершить')" --msgbox "$DONE_MSG"$'\n\n'"$HINT"
+else
+    draw 4 0 100 "$DONE_MSG"
+    F=; line "$C_MUT$HINT" ${#HINT}; printf '%s' "$F"
+fi

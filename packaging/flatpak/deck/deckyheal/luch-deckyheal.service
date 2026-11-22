@@ -1,0 +1,7 @@
+[Unit]
+Description=Luch: put the Decky plugin and Decky Loader back if an update broke them
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/var/lib/luch/luch-deckyheal.sh

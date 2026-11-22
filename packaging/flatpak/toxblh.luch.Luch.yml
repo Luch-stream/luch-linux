@@ -1,4 +1,4 @@
-app-id: dev.luch.Luch
+app-id: toxblh.luch.Luch
 runtime: org.freedesktop.Platform
 runtime-version: '25.08'
 sdk: org.freedesktop.Sdk
@@ -64,7 +64,15 @@ modules:
       # Steam Deck: the Decky plugin and the setup command.
       - cp -a packaging/flatpak/deck/decky-plugin /app/share/luch/decky-plugin
       - install -Dm755 packaging/flatpak/deck/luch-setup /app/bin/luch-setup
-      - install -Dm644 packaging/flatpak/deck/dev.luch.Luch.desktop /app/share/applications/dev.luch.Luch.desktop
+      - mkdir -p /app/share/luch && cp -a packaging/flatpak/deck/plasmoid /app/share/luch/plasmoid
+      - install -Dm755 packaging/flatpak/deck/deckyheal/luch-deckyheal.sh /app/share/luch/deckyheal/luch-deckyheal.sh
+      - install -Dm755 packaging/flatpak/deck/deckyheal/luch-decky-install.sh /app/share/luch/deckyheal/luch-decky-install.sh
+      - install -Dm644 packaging/flatpak/deck/deckyheal/luch-deckyheal.service /app/share/luch/deckyheal/luch-deckyheal.service
+      - install -Dm644 packaging/flatpak/deck/deckyheal/luch-deckyheal.timer /app/share/luch/deckyheal/luch-deckyheal.timer
+      - install -Dm644 assets/luch.png /app/share/luch/luch.png
+      - install -Dm644 assets/luch.svg /app/share/icons/hicolor/scalable/apps/toxblh.luch.Luch.svg
+      - install -Dm644 packaging/flatpak/deck/toxblh.luch.Luch.desktop /app/share/applications/toxblh.luch.Luch.desktop
+      - install -Dm644 packaging/flatpak/deck/toxblh.luch.Luch.Setup.desktop /app/share/applications/toxblh.luch.Luch.Setup.desktop
     sources:
       - type: dir
         path: ../..

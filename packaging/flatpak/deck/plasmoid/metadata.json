@@ -1,0 +1,19 @@
+{
+    "KPlugin": {
+        "Id": "toxblh.luch.panel",
+        "Name": "Luch",
+        "Name[ru]": "Луч",
+        "Description": "Show this computer's screen on a TV, projector or phone",
+        "Description[ru]": "Показать экран этого компьютера на ТВ, проекторе или телефоне",
+        "Icon": "video-display",
+        "Authors": [{ "Name": "Luch" }],
+        "License": "GPL-3.0-or-later",
+        "Version": "1.0",
+        "Category": "Multimedia",
+        "EnabledByDefault": true
+    },
+    "X-Plasma-API-Minimum-Version": "6.0",
+    "X-Plasma-NotificationArea": "true",
+    "X-Plasma-NotificationAreaCategory": "ApplicationStatus",
+    "KPackageStructure": "Plasma/Applet"
+}

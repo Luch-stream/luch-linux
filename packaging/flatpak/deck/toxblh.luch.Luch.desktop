@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Luch
+Name[ru]=Луч
+Comment=Show this computer's screen and sound on a TV, projector or phone
+Comment[ru]=Показать экран и звук этого компьютера на ТВ, проекторе или телефоне
+Exec=luchd
+Icon=toxblh.luch.Luch
+Terminal=false
+NoDisplay=true
+Categories=AudioVideo;Video;

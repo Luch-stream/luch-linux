@@ -97,8 +97,8 @@ const STR = {
     receivers: ["Receivers", "Приёмники"],
     none: ["No receivers found on this network.", "В сети не найдено приёмников."],
     notRunning: [
-        "Luch is not running. Start the luchd service (flatpak run dev.luch.Luch).",
-        "Луч не запущен. Запустите службу luchd (flatpak run dev.luch.Luch).",
+        "Luch is not running. Start the luchd service (flatpak run toxblh.luch.Luch).",
+        "Луч не запущен. Запустите службу luchd (flatpak run toxblh.luch.Luch).",
     ],
     mirroring: ["Mirroring — press to stop", "Идёт показ — нажмите, чтобы остановить"],
     connected: ["Connected", "Подключён"],

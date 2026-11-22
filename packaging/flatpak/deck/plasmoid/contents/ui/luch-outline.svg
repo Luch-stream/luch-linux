@@ -1,0 +1,8 @@
+<!-- SPDX-License-Identifier: GPL-3.0-or-later -->
+<!-- The Luch mark as an outline for the panel: a 22 px grid with 1 px strokes on pixel centres, like the Breeze panel icons. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 22 22" shape-rendering="crispEdges">
+  <rect x="3.5" y="2.5" width="15" height="9" rx="1.5" fill="none" stroke="#222" stroke-width="1"/>
+  <path d="M7.5 14.5 L5.5 12.5 M14.5 14.5 L16.5 12.5" fill="none" stroke="#222" stroke-width="1"/>
+  <rect x="7.5" y="14.5" width="7" height="4" rx="1" fill="none" stroke="#222" stroke-width="1"/>
+  <path d="M6 20.5 H16" fill="none" stroke="#222" stroke-width="1"/>
+</svg>

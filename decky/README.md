@@ -5,7 +5,7 @@ screen to a TV or projector from the Quick Access menu. Pick a receiver, a mode 
 whether the Deck keeps playing sound.
 
 It talks to the `luchd` daemon over the session bus (`dev.luch.Luch1`) with `busctl`, so `luchd` has to run: the Luch
-Flatpak (`dev.luch.Luch`) or a native install.
+Flatpak (`toxblh.luch.Luch`) or a native install.
 
 Build: `pnpm install && pnpm build`, then copy the folder to `~/homebrew/plugins/Luch`.
 
