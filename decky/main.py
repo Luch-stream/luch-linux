@@ -11,6 +11,7 @@ import json
 import os
 import pwd
 import shutil
+import ssl
 import subprocess
 import tempfile
 import time
@@ -150,11 +151,19 @@ def _start_helper():
         decky.logger.info("Luch helper not found: fast mode off")
 
 
+def _ssl_context():
+    """Decky's own Python has no CA bundle of its own: use the system's (SteamOS keeps it under /etc/ssl)."""
+    for path in ("/etc/ssl/certs/ca-certificates.crt", "/etc/ssl/cert.pem", "/etc/pki/tls/certs/ca-bundle.crt"):
+        if os.path.isfile(path):
+            return ssl.create_default_context(cafile=path)
+    return None
+
+
 async def _download():
     """luch.flatpak from the first source that gives a file with the right hash; returns its path."""
     work = tempfile.mkdtemp(prefix="luch-install-", dir="/var/tmp")
     os.chmod(work, 0o755)
-    async with aiohttp.ClientSession() as http:
+    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=_ssl_context())) as http:
         for base in RELEASES:
             try:
                 async with http.get(f"{base}/luch.flatpak.sha256", timeout=aiohttp.ClientTimeout(total=20)) as r:
@@ -382,6 +391,11 @@ class Plugin:
         if not _inst["running"]:
             asyncio.create_task(_run_install())
 
+    async def start_service(self):
+        """Start luchd by hand: the panel offers it when luchd has not come up on its own."""
+        r = await asyncio.to_thread(_as_user, "systemctl", "--user", "start", "luchd-flatpak.service")
+        return r.returncode == 0
+
     async def install_status(self):
         return dict(_inst)
 
@@ -434,6 +448,8 @@ class Plugin:
             await asyncio.to_thread(_stop_all)
         if _installed():
             await asyncio.to_thread(_ensure_helper)
+            # luchd normally starts with the session; if it has not (the plugin was reloaded early), start it
+            await asyncio.to_thread(_as_user, "systemctl", "--user", "start", "luchd-flatpak.service")
         _start_helper()
 
     async def _unload(self):

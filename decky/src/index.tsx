@@ -1,7 +1,9 @@
 import {
   ButtonItem,
   ConfirmModal,
+  DialogButton,
   DropdownItem,
+  Focusable,
   PanelSection,
   PanelSectionRow,
   ProgressBar,
@@ -11,7 +13,16 @@ import {
 } from "@decky/ui";
 import { callable, definePlugin } from "@decky/api";
 import { useEffect, useState } from "react";
-import { FaVideo } from "react-icons/fa";
+
+// The Luch mark as an outline, the same as the one in the Plasma panel widget (luch-outline.svg), in the colour of the text.
+const LuchIcon = () => (
+  <svg width="1em" height="1em" viewBox="0 0 22 22" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round">
+    <rect x="3.5" y="2.5" width="15" height="9" rx="1.5" />
+    <path d="M7.5 14.5 L5.5 12.5 M14.5 14.5 L16.5 12.5" />
+    <rect x="7.5" y="14.5" width="7" height="4" rx="1" />
+    <path d="M6 20.5 H16" />
+  </svg>
+);
 
 type Receiver = {
   id: string;
@@ -46,72 +57,28 @@ const chooseCodec = callable<[string, string], void>("choose_codec");
 const setLocalAudio = callable<[boolean], void>("set_local_audio");
 const setDimScreen = callable<[boolean], void>("set_dim_screen");
 const installLuch = callable<[], void>("install_luch");
+const startService = callable<[], boolean>("start_service");
 
-// Steam UI language: Russian if the Deck is set to Russian, English otherwise.
-const isRu = (() => {
-  const l = (window as any).LocalizationManager?.m_rgLocalesToUse?.[0] ?? navigator.language ?? "";
-  return /^(ru|russian)/i.test(String(l));
-})();
+import { t } from "./i18n";
 
-const STR: Record<string, [string, string]> = {
-  receivers: ["Receivers", "Приёмники"],
-  none: ["No receivers found on this network.", "В сети не найдено приёмников."],
-  notRunning: [
-    "Luch is not running. Start the luchd service (flatpak run toxblh.luch.Luch).",
-    "Луч не запущен. Запустите службу luchd (flatpak run toxblh.luch.Luch).",
-  ],
-  mirroring: ["Mirroring — press to stop", "Идёт показ — нажмите, чтобы остановить"],
-  busyTitle: ["A show is already running", "Показ уже идёт"],
-  busyText: [
-    "Showing to %s. Stop it first, or show to both?",
-    "Сейчас идёт показ на: %s. Остановить его перед новым или показывать на оба?",
-  ],
-  stopAndStart: ["Stop it and start", "Остановить и начать"],
-  both: ["Show to both", "Показывать на оба"],
-  cancel: ["Cancel", "Отмена"],
-  connected: ["Connected", "Подключён"],
-  mode: ["Mode", "Режим"],
-  size: ["Size", "Размер"],
-  codec: ["Video codec", "Видеокодек"],
-  codecAuto: ["Auto", "Авто"],
-  sound: ["Sound", "Звук"],
-  alsoHere: ["Also play on this device", "Играть звук и на этом устройстве"],
-  screen: ["Screen", "Экран"],
-  dim: ["Dim the Deck screen while mirroring", "Затемнять экран Deck при показе"],
-  dimOff: [
-    "Brightness drops to the minimum 4 s after the menus close. Press Steam or ··· to bring it back; it also returns when the mirror stops",
-    "Яркость падает до минимума через 4 с после закрытия меню. Нажмите Steam или «···», чтобы вернуть; при остановке показа она возвращается сама",
-  ],
-  installTitle: ["Luch is not installed yet", "Луч ещё не установлен"],
-  installText: [
-    "This panel needs Luch itself (a Flatpak). It is downloaded from the Luch site's release and set up here, no desktop mode needed.",
-    "Панели нужен сам Луч (Flatpak). Он скачается с релиза сайта Луча и настроится прямо здесь, рабочий стол не нужен.",
-  ],
-  installBtn: ["Install Luch", "Установить Луч"],
-  installing: ["Installing…", "Установка…"],
-  installFailed: ["Could not install: ", "Не удалось установить: "],
-  stage1: ["Downloading", "Скачивание"],
-  stage2: ["Installing the Flatpak", "Установка Flatpak"],
-  stage3: ["Starting the service", "Запуск службы"],
-  stage4: ["Checking that it works", "Проверка работоспособности"],
-  alsoHereOff: [
-    "Off: the Deck stays silent while mirroring",
-    "Выключено: во время показа Deck молчит",
-  ],
-};
-const t = (k: string) => STR[k][isRu ? 1 : 0];
+const srcTitle = (v: string) => t(v);
 
-const SOURCE_TITLES: Record<string, [string, string]> = {
-  fast: ["Fast mirror", "Быстрое зеркало"],
-  fast169: ["Mirror 16:9", "Зеркало 16:9"],
-  monitor: ["Pick a screen", "Выбор экрана"],
-  window: ["One window", "Одно окно"],
-  virtual: ["Second screen", "Второй экран"],
-};
-const srcTitle = (v: string) => SOURCE_TITLES[v]?.[isRu ? 1 : 0] ?? v;
+// A row of text with air around it (the panel packs its rows tightly).
+const Gap = ({ children, below = 10, size, dim }: { children: any; below?: number; size?: number; dim?: boolean }) => (
+  <PanelSectionRow>
+    <div style={{ paddingBottom: below, fontSize: size, opacity: dim ? 0.7 : 1 }}>{children}</div>
+  </PanelSectionRow>
+);
+
+// 1920x1080 -> 1080p
+const short = (size: string) => (/^\d+x(\d+)$/.exec(size) ? `${/^\d+x(\d+)$/.exec(size)![1]}p` : size);
 
 function Content() {
   const [s, setS] = useState<State>({ up: false, receivers: [] });
+  // luchd takes a few seconds after a start or an install: a loading bar first, the hint only when it does not come up
+  const [downFor, setDownFor] = useState(0);
+  // the mode, codec and size of a receiver are folded away until its arrow is pressed
+  const [open, setOpen] = useState<Record<string, boolean>>({});
 
   const refresh = async () => setS(await state());
   useEffect(() => {
@@ -119,23 +86,26 @@ function Content() {
     const t = setInterval(refresh, 2000);
     return () => clearInterval(t);
   }, []);
+  useEffect(() => {
+    setDownFor((d) => (s.up ? 0 : d + 2));
+  }, [s]);
 
   if (!s.up && s.installed === false) {
     const i = s.install;
+    const pct = i?.stage === 1 && parseInt(i.text) ? parseInt(i.text) / 4 : 0;
     return (
       <PanelSection title={t("installTitle")}>
-        <PanelSectionRow>{t("installText")}</PanelSectionRow>
+        <Gap size={12} dim>{t("tagline")}</Gap>
+        <Gap below={16}>{t("installText")}</Gap>
         {i?.running && (
           <>
-            <PanelSectionRow>
-              {`${i.stage}/4 ${t("stage" + i.stage)} ${i.text}`}
-            </PanelSectionRow>
-            <PanelSectionRow>
-              <ProgressBar nProgress={(i.stage - 1) * 25 + (i.stage === 1 && parseInt(i.text) ? parseInt(i.text) / 4 : 0)} />
-            </PanelSectionRow>
+            <Gap below={8}>{`${i.stage}/4 · ${t("stage" + i.stage)} ${i.text}`}</Gap>
+            <Gap below={16}>
+              <ProgressBar nProgress={i.stage > 1 ? (i.stage - 1) * 25 + pct : pct} />
+            </Gap>
           </>
         )}
-        {i?.error && <PanelSectionRow>{t("installFailed") + i.error}</PanelSectionRow>}
+        {i?.error && <Gap below={16}>{t("installFailed") + (i.error === "download" ? t("errDownload") : i.error)}</Gap>}
         <PanelSectionRow>
           <ButtonItem layout="below" disabled={!!i?.running} onClick={() => installLuch().then(refresh)}>
             {i?.running ? t("installing") : t("installBtn")}
@@ -147,10 +117,24 @@ function Content() {
 
   if (!s.up) {
     return (
-      <PanelSection title={isRu ? "Луч" : "Luch"}>
-        <PanelSectionRow>
-          {t("notRunning")}
-        </PanelSectionRow>
+      <PanelSection title={t("appName")}>
+        {downFor < 30 ? (
+          <>
+            <Gap below={10}>{t("starting")}</Gap>
+            <Gap below={10}>
+              <ProgressBar indeterminate nProgress={0} />
+            </Gap>
+          </>
+        ) : (
+          <>
+            <Gap below={12}>{t("notRunning")}</Gap>
+            <PanelSectionRow>
+              <ButtonItem layout="below" onClick={() => startService().then(refresh)}>
+                {t("startBtn")}
+              </ButtonItem>
+            </PanelSectionRow>
+          </>
+        )}
       </PanelSection>
     );
   }
@@ -158,50 +142,64 @@ function Content() {
   return (
     <>
       <PanelSection title={t("receivers")}>
-        {s.receivers.length === 0 && <PanelSectionRow>{t("none")}</PanelSectionRow>}
+        {s.receivers.length === 0 && <Gap>{t("none")}</Gap>}
         {s.receivers.map((r) => (
-          <div key={r.id}>
+          <div key={r.id} style={{ paddingBottom: 14 }}>
             <PanelSectionRow>
-              <ButtonItem
-                layout="below"
-                onClick={async () => {
-                  if (r.mirroring) {
-                    await stop(r.id);
-                    refresh();
-                    return;
-                  }
-                  // Another show is running: ask what to do with it first.
-                  const others = s.receivers.filter((x) => x.mirroring && x.id !== r.id);
-                  if (others.length === 0) {
-                    await start(r.id, r.source, r.size);
-                    refresh();
-                    return;
-                  }
-                  showModal(
-                    <ConfirmModal
-                      strTitle={t("busyTitle")}
-                      strDescription={t("busyText").replace("%s", others.map((x) => x.name).join(", "))}
-                      strOKButtonText={t("stopAndStart")}
-                      strMiddleButtonText={t("both")}
-                      strCancelButtonText={t("cancel")}
-                      onOK={async () => {
-                        for (const o of others) await stop(o.id);
-                        await start(r.id, r.source, r.size);
-                        refresh();
-                      }}
-                      onMiddleButton={async () => {
-                        await start(r.id, r.source, r.size);
-                        refresh();
-                      }}
-                    />,
-                  );
-                }}
-                description={r.mirroring ? t("mirroring") : r.connected ? t("connected") : r.model}
-              >
-                {r.mirroring ? "■ " : "▶ "}
-                {r.name}
-              </ButtonItem>
+              <Focusable style={{ display: "flex", gap: "8px", alignItems: "stretch" }} flow-children="horizontal">
+                <DialogButton
+                  style={{ flex: 1, minWidth: 0, textAlign: "left", padding: "10px 14px" }}
+                  onClick={async () => {
+                    if (r.mirroring) {
+                      await stop(r.id);
+                      refresh();
+                      return;
+                    }
+                    // Another show is running: ask what to do with it first.
+                    const others = s.receivers.filter((x) => x.mirroring && x.id !== r.id);
+                    if (others.length === 0) {
+                      await start(r.id, r.source, r.size);
+                      refresh();
+                      return;
+                    }
+                    showModal(
+                      <ConfirmModal
+                        strTitle={t("busyTitle")}
+                        strDescription={t("busyText").replace("%s", others.map((x) => x.name).join(", "))}
+                        strOKButtonText={t("stopAndStart")}
+                        strMiddleButtonText={t("both")}
+                        strCancelButtonText={t("cancel")}
+                        onOK={async () => {
+                          for (const o of others) await stop(o.id);
+                          await start(r.id, r.source, r.size);
+                          refresh();
+                        }}
+                        onMiddleButton={async () => {
+                          await start(r.id, r.source, r.size);
+                          refresh();
+                        }}
+                      />,
+                    );
+                  }}
+                >
+                  <div style={{ fontWeight: 600 }}>
+                    {r.mirroring ? "■ " : "▶ "}
+                    {r.name}
+                  </div>
+                  <div style={{ fontSize: "12px", opacity: 0.7, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis", marginTop: 2 }}>
+                    {r.mirroring ? t("mirroring") : `${srcTitle(r.source)} · ${short(r.size)}`}
+                  </div>
+                </DialogButton>
+                <DialogButton
+                  style={{ width: "44px", minWidth: "44px", padding: "0", height: "auto" }}
+                  onClick={() => setOpen((o) => ({ ...o, [r.id]: !o[r.id] }))}
+                >
+                  {open[r.id] ? "▴" : "▾"}
+                </DialogButton>
+              </Focusable>
             </PanelSectionRow>
+            {open[r.id] && (
+              <>
             <PanelSectionRow>
               <DropdownItem
                 label={t("mode")}
@@ -239,6 +237,8 @@ function Content() {
                 }}
               />
             </PanelSectionRow>
+              </>
+            )}
           </div>
         ))}
       </PanelSection>
@@ -273,9 +273,9 @@ function Content() {
 }
 
 export default definePlugin(() => ({
-  name: "Luch",
-  titleView: <div className={staticClasses.Title}>{isRu ? "Луч" : "Luch"}</div>,
+  name: t("appName"),
+  titleView: <div className={staticClasses.Title}>{t("appName")}</div>,
   content: <Content />,
-  icon: <FaVideo />,
+  icon: <LuchIcon />,
   onDismount() {},
 }));
