@@ -4,11 +4,15 @@ Decky runs plugins as the user, but the session bus address is not always in the
 so it is built from the user's runtime directory.
 """
 import asyncio
+import filecmp
 import glob
+import hashlib
 import json
 import os
 import pwd
+import shutil
 import subprocess
+import tempfile
 import time
 
 import aiohttp
@@ -30,6 +34,30 @@ HELPER_DIR = os.path.join(decky.DECKY_PLUGIN_DIR, "helper")
 
 _helper = None
 _dimmer_task = None
+
+# Luch itself (luchd, luch-kms) is a Flatpak. A plugin from the Decky store brings only this panel, so the panel can fetch
+# and set up the rest itself, from the same release the installer on the Luch site uses (ALS first, GitHub after it).
+APP_ID = "toxblh.luch.Luch"
+RELEASES = [
+    "https://altlinux.space/plafonlinux/luch-linux/releases/download/deck-latest",
+    "https://github.com/plafonlinux/luch-linux/releases/download/deck-latest",
+]
+HOME = pwd.getpwnam(USER).pw_dir
+UNIT_FILE = os.path.join(HOME, ".config/systemd/user/luchd-flatpak.service")
+UNIT = """[Unit]
+Description=Luch sender daemon (Flatpak)
+
+[Service]
+ExecStartPre=-/usr/bin/pkill -x luchd
+ExecStart=/usr/bin/flatpak run toxblh.luch.Luch
+ExecStop=-/usr/bin/pkill -x luchd
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+"""
+INSTALL_STAGES = 4
+_inst = {"running": False, "done": False, "stage": 0, "text": "", "error": ""}
 
 # The built-in screen goes off this long after the last Steam menu closed, while a mirror runs.
 DIM_AFTER = 4.0
@@ -74,6 +102,141 @@ def _read(path):
             return f.read().strip()
     except OSError:
         return ""
+
+
+def _as_user(*args, timeout=60):
+    cmd = ["runuser", "-u", USER, "--", "env", f"XDG_RUNTIME_DIR={RUNTIME}",
+           f"DBUS_SESSION_BUS_ADDRESS=unix:path={RUNTIME}/bus", *args]
+    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+
+
+def _installed():
+    return os.path.isdir(os.path.join(HOME, ".local/share/flatpak/app", APP_ID))
+
+
+def _location():
+    r = _as_user("flatpak", "info", "--user", "--show-location", APP_ID, timeout=20)
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def _ensure_helper():
+    """The fast-mode helper in this plugin's folder is the one that ships with the installed Flatpak. A plugin update
+    from the store replaces the folder, and a Flatpak update brings a new helper: either way it is copied again."""
+    loc = _location()
+    src = os.path.join(loc, "files/share/luch/helper") if loc else ""
+    if not os.path.isfile(os.path.join(src, "luch-kms")):
+        return False
+    dst = os.path.join(HELPER_DIR, "luch-kms")
+    if os.path.isfile(dst) and filecmp.cmp(os.path.join(src, "luch-kms"), dst, shallow=False):
+        return False
+    _kill_stale_helpers()
+    os.makedirs(HELPER_DIR, exist_ok=True)
+    shutil.copytree(src, HELPER_DIR, dirs_exist_ok=True)
+    os.chmod(dst, 0o755)
+    decky.logger.info("Luch helper copied from the Flatpak")
+    return True
+
+
+def _start_helper():
+    global _helper
+    exe = os.path.join(HELPER_DIR, "luch-kms")
+    if _helper and _helper.poll() is None:
+        return
+    if os.path.isfile(exe):
+        env = dict(os.environ, LD_LIBRARY_PATH=HELPER_DIR)
+        _helper = subprocess.Popen([exe, "--serve", SOCKET, "--uid", str(UID)], env=env)
+        decky.logger.info(f"Luch helper started (pid {_helper.pid})")
+    else:
+        decky.logger.info("Luch helper not found: fast mode off")
+
+
+async def _download():
+    """luch.flatpak from the first source that gives a file with the right hash; returns its path."""
+    work = tempfile.mkdtemp(prefix="luch-install-", dir="/var/tmp")
+    os.chmod(work, 0o755)
+    async with aiohttp.ClientSession() as http:
+        for base in RELEASES:
+            try:
+                async with http.get(f"{base}/luch.flatpak.sha256", timeout=aiohttp.ClientTimeout(total=20)) as r:
+                    r.raise_for_status()
+                    want = (await r.text()).split()[0]
+                path = os.path.join(work, "luch.flatpak")
+                h = hashlib.sha256()
+                async with http.get(f"{base}/luch.flatpak", timeout=aiohttp.ClientTimeout(total=300)) as r:
+                    r.raise_for_status()
+                    total, got = int(r.headers.get("Content-Length", 0)), 0
+                    with open(path, "wb") as f:
+                        async for chunk in r.content.iter_chunked(1 << 16):
+                            f.write(chunk)
+                            h.update(chunk)
+                            got += len(chunk)
+                            _inst["text"] = f"{got * 100 // total} %" if total else ""
+                if h.hexdigest() == want:
+                    os.chmod(path, 0o644)
+                    return path
+                decky.logger.warning(f"{base}: the hash does not match")
+            except Exception as e:
+                decky.logger.warning(f"{base}: {e}")
+    raise RuntimeError("download")
+
+
+def _flatpak_install(path):
+    r = _as_user("flatpak", "install", "--user", "--noninteractive", "-y", "--or-update", path, timeout=1200)
+    if r.returncode != 0:
+        raise RuntimeError("flatpak: " + (r.stderr or r.stdout).strip().splitlines()[-1][:200])
+
+
+def _enable_service():
+    os.makedirs(os.path.dirname(UNIT_FILE), exist_ok=True)
+    with open(UNIT_FILE, "w") as f:
+        f.write(UNIT)
+    for d in (os.path.dirname(UNIT_FILE), os.path.dirname(os.path.dirname(UNIT_FILE))):
+        shutil.chown(d, USER, USER)
+    shutil.chown(UNIT_FILE, USER, USER)
+    _as_user("systemctl", "--user", "daemon-reload")
+    r = _as_user("systemctl", "--user", "enable", "--now", "luchd-flatpak.service")
+    if r.returncode != 0:
+        raise RuntimeError("service: " + r.stderr.strip()[:200])
+    # SteamOS ships Avahi with publishing off, and luchd then cannot announce this Deck as a sender.
+    conf = "/etc/avahi/avahi-daemon.conf"
+    try:
+        text = open(conf).read()
+        fixed = text.replace("disable-publishing=yes", "disable-publishing=no").replace(
+            "disable-user-service-publishing=yes", "disable-user-service-publishing=no")
+        if fixed != text:
+            open(conf, "w").write(fixed)
+            subprocess.run(["systemctl", "restart", "avahi-daemon"], timeout=30)
+            _as_user("systemctl", "--user", "restart", "luchd-flatpak.service")
+    except OSError as e:
+        decky.logger.warning(f"avahi: {e}")
+
+
+async def _run_install():
+    _inst.update(running=True, done=False, stage=1, text="", error="")
+    try:
+        path = await _download()
+        _inst.update(stage=2, text="")
+        await asyncio.to_thread(_flatpak_install, path)
+        shutil.rmtree(os.path.dirname(path), ignore_errors=True)
+        _inst.update(stage=3)
+        await asyncio.to_thread(_enable_service)
+        await asyncio.to_thread(_ensure_helper)
+        _start_helper()
+        _inst.update(stage=4)
+        for _ in range(30):
+            try:
+                await asyncio.to_thread(_call, "Receivers")
+                break
+            except Exception:
+                await asyncio.sleep(1)
+        else:
+            raise RuntimeError("luchd does not answer")
+        _inst.update(done=True)
+    except Exception as e:
+        decky.logger.error(f"install: {e}")
+        _inst["error"] = str(e)
+    finally:
+        _inst["running"] = False
 
 
 def _kill_stale_helpers():
@@ -191,7 +354,7 @@ class Plugin:
         try:
             rows = _call("Receivers")["data"][0]
         except Exception as e:  # luchd not running, or no busctl
-            return {"up": False, "error": str(e), "receivers": []}
+            return {"up": False, "error": str(e), "receivers": [], "installed": _installed(), "install": dict(_inst)}
         saved = _load()
         try:
             sources = _call("Sources")["data"][0]
@@ -213,6 +376,14 @@ class Plugin:
             })
         return {"up": True, "receivers": receivers, "sources": sources, "sizes": SIZES, "local_audio": local_audio,
                 "dim_screen": saved.get("dim_screen", False)}
+
+    async def install_luch(self):
+        """Fetch Luch (a Flatpak), set the service up and start it: what the installer on the site does, from the panel."""
+        if not _inst["running"]:
+            asyncio.create_task(_run_install())
+
+    async def install_status(self):
+        return dict(_inst)
 
     async def choose(self, rid: str, source: str, size: str):
         data = _load()
@@ -256,18 +427,14 @@ class Plugin:
 
     async def _main(self):
         """Start the fast-mode grabber (a privileged luch-kms that only this user can talk to) and the screen dimmer."""
-        global _helper, _dimmer_task
+        global _dimmer_task
         _dim(False)   # a screen left dark by a crash comes back
         _dimmer_task = asyncio.create_task(_dim_loop())
-        exe = os.path.join(HELPER_DIR, "luch-kms")
         if _kill_stale_helpers():
             await asyncio.to_thread(_stop_all)
-        if os.path.isfile(exe):
-            env = dict(os.environ, LD_LIBRARY_PATH=HELPER_DIR)
-            _helper = subprocess.Popen([exe, "--serve", SOCKET, "--uid", str(UID)], env=env)
-            decky.logger.info(f"Luch helper started (pid {_helper.pid})")
-        else:
-            decky.logger.info("Luch helper not found: fast mode off")
+        if _installed():
+            await asyncio.to_thread(_ensure_helper)
+        _start_helper()
 
     async def _unload(self):
         global _helper, _dimmer_task

@@ -4,6 +4,7 @@ import {
   DropdownItem,
   PanelSection,
   PanelSectionRow,
+  ProgressBar,
   ToggleField,
   showModal,
   staticClasses,
@@ -23,8 +24,12 @@ type Receiver = {
   codec: string;
 };
 
+type Install = { running: boolean; done: boolean; stage: number; text: string; error: string };
+
 type State = {
   up: boolean;
+  installed?: boolean;
+  install?: Install;
   error?: string;
   receivers: Receiver[];
   sources?: string[];
@@ -40,6 +45,7 @@ const stop = callable<[string], void>("stop");
 const chooseCodec = callable<[string, string], void>("choose_codec");
 const setLocalAudio = callable<[boolean], void>("set_local_audio");
 const setDimScreen = callable<[boolean], void>("set_dim_screen");
+const installLuch = callable<[], void>("install_luch");
 
 // Steam UI language: Russian if the Deck is set to Russian, English otherwise.
 const isRu = (() => {
@@ -76,6 +82,18 @@ const STR: Record<string, [string, string]> = {
     "Brightness drops to the minimum 4 s after the menus close. Press Steam or ··· to bring it back; it also returns when the mirror stops",
     "Яркость падает до минимума через 4 с после закрытия меню. Нажмите Steam или «···», чтобы вернуть; при остановке показа она возвращается сама",
   ],
+  installTitle: ["Luch is not installed yet", "Луч ещё не установлен"],
+  installText: [
+    "This panel needs Luch itself (a Flatpak). It is downloaded from the Luch site's release and set up here, no desktop mode needed.",
+    "Панели нужен сам Луч (Flatpak). Он скачается с релиза сайта Луча и настроится прямо здесь, рабочий стол не нужен.",
+  ],
+  installBtn: ["Install Luch", "Установить Луч"],
+  installing: ["Installing…", "Установка…"],
+  installFailed: ["Could not install: ", "Не удалось установить: "],
+  stage1: ["Downloading", "Скачивание"],
+  stage2: ["Installing the Flatpak", "Установка Flatpak"],
+  stage3: ["Starting the service", "Запуск службы"],
+  stage4: ["Checking that it works", "Проверка работоспособности"],
   alsoHereOff: [
     "Off: the Deck stays silent while mirroring",
     "Выключено: во время показа Deck молчит",
@@ -101,6 +119,31 @@ function Content() {
     const t = setInterval(refresh, 2000);
     return () => clearInterval(t);
   }, []);
+
+  if (!s.up && s.installed === false) {
+    const i = s.install;
+    return (
+      <PanelSection title={t("installTitle")}>
+        <PanelSectionRow>{t("installText")}</PanelSectionRow>
+        {i?.running && (
+          <>
+            <PanelSectionRow>
+              {`${i.stage}/4 ${t("stage" + i.stage)} ${i.text}`}
+            </PanelSectionRow>
+            <PanelSectionRow>
+              <ProgressBar nProgress={(i.stage - 1) * 25 + (i.stage === 1 && parseInt(i.text) ? parseInt(i.text) / 4 : 0)} />
+            </PanelSectionRow>
+          </>
+        )}
+        {i?.error && <PanelSectionRow>{t("installFailed") + i.error}</PanelSectionRow>}
+        <PanelSectionRow>
+          <ButtonItem layout="below" disabled={!!i?.running} onClick={() => installLuch().then(refresh)}>
+            {i?.running ? t("installing") : t("installBtn")}
+          </ButtonItem>
+        </PanelSectionRow>
+      </PanelSection>
+    );
+  }
 
   if (!s.up) {
     return (
