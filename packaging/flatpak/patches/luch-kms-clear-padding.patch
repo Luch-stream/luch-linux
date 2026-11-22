@@ -1,0 +1,22 @@
+diff --git a/luch-kms/src/kms.c b/luch-kms/src/kms.c
+index 7d44202..1d3e917 100644
+--- a/luch-kms/src/kms.c
++++ b/luch-kms/src/kms.c
+@@ -149,13 +149,16 @@ static Target *target_for(EGLDisplay d, AVFrame *f, int W, int H) {
+     const AVDRMFrameDescriptor *dd = (void *)drm->data[0];
+     Target *t = &targets[n_targets++];
+     t->id = id;
++    // The coded picture is a multiple of 16 rows high (1088 for 1080): the extra rows are shown by a receiver that does not crop,
++    // so they are bound and cleared to black too instead of staying green.
++    int AH = (H + 15) & ~15;
+     for (int l = 0; l < 2; l++) { // FFmpeg exports NV12 as two layers: R8 (Y) and GR88 (UV)
+         const AVDRMLayerDescriptor *L = &dd->layers[dd->nb_layers == 2 ? l : 0];
+         const AVDRMPlaneDescriptor *P = &L->planes[dd->nb_layers == 2 ? 0 : l];
+         const AVDRMObjectDescriptor *O = &dd->objects[P->object_index];
+         uint32_t off = P->offset, pitch = P->pitch;
+         uint32_t fourcc = l == 0 ? DRM_FORMAT_R8 : DRM_FORMAT_GR88;
+-        EGLImage img = egl_import(d, O->fd, fourcc, l == 0 ? W : W / 2, l == 0 ? H : H / 2, O->format_modifier, 1, &off, &pitch);
++        EGLImage img = egl_import(d, O->fd, fourcc, l == 0 ? W : W / 2, l == 0 ? AH : AH / 2, O->format_modifier, 1, &off, &pitch);
+         if (img == EGL_NO_IMAGE) DIE("cannot bind encoder surface plane %d", l);
+         GLuint tex; glGenTextures(1, &tex); glBindTexture(GL_TEXTURE_2D, tex);
+         img_to_tex(GL_TEXTURE_2D, img);

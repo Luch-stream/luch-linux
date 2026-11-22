@@ -89,6 +89,9 @@ modules:
         path: patches/luchd-prefer-hevc.patch
       - type: patch
         path: patches/luch-kms-plane-opaque.patch
+      # The coded picture is 1088 rows for 1080: the rows below the picture stayed green on receivers that do not crop.
+      - type: patch
+        path: patches/luch-kms-clear-padding.patch
       # Crates for the offline build: `cargo vendor` at the repo root, see README.md in this directory.
       - type: dir
         path: vendor
