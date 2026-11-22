@@ -59,7 +59,8 @@ const setDimScreen = callable<[boolean], void>("set_dim_screen");
 const installLuch = callable<[], void>("install_luch");
 const startService = callable<[], boolean>("start_service");
 
-import { t } from "./i18n";
+import { lang, t } from "./i18n";
+import { qrFor, qrPath } from "./qr";
 
 const srcTitle = (v: string) => t(v);
 
@@ -79,6 +80,7 @@ function Content() {
   const [downFor, setDownFor] = useState(0);
   // the mode, codec and size of a receiver are folded away until its arrow is pressed
   const [open, setOpen] = useState<Record<string, boolean>>({});
+  const [qrOpen, setQrOpen] = useState(false);
 
   const refresh = async () => setS(await state());
   useEffect(() => {
@@ -241,6 +243,36 @@ function Content() {
             )}
           </div>
         ))}
+      </PanelSection>
+      <PanelSection>
+        <PanelSectionRow>
+          <DialogButton
+            style={{ width: "100%", textAlign: "left", padding: "10px 14px", display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}
+            onClick={() => setQrOpen((o) => !o)}
+          >
+            <span style={{ fontSize: "13px" }}>{t("getReceiver")}</span>
+            <span>{qrOpen ? "▴" : "▾"}</span>
+          </DialogButton>
+        </PanelSectionRow>
+        {qrOpen && (
+          <>
+            <Gap below={10} size={12} dim>{t("getReceiverText")}</Gap>
+            <PanelSectionRow>
+              <div style={{ display: "flex", justifyContent: "center", paddingBottom: 6 }}>
+                <svg
+                  width="176"
+                  height="176"
+                  viewBox="-4 -4 41 41"
+                  shapeRendering="crispEdges"
+                  style={{ background: "#fff", borderRadius: 6 }}
+                >
+                  <path d={qrPath(qrFor(lang).rows)} fill="#000" />
+                </svg>
+              </div>
+            </PanelSectionRow>
+            <Gap below={4} size={11} dim>{qrFor(lang).url.replace("https://", "")}</Gap>
+          </>
+        )}
       </PanelSection>
       <PanelSection title={t("sound")}>
         <PanelSectionRow>

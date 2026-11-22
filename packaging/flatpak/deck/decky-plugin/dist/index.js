@@ -23,6 +23,8 @@ const definePlugin = (fn) => {
 };
 
 const en = {
+    getReceiver: "Install the receiver on the other device",
+    getReceiverText: "To show the screen there, that device needs the Luch receiver. Point a phone camera at the code to open the page with the app for Android.",
     appName: "Luch",
     tagline: "Your screen on a TV, projector or phone, with game-streaming latency",
     receivers: "Devices",
@@ -63,6 +65,8 @@ const en = {
     virtual: "Second screen",
 };
 const ru = {
+    getReceiver: "Нужен приёмник на устройстве",
+    getReceiverText: "Чтобы показать экран на устройстве, на нём должен стоять приёмник Луча. Наведите камеру телефона на код: откроется страница с приложением для Android.",
     appName: "Луч",
     tagline: "Экран на ТВ, проектор или телефон с задержкой игрового стриминга",
     receivers: "Устройства",
@@ -103,6 +107,8 @@ const ru = {
     virtual: "Второй экран",
 };
 const uk = {
+    getReceiver: "Потрібен приймач на пристрої",
+    getReceiverText: "Щоб показати екран на пристрої, на ньому має стояти приймач Променя. Наведіть камеру телефона на код: відкриється сторінка із застосунком для Android.",
     appName: "Промінь",
     tagline: "Екран на ТБ, проєктор чи телефон із затримкою ігрового стримінгу",
     receivers: "Пристрої",
@@ -143,6 +149,8 @@ const uk = {
     virtual: "Другий екран",
 };
 const de = {
+    getReceiver: "Empfänger auf dem anderen Gerät installieren",
+    getReceiverText: "Damit der Bildschirm dort erscheint, braucht das Gerät den Luch-Empfänger. Richte die Handykamera auf den Code, um die Seite mit der Android-App zu öffnen.",
     appName: "Luch",
     tagline: "Dein Bildschirm auf TV, Beamer oder Handy, mit der Latenz von Spiele-Streaming",
     receivers: "Geräte",
@@ -183,6 +191,8 @@ const de = {
     virtual: "Zweiter Bildschirm",
 };
 const fr = {
+    getReceiver: "Installer le récepteur sur l'autre appareil",
+    getReceiverText: "Pour y afficher l'écran, cet appareil doit avoir le récepteur Luch. Pointez la caméra d'un téléphone sur le code pour ouvrir la page de l'application Android.",
     appName: "Luch",
     tagline: "Votre écran sur une TV, un projecteur ou un téléphone, avec la latence du streaming de jeu",
     receivers: "Appareils",
@@ -223,6 +233,8 @@ const fr = {
     virtual: "Second écran",
 };
 const es = {
+    getReceiver: "Instala el receptor en el otro dispositivo",
+    getReceiverText: "Para mostrar la pantalla allí, ese dispositivo necesita el receptor de Luch. Apunta la cámara del móvil al código para abrir la página con la app de Android.",
     appName: "Luch",
     tagline: "Tu pantalla en una TV, proyector o móvil, con la latencia del streaming de juegos",
     receivers: "Dispositivos",
@@ -263,6 +275,8 @@ const es = {
     virtual: "Segunda pantalla",
 };
 const it = {
+    getReceiver: "Installa il ricevitore sull'altro dispositivo",
+    getReceiverText: "Per mostrare lo schermo lì, quel dispositivo ha bisogno del ricevitore Luch. Inquadra il codice con la fotocamera del telefono per aprire la pagina con l'app per Android.",
     appName: "Luch",
     tagline: "Il tuo schermo su TV, proiettore o telefono, con la latenza del game streaming",
     receivers: "Dispositivi",
@@ -303,6 +317,8 @@ const it = {
     virtual: "Secondo schermo",
 };
 const pt = {
+    getReceiver: "Instale o receptor no outro dispositivo",
+    getReceiverText: "Para mostrar a tela lá, esse dispositivo precisa do receptor do Luch. Aponte a câmera do celular para o código para abrir a página com o app para Android.",
     appName: "Luch",
     tagline: "Sua tela na TV, projetor ou celular, com a latência do streaming de jogos",
     receivers: "Dispositivos",
@@ -343,6 +359,8 @@ const pt = {
     virtual: "Segunda tela",
 };
 const pl = {
+    getReceiver: "Zainstaluj odbiornik na drugim urządzeniu",
+    getReceiverText: "Aby pokazać tam ekran, urządzenie potrzebuje odbiornika Luch. Skieruj aparat telefonu na kod, aby otworzyć stronę z aplikacją na Androida.",
     appName: "Luch",
     tagline: "Twój ekran na telewizorze, projektorze lub telefonie, z opóźnieniem streamingu gier",
     receivers: "Urządzenia",
@@ -383,6 +401,8 @@ const pl = {
     virtual: "Drugi ekran",
 };
 const zh = {
+    getReceiver: "在另一台设备上安装接收端",
+    getReceiverText: "要在那里显示屏幕，该设备需要安装 Luch 接收端。用手机相机对准二维码，即可打开包含 Android 应用的页面。",
     appName: "Luch",
     tagline: "以游戏串流级别的延迟，把屏幕投到电视、投影仪或手机",
     receivers: "设备",
@@ -434,6 +454,145 @@ const lang = (() => {
 })();
 const t = (key) => TABLES[lang]?.[key] ?? en[key] ?? key;
 
+// QR codes of the receiver page on the site (generated once, see the commit message): rows of 33 modules, '1' dark.
+const QR = {
+    "ru": {
+        "url": "https://plafonlinux.altlinux.team/luch-site/android.html",
+        "rows": [
+            "111111100100110101110011001111111",
+            "100000101111101101011101101000001",
+            "101110100110011100101001001011101",
+            "101110100000011010110010001011101",
+            "101110101011101011010111001011101",
+            "100000100111111111110011101000001",
+            "111111101010101010101010101111111",
+            "000000000110010101001100100000000",
+            "101010100111110011011101100010010",
+            "101111000101010001101000111100011",
+            "001100101000101010001100110100101",
+            "010010011110011101001100100010000",
+            "001001101111001111011100111001010",
+            "000110010101101111000000001100101",
+            "100001100110010110001000010011011",
+            "101110011001011011011101101110010",
+            "100001110111010101001100111000000",
+            "000110011110011010000100101100011",
+            "110110110000110000001000001000111",
+            "110100001111101111110101001110000",
+            "001001100011101001011100111001001",
+            "001010001111110100001010111000111",
+            "101100101001001000000010101100111",
+            "010011000111111101010111110100010",
+            "100110110100100001010100111111000",
+            "000000001110101010001101100011011",
+            "111111100001110010000111101010111",
+            "100000100111010011011100100010000",
+            "101110101101011110101100111111011",
+            "101110100111111110001001000010001",
+            "101110101101001110100101000011101",
+            "100000100011011011101100111010010",
+            "111111101110001111010101111010011"
+        ]
+    },
+    "en": {
+        "url": "https://plafonlinux.altlinux.team/luch-site/en/android.html",
+        "rows": [
+            "111111101100001011111101001111111",
+            "100000101111101001000011101000001",
+            "101110100110111100110001101011101",
+            "101110101001100001000011101011101",
+            "101110100000100010010100101011101",
+            "100000100100011110111100101000001",
+            "111111101010101010101010101111111",
+            "000000001000001111010000100000000",
+            "101101110001001111100101001001011",
+            "110000000111010000011001001101101",
+            "000010110010110001101111010111001",
+            "000001000101100010001011100101000",
+            "011111101110101001110000110111011",
+            "010000010000011001010100010000110",
+            "000100100101111010110000101011100",
+            "010000001111100110110100011111100",
+            "100011110000100110101111011011100",
+            "101011000110101101000111101011011",
+            "000100101001111111000010000110110",
+            "111010010111000011001011010010011",
+            "000100101001101011101100000001110",
+            "100010001001001011111001001001001",
+            "000010110001101011101001001111011",
+            "011100010001000000011000110011001",
+            "100000101000111011001010111111001",
+            "000000001101111110010001100011000",
+            "111111101000100010011011101010000",
+            "100000101101110010101111100011110",
+            "101110100011001100101111111110111",
+            "101110101000110101101110000101001",
+            "101110101011011100100011001101100",
+            "100000100101000011110000100110001",
+            "111111101001001011101101000010100"
+        ]
+    },
+    "it": {
+        "url": "https://plafonlinux.altlinux.team/luch-site/it/android.html",
+        "rows": [
+            "111111101011010000100010001111111",
+            "100000101110011000110000001000001",
+            "101110101100011000010101001011101",
+            "101110100111001111001101101011101",
+            "101110101101000110110010001011101",
+            "100000100100101111001101001000001",
+            "111111101010101010101010101111111",
+            "000000000000111110100001000000000",
+            "100111111101101011000001110010111",
+            "111110001001011110010011000011100",
+            "100110110000010101001111110011101",
+            "100011010100010011111010010100110",
+            "110010110011010010101011101100000",
+            "111101010000001000100101100001000",
+            "100100111000011110010100001111000",
+            "010110011001001000111010010001101",
+            "000111100101000010001011111111000",
+            "111000010111001100110110011010101",
+            "101110110110111100011001011101101",
+            "001011000010110010111010100011101",
+            "110011101011000111001000100101010",
+            "111101000110100101110111000111000",
+            "100010100100101111001101101011111",
+            "100101011001010001101001000010111",
+            "110011110011100000010001111110010",
+            "000000001000001111100000100010110",
+            "111111101100001110111111101010100",
+            "100000101101100100100001100011111",
+            "101110101111110000001011111110011",
+            "101110101010000100011111110100111",
+            "101110100000100111111000010110111",
+            "100000100101110010000001010111111",
+            "111111101101101111001001100110000"
+        ]
+    }
+};
+// The page for the language of the Deck: the site has Russian, English and Italian pages, English for the rest.
+const qrFor = (lang) => QR[lang] ?? QR.en;
+/** One SVG path for the dark modules, a run of modules in a row at a time. */
+const qrPath = (rows) => {
+    let d = "";
+    rows.forEach((row, y) => {
+        let x = 0;
+        while (x < row.length) {
+            if (row[x] === "1") {
+                let e = x;
+                while (e < row.length && row[e] === "1")
+                    e++;
+                d += `M${x} ${y}h${e - x}v1h-${e - x}z`;
+                x = e;
+            }
+            else
+                x++;
+        }
+    });
+    return d;
+};
+
 // The Luch mark as an outline, the same as the one in the Plasma panel widget (luch-outline.svg), in the colour of the text.
 const LuchIcon = () => (window.SP_REACT.createElement("svg", { width: "1em", height: "1em", viewBox: "0 0 22 22", fill: "none", stroke: "currentColor", strokeWidth: "1.4", strokeLinecap: "round", strokeLinejoin: "round" },
     window.SP_REACT.createElement("rect", { x: "3.5", y: "2.5", width: "15", height: "9", rx: "1.5" }),
@@ -461,6 +620,7 @@ function Content() {
     const [downFor, setDownFor] = SP_REACT.useState(0);
     // the mode, codec and size of a receiver are folded away until its arrow is pressed
     const [open, setOpen] = SP_REACT.useState({});
+    const [qrOpen, setQrOpen] = SP_REACT.useState(false);
     const refresh = async () => setS(await state());
     SP_REACT.useEffect(() => {
         refresh();
@@ -547,6 +707,18 @@ function Content() {
                                 await choose(r.id, r.source, o.data);
                                 refresh();
                             } })))))))),
+        window.SP_REACT.createElement(DFL.PanelSection, null,
+            window.SP_REACT.createElement(DFL.PanelSectionRow, null,
+                window.SP_REACT.createElement(DFL.DialogButton, { style: { width: "100%", textAlign: "left", padding: "10px 14px", display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }, onClick: () => setQrOpen((o) => !o) },
+                    window.SP_REACT.createElement("span", { style: { fontSize: "13px" } }, t("getReceiver")),
+                    window.SP_REACT.createElement("span", null, qrOpen ? "▴" : "▾"))),
+            qrOpen && (window.SP_REACT.createElement(window.SP_REACT.Fragment, null,
+                window.SP_REACT.createElement(Gap, { below: 10, size: 12, dim: true }, t("getReceiverText")),
+                window.SP_REACT.createElement(DFL.PanelSectionRow, null,
+                    window.SP_REACT.createElement("div", { style: { display: "flex", justifyContent: "center", paddingBottom: 6 } },
+                        window.SP_REACT.createElement("svg", { width: "176", height: "176", viewBox: "-4 -4 41 41", shapeRendering: "crispEdges", style: { background: "#fff", borderRadius: 6 } },
+                            window.SP_REACT.createElement("path", { d: qrPath(qrFor(lang).rows), fill: "#000" })))),
+                window.SP_REACT.createElement(Gap, { below: 4, size: 11, dim: true }, qrFor(lang).url.replace("https://", ""))))),
         window.SP_REACT.createElement(DFL.PanelSection, { title: t("sound") },
             window.SP_REACT.createElement(DFL.PanelSectionRow, null,
                 window.SP_REACT.createElement(DFL.ToggleField, { label: t("alsoHere"), description: t("alsoHereOff"), checked: s.local_audio ?? true, onChange: async (on) => {

@@ -2,6 +2,8 @@
 type Table = Record<string, string>;
 
 const en: Table = {
+  getReceiver: "Install the receiver on the other device",
+  getReceiverText: "To show the screen there, that device needs the Luch receiver. Point a phone camera at the code to open the page with the app for Android.",
   appName: "Luch",
   tagline: "Your screen on a TV, projector or phone, with game-streaming latency",
   receivers: "Devices",
@@ -43,6 +45,8 @@ const en: Table = {
 };
 
 const ru: Table = {
+  getReceiver: "Нужен приёмник на устройстве",
+  getReceiverText: "Чтобы показать экран на устройстве, на нём должен стоять приёмник Луча. Наведите камеру телефона на код: откроется страница с приложением для Android.",
   appName: "Луч",
   tagline: "Экран на ТВ, проектор или телефон с задержкой игрового стриминга",
   receivers: "Устройства",
@@ -84,6 +88,8 @@ const ru: Table = {
 };
 
 const uk: Table = {
+  getReceiver: "Потрібен приймач на пристрої",
+  getReceiverText: "Щоб показати екран на пристрої, на ньому має стояти приймач Променя. Наведіть камеру телефона на код: відкриється сторінка із застосунком для Android.",
   appName: "Промінь",
   tagline: "Екран на ТБ, проєктор чи телефон із затримкою ігрового стримінгу",
   receivers: "Пристрої",
@@ -125,6 +131,8 @@ const uk: Table = {
 };
 
 const de: Table = {
+  getReceiver: "Empfänger auf dem anderen Gerät installieren",
+  getReceiverText: "Damit der Bildschirm dort erscheint, braucht das Gerät den Luch-Empfänger. Richte die Handykamera auf den Code, um die Seite mit der Android-App zu öffnen.",
   appName: "Luch",
   tagline: "Dein Bildschirm auf TV, Beamer oder Handy, mit der Latenz von Spiele-Streaming",
   receivers: "Geräte",
@@ -166,6 +174,8 @@ const de: Table = {
 };
 
 const fr: Table = {
+  getReceiver: "Installer le récepteur sur l'autre appareil",
+  getReceiverText: "Pour y afficher l'écran, cet appareil doit avoir le récepteur Luch. Pointez la caméra d'un téléphone sur le code pour ouvrir la page de l'application Android.",
   appName: "Luch",
   tagline: "Votre écran sur une TV, un projecteur ou un téléphone, avec la latence du streaming de jeu",
   receivers: "Appareils",
@@ -207,6 +217,8 @@ const fr: Table = {
 };
 
 const es: Table = {
+  getReceiver: "Instala el receptor en el otro dispositivo",
+  getReceiverText: "Para mostrar la pantalla allí, ese dispositivo necesita el receptor de Luch. Apunta la cámara del móvil al código para abrir la página con la app de Android.",
   appName: "Luch",
   tagline: "Tu pantalla en una TV, proyector o móvil, con la latencia del streaming de juegos",
   receivers: "Dispositivos",
@@ -248,6 +260,8 @@ const es: Table = {
 };
 
 const it: Table = {
+  getReceiver: "Installa il ricevitore sull'altro dispositivo",
+  getReceiverText: "Per mostrare lo schermo lì, quel dispositivo ha bisogno del ricevitore Luch. Inquadra il codice con la fotocamera del telefono per aprire la pagina con l'app per Android.",
   appName: "Luch",
   tagline: "Il tuo schermo su TV, proiettore o telefono, con la latenza del game streaming",
   receivers: "Dispositivi",
@@ -289,6 +303,8 @@ const it: Table = {
 };
 
 const pt: Table = {
+  getReceiver: "Instale o receptor no outro dispositivo",
+  getReceiverText: "Para mostrar a tela lá, esse dispositivo precisa do receptor do Luch. Aponte a câmera do celular para o código para abrir a página com o app para Android.",
   appName: "Luch",
   tagline: "Sua tela na TV, projetor ou celular, com a latência do streaming de jogos",
   receivers: "Dispositivos",
@@ -330,6 +346,8 @@ const pt: Table = {
 };
 
 const pl: Table = {
+  getReceiver: "Zainstaluj odbiornik na drugim urządzeniu",
+  getReceiverText: "Aby pokazać tam ekran, urządzenie potrzebuje odbiornika Luch. Skieruj aparat telefonu na kod, aby otworzyć stronę z aplikacją na Androida.",
   appName: "Luch",
   tagline: "Twój ekran na telewizorze, projektorze lub telefonie, z opóźnieniem streamingu gier",
   receivers: "Urządzenia",
@@ -371,6 +389,8 @@ const pl: Table = {
 };
 
 const zh: Table = {
+  getReceiver: "在另一台设备上安装接收端",
+  getReceiverText: "要在那里显示屏幕，该设备需要安装 Luch 接收端。用手机相机对准二维码，即可打开包含 Android 应用的页面。",
   appName: "Luch",
   tagline: "以游戏串流级别的延迟，把屏幕投到电视、投影仪或手机",
   receivers: "设备",
