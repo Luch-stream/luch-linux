@@ -17,7 +17,7 @@ command -v flatpak >/dev/null || die "$(t 'Flatpak is not installed on this syst
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 
 # Run again from the shortcut when Luch is already there: ask whether to reinstall it (the latest version is downloaded) or remove it.
-if command -v kdialog >/dev/null && flatpak info --user "$APP" >/dev/null 2>&1 && [ -d "$HOME/homebrew/plugins/Luch" ]; then
+if command -v kdialog >/dev/null && flatpak info --user "$APP" >/dev/null 2>&1 && grep -qs '"name": *"Luch' "$HOME"/homebrew/plugins/*/plugin.json; then
     kd --yes-label "$(t Reinstall Переустановить)" --no-label "$(t Remove Удалить)" --cancel-label "$(t Close Закрыть)" \
         --yesnocancel "$(t 'Luch is already installed on this Steam Deck.' 'Луч уже установлен на этом Steam Deck.')"$'\n\n'"$(t 'Reinstall it (the latest version is downloaded), or remove it?' 'Переустановить (скачается последняя версия) или удалить?')"
     case $? in

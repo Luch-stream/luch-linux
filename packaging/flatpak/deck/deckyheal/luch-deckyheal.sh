@@ -7,7 +7,11 @@ set -u
 LUCH_MANAGE_DECKY=${LUCH_MANAGE_DECKY:-0}
 HOME_DIR=$(getent passwd "$LUCH_USER" | cut -d: -f6)
 HB=$HOME_DIR/homebrew
+# The folder that holds the Luch plugin (a store install may name it otherwise), else Luch.
 PLUG=$HB/plugins/Luch
+for d in "$HB"/plugins/*/; do
+    if grep -qs '"name": *"Luch' "${d}plugin.json"; then PLUG=${d%/}; break; fi
+done
 BACKUP=/var/lib/luch/plugin
 STAMP=/var/lib/luch/decky-reinstall
 say() { echo "luch-deckyheal: $*"; }

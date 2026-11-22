@@ -1,11 +1,16 @@
 {
-  "name": "Luch",
+  "name": "Luch Streaming",
   "author": "plafonlinux",
-  "flags": ["root"],
+  "flags": [
+    "root"
+  ],
   "api_version": 1,
   "publish": {
-    "tags": ["streaming", "utility"],
-    "description": "Mirror the Steam Deck screen to a TV or projector with Luch: pick a receiver, a mode and a size from the Quick Access menu.",
+    "tags": [
+      "streaming",
+      "utility"
+    ],
+    "description": "Luch: your screen on a TV, projector or phone, with game-streaming latency. Pick a device, a mode and a size from the Quick Access menu.",
     "image": "https://opengraph.githubassets.com/1/Toxblh/luch-linux"
   }
 }

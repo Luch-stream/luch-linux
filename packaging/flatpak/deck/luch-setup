@@ -15,7 +15,9 @@ MANAGE_DECKY=${LUCH_MANAGE_DECKY:-0}
 DRY=0
 
 PLUGINS=${DECKY_PLUGINS:-$HOME/homebrew/plugins}
-PLUGIN_DIR=$PLUGINS/Luch
+# The folder of the Luch plugin: the one that already holds it (a plugin from the Decky store may be in a folder of another
+# name), else a new one called Luch.
+PLUGIN_DIR=$(host sh -c "for d in '$PLUGINS'/*/; do grep -qs '\"name\": *\"Luch' \"\${d}plugin.json\" && { echo \"\${d%/}\"; exit; }; done; echo '$PLUGINS/Luch'")
 UNIT=$HOME/.config/systemd/user/luchd-flatpak.service
 
 list() {
