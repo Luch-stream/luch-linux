@@ -119,6 +119,12 @@ WantedBy=default.target
 UNIT
         systemctl --user daemon-reload
         systemctl --user enable --now luchd-flatpak.service
+        # A shortcut "Luch" on the desktop: starts install.sh, which reinstalls or removes Luch when it is already installed.
+        D=\$(xdg-user-dir DESKTOP 2>/dev/null || echo \$HOME/Desktop)
+        mkdir -p \"\$D\" \$HOME/.local/share/icons/hicolor/scalable/apps
+        cp -a '$LOC/files/share/icons/hicolor/scalable/apps/toxblh.luch.Luch.svg' \$HOME/.local/share/icons/hicolor/scalable/apps/
+        sed 's/^Icon=.*/Icon=toxblh.luch.Luch/; s/^Name=.*/Name=Luch/; s/^Name\\[ru\\]=.*/Name[ru]=Луч/' '$LOC/files/share/luch/Install-Luch.desktop' > \"\$D/Luch.desktop\"
+        chmod +x \"\$D/Luch.desktop\"
         # The Luch widget for the system tray (Plasma): the package, then the tray settings (shown always; the entry
         # Plasma makes by itself for the background daemon is hidden, the widget replaces it). Plasma restarts only when the tray changed.
         W=\$HOME/.local/share/plasma/plasmoids/toxblh.luch.panel

@@ -65,6 +65,7 @@ modules:
       - cp -a packaging/flatpak/deck/decky-plugin /app/share/luch/decky-plugin
       - install -Dm755 packaging/flatpak/deck/luch-setup /app/bin/luch-setup
       - mkdir -p /app/share/luch && cp -a packaging/flatpak/deck/plasmoid /app/share/luch/plasmoid
+      - install -Dm644 packaging/flatpak/deck/Install-Luch.desktop /app/share/luch/Install-Luch.desktop
       - install -Dm755 packaging/flatpak/deck/deckyheal/luch-deckyheal.sh /app/share/luch/deckyheal/luch-deckyheal.sh
       - install -Dm755 packaging/flatpak/deck/deckyheal/luch-decky-install.sh /app/share/luch/deckyheal/luch-decky-install.sh
       - install -Dm644 packaging/flatpak/deck/deckyheal/luch-deckyheal.service /app/share/luch/deckyheal/luch-deckyheal.service
