@@ -93,6 +93,7 @@ ROOT_SCRIPT="
     install -m644 '$LOC/files/share/luch/deckyheal/luch-deckyheal.service' '$LOC/files/share/luch/deckyheal/luch-deckyheal.timer' /etc/systemd/system/
     echo 'LUCH_USER=$USER_NAME' > /etc/luch/heal.conf
     systemctl daemon-reload; systemctl enable --now luch-deckyheal.timer
+    if grep -qsE '^disable-(user-service-)?publishing=yes' /etc/avahi/avahi-daemon.conf; then sed -i -E 's/^(disable-(user-service-)?publishing)=yes/\\1=no/' /etc/avahi/avahi-daemon.conf; systemctl restart avahi-daemon; fi
     systemctl restart plugin_loader
     echo plugin
 "

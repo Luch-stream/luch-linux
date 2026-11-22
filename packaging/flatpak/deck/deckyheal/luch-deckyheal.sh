@@ -50,6 +50,14 @@ if [ -n "$LOC" ] && [ -f "$LOC/files/share/luch/helper/luch-kms" ] && [ -d "$PLU
     systemctl start plugin_loader
 fi
 
+# 2c. SteamOS ships Avahi with publishing off, so luchd cannot announce this Deck as a sender; switch it on again after an update.
+if grep -qsE '^disable-(user-service-)?publishing=yes' /etc/avahi/avahi-daemon.conf; then
+    say "Avahi publishing was switched off, turning it on so that receivers see this Deck"
+    sed -i -E 's/^(disable-(user-service-)?publishing)=yes/\1=no/' /etc/avahi/avahi-daemon.conf
+    systemctl restart avahi-daemon
+    runuser -u "$LUCH_USER" -- systemctl --user restart luchd-flatpak.service 2>/dev/null || true
+fi
+
 # 3. Decky Loader does not run or does not answer: restart it, and if that does not help, reinstall it
 #    (luch-decky-install.sh: the ALS mirror first, GitHub if ALS does not answer, at most once in 12 hours).
 if ! loader_ok; then
