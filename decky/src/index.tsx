@@ -243,8 +243,6 @@ function Content() {
             )}
           </div>
         ))}
-      </PanelSection>
-      <PanelSection>
         <PanelSectionRow>
           <DialogButton
             style={{ width: "100%", textAlign: "left", padding: "10px 14px", display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }}
@@ -260,8 +258,8 @@ function Content() {
             <PanelSectionRow>
               <div style={{ display: "flex", justifyContent: "center", paddingBottom: 6 }}>
                 <svg
-                  width="176"
-                  height="176"
+                  width="124"
+                  height="124"
                   viewBox="-4 -4 41 41"
                   shapeRendering="crispEdges"
                   style={{ background: "#fff", borderRadius: 6 }}

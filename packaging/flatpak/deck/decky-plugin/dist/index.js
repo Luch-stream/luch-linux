@@ -706,8 +706,7 @@ function Content() {
                         window.SP_REACT.createElement(DFL.DropdownItem, { label: t("size"), rgOptions: (s.sizes ?? []).map((v) => ({ data: v, label: v.replace("x", "×") })), selectedOption: r.size, onChange: async (o) => {
                                 await choose(r.id, r.source, o.data);
                                 refresh();
-                            } })))))))),
-        window.SP_REACT.createElement(DFL.PanelSection, null,
+                            } }))))))),
             window.SP_REACT.createElement(DFL.PanelSectionRow, null,
                 window.SP_REACT.createElement(DFL.DialogButton, { style: { width: "100%", textAlign: "left", padding: "10px 14px", display: "flex", justifyContent: "space-between", alignItems: "center", gap: 8 }, onClick: () => setQrOpen((o) => !o) },
                     window.SP_REACT.createElement("span", { style: { fontSize: "13px" } }, t("getReceiver")),
@@ -716,7 +715,7 @@ function Content() {
                 window.SP_REACT.createElement(Gap, { below: 10, size: 12, dim: true }, t("getReceiverText")),
                 window.SP_REACT.createElement(DFL.PanelSectionRow, null,
                     window.SP_REACT.createElement("div", { style: { display: "flex", justifyContent: "center", paddingBottom: 6 } },
-                        window.SP_REACT.createElement("svg", { width: "176", height: "176", viewBox: "-4 -4 41 41", shapeRendering: "crispEdges", style: { background: "#fff", borderRadius: 6 } },
+                        window.SP_REACT.createElement("svg", { width: "124", height: "124", viewBox: "-4 -4 41 41", shapeRendering: "crispEdges", style: { background: "#fff", borderRadius: 6 } },
                             window.SP_REACT.createElement("path", { d: qrPath(qrFor(lang).rows), fill: "#000" })))),
                 window.SP_REACT.createElement(Gap, { below: 4, size: 11, dim: true }, qrFor(lang).url.replace("https://", ""))))),
         window.SP_REACT.createElement(DFL.PanelSection, { title: t("sound") },
