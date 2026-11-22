@@ -16,6 +16,18 @@ die() { kd --error "$1" || echo "$1" >&2; exit 1; }
 command -v flatpak >/dev/null || die "$(t 'Flatpak is not installed on this system.' 'В системе нет Flatpak.')"
 tmp=$(mktemp -d); trap 'rm -rf "$tmp"' EXIT
 
+# Run again from the shortcut when Luch is already there: ask whether to reinstall it (the latest version is downloaded) or remove it.
+if command -v kdialog >/dev/null && flatpak info --user "$APP" >/dev/null 2>&1 && [ -d "$HOME/homebrew/plugins/Luch" ]; then
+    kd --yes-label "$(t Reinstall Переустановить)" --no-label "$(t Remove Удалить)" --cancel-label "$(t Close Закрыть)" \
+        --yesnocancel "$(t 'Luch is already installed on this Steam Deck.' 'Луч уже установлен на этом Steam Deck.')"$'\n\n'"$(t 'Reinstall it (the latest version is downloaded), or remove it?' 'Переустановить (скачается последняя версия) или удалить?')"
+    case $? in
+        0) ;;                                                    # reinstall: go on to the download
+        1) flatpak run --command=luch-setup "$APP" --remove &&
+               kd --msgbox "$(t 'Luch has been removed.' 'Луч удалён.')"; exit 0 ;;
+        *) exit 0 ;;
+    esac
+fi
+
 ref=$(kd --progressbar "$(t 'Downloading the Luch installer...' 'Скачиваем установщик Луча...')" 0)   # 0: a busy bar
 close() { [ -n "$ref" ] && qdbus6 $ref close >/dev/null 2>&1 || true; }
 
