@@ -52,6 +52,20 @@ PlasmoidItem {
             root.receivers = rows
         })
     }
+    // A show is already running somewhere else: ask before starting another (stop it, or show to both).
+    property var pending: null
+    function begin(id, what) {
+        const others = receivers.filter(r => r.mirroring && r.id !== id)
+        if (what === "stop" || others.length === 0) { act(id, what); return }
+        pending = { id: id, what: what, others: others }
+    }
+    function confirmPending(stopOthers) {
+        const p = pending
+        pending = null
+        if (!p) return
+        if (stopOthers) p.others.forEach(o => act(o.id, "stop"))
+        act(p.id, p.what)
+    }
     function act(id, what) {
         exec.run(ctl + (what === "stop" ? "stop " : "mirror ") + id + (what === "stop" ? "" : " " + what), () => refresh())
     }
@@ -104,6 +118,29 @@ PlasmoidItem {
             }
         }
 
+        Rectangle {   // the question: another show is running
+            anchors.fill: parent
+            visible: root.pending !== null
+            color: Qt.alpha(Kirigami.Theme.backgroundColor, 0.94)
+            z: 10
+            MouseArea { anchors.fill: parent }   // swallows clicks under the question
+            ColumnLayout {
+                anchors.centerIn: parent
+                width: parent.width - Kirigami.Units.gridUnit * 3
+                spacing: Kirigami.Units.largeSpacing
+                Kirigami.Icon { source: "dialog-warning"; Layout.alignment: Qt.AlignHCenter; implicitWidth: Kirigami.Units.iconSizes.huge; implicitHeight: implicitWidth }
+                Kirigami.Heading { level: 3; text: root.tr("A show is already running", "Показ уже идёт"); Layout.fillWidth: true; horizontalAlignment: Text.AlignHCenter; wrapMode: Text.Wrap }
+                PC3.Label {
+                    Layout.fillWidth: true; horizontalAlignment: Text.AlignHCenter; wrapMode: Text.Wrap
+                    text: root.pending ? root.tr("Showing to ", "Сейчас идёт показ на: ") + root.pending.others.map(o => o.name).join(", ")
+                                           + root.tr(". Stop it first, or show to both?", ". Остановить его перед новым или показывать на оба?") : ""
+                }
+                PC3.Button { Layout.fillWidth: true; highlighted: true; text: root.tr("Stop it and start", "Остановить и начать"); icon.name: "media-playback-stop"; onClicked: root.confirmPending(true) }
+                PC3.Button { Layout.fillWidth: true; text: root.tr("Show to both", "Показывать на оба"); onClicked: root.confirmPending(false) }
+                PC3.Button { Layout.fillWidth: true; flat: true; text: root.tr("Cancel", "Отмена"); onClicked: root.pending = null }
+            }
+        }
+
         contentItem: ListView {
             id: list
             model: root.receivers
@@ -145,7 +182,7 @@ PlasmoidItem {
                             highlighted: true
                             text: root.tr("Show screen", "Показать экран")
                             icon.name: "media-playback-start"
-                            onClicked: root.act(modelData.id, "fast")
+                            onClicked: root.begin(modelData.id, "fast")
                         }
                         PC3.Button {
                             visible: modelData.mirroring
@@ -158,9 +195,9 @@ PlasmoidItem {
                     Flow {
                         Layout.fillWidth: true
                         spacing: Kirigami.Units.smallSpacing
-                        PC3.Button { flat: true; text: root.tr("Pick a screen", "Выбрать экран"); icon.name: "monitor"; onClicked: root.act(modelData.id, "monitor") }
-                        PC3.Button { flat: true; text: root.tr("One window", "Одно окно"); icon.name: "window"; onClicked: root.act(modelData.id, "window") }
-                        PC3.Button { flat: true; text: root.tr("Second screen", "Второй экран"); icon.name: "video-display-add"; onClicked: root.act(modelData.id, "virtual") }
+                        PC3.Button { flat: true; text: root.tr("Pick a screen", "Выбрать экран"); icon.name: "monitor"; onClicked: root.begin(modelData.id, "monitor") }
+                        PC3.Button { flat: true; text: root.tr("One window", "Одно окно"); icon.name: "window"; onClicked: root.begin(modelData.id, "window") }
+                        PC3.Button { flat: true; text: root.tr("Second screen", "Второй экран"); icon.name: "video-display-add"; onClicked: root.begin(modelData.id, "virtual") }
                     }
                 }
             }

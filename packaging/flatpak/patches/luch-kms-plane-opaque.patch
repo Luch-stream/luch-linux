@@ -1,0 +1,26 @@
+diff --git a/luch-kms/src/kms.c b/luch-kms/src/kms.c
+index 7d44202..df75f44 100644
+--- a/luch-kms/src/kms.c
++++ b/luch-kms/src/kms.c
+@@ -256,16 +256,18 @@ static Cursor read_cursor(int fd, const PlaneProps *pp) {
+     return c;
+ }
+ 
+-/// The biggest active plane: the desktop's primary plane on the main monitor.
++/// The biggest active plane without an alpha channel (gamescope keeps the game there and draws the Steam overlay on a bigger
++/// ARGB plane: taking that one shows a black picture); the biggest of any kind if every plane has alpha.
+ static uint32_t find_plane(int fd) {
+     drmModePlaneRes *pr = drmModeGetPlaneResources(fd);
+     if (!pr) DIE("no plane resources");
+-    uint32_t best = 0, area = 0;
++    uint32_t best = 0; uint64_t area = 0;
+     for (uint32_t i = 0; i < pr->count_planes; i++) {
+         drmModePlane *p = drmModeGetPlane(fd, pr->planes[i]);
+         if (p && p->fb_id) {
+             drmModeFB2 *fb = drmModeGetFB2(fd, p->fb_id);
+-            if (fb && fb->width * fb->height > area) { area = fb->width * fb->height; best = p->plane_id; }
++            uint64_t score = fb ? (uint64_t)fb->width * fb->height + ((fb->pixel_format & 0xff) == 'A' ? 0 : 1ull << 40) : 0;
++            if (fb && score > area) { area = score; best = p->plane_id; }
+             if (fb) drmModeFreeFB2(fb);
+         }
+         if (p) drmModeFreePlane(p);

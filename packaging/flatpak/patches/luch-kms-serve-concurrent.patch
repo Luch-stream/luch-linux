@@ -1,0 +1,25 @@
+diff --git a/luch-kms/src/main.rs b/luch-kms/src/main.rs
+index 423261d..d387558 100644
+--- a/luch-kms/src/main.rs
++++ b/luch-kms/src/main.rs
+@@ -78,11 +78,18 @@ fn serve(path: &str, uid: Option<u32>) -> std::io::Result<()> {
+         let Ok(input) = conn.try_clone() else {
+             continue;
+         };
+-        let _ = Command::new(&exe)
++        // One child per client and the loop goes on: two receivers can be shown to at once, and a session that is still
++        // running (a phone left on) must not keep the next one waiting with a black picture.
++        if let Ok(mut child) = Command::new(&exe)
+             .args(args)
+             .stdin(Stdio::from(OwnedFd::from(input)))
+             .stdout(Stdio::from(OwnedFd::from(conn)))
+-            .status();
++            .spawn()
++        {
++            std::thread::spawn(move || {
++                let _ = child.wait();
++            });
++        }
+     }
+     Ok(())
+ }

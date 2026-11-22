@@ -163,6 +163,14 @@ def _call(method, signature="", *values):
     return _busctl("call", BUS, PATH, IFACE, method, *([signature, *map(str, values)] if signature else []))
 
 
+def _codec(rid, choice):
+    """The codec luchd remembers for a receiver; this plugin's own copy when luchd cannot say."""
+    try:
+        return _call("GetCodec", "s", rid)["data"][0]
+    except RuntimeError:
+        return choice.get("codec", "auto")
+
+
 def _load():
     try:
         with open(SETTINGS) as f:
@@ -201,18 +209,33 @@ class Plugin:
                 "connected": connected, "mirroring": mirroring,
                 "source": choice.get("source", sources[0] if sources else "fast"),
                 "size": choice.get("size", "1920x1080"),
+                "codec": _codec(rid, choice),
             })
         return {"up": True, "receivers": receivers, "sources": sources, "sizes": SIZES, "local_audio": local_audio,
                 "dim_screen": saved.get("dim_screen", False)}
 
     async def choose(self, rid: str, source: str, size: str):
         data = _load()
-        data[rid] = {"source": source, "size": size}
+        data[rid] = {**data.get(rid, {}), "source": source, "size": size}
         _save(data)
+
+    async def choose_codec(self, rid: str, codec: str):
+        """auto, hevc or avc for this receiver: kept by luchd (so it holds for every front-end) and here as a fallback."""
+        data = _load()
+        data[rid] = {**data.get(rid, {}), "codec": codec}
+        _save(data)
+        try:
+            _call("SetCodec", "ss", rid, codec)
+        except RuntimeError:  # an older luchd without SetCodec
+            pass
 
     async def start(self, rid: str, source: str, size: str):
         w, h = size.split("x")
         await self.choose(rid, source, size)
+        try:  # the saved choice of the video codec (an older luchd has no SetCodec: it picks by itself)
+            _call("SetCodec", "ss", rid, _load().get(rid, {}).get("codec", "auto"))
+        except RuntimeError:
+            pass
         try:
             _call("MirrorSized", "ssuu", rid, source, w, h)
         except RuntimeError:  # an older luchd without MirrorSized: 1920x1080

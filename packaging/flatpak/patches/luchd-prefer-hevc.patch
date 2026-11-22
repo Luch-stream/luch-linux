@@ -1,0 +1,99 @@
+diff --git a/luchd/src/main.rs b/luchd/src/main.rs
+index 984b271..9f3f136 100644
+--- a/luchd/src/main.rs
++++ b/luchd/src/main.rs
+@@ -61,6 +61,7 @@ struct State {
+     mirrors: HashMap<String, mpsc::Sender<()>>, // id -> stop signal
+     stats: HashMap<String, mirror::Stats>,      // id -> live mirroring stats
+     welcomes: HashMap<String, Value>,           // id -> last welcome (hw passport, decoder bench)
++    codec: HashMap<String, String>,             // id -> "auto" | "avc" | "hevc": a person's choice of the video codec
+ }
+ type Shared = Arc<Mutex<State>>;
+ 
+@@ -230,6 +231,27 @@ impl Luch {
+             .unwrap_or_else(|| "{}".into())
+     }
+ 
++    /// The video codec for the next show to a receiver: "auto" (HEVC when the receiver decodes it about as fast as
++    /// H.264, else the receiver's own pick), "hevc" or "avc". Kept until luchd restarts; front-ends save the choice.
++    async fn set_codec(&self, id: String, codec: String) -> fdo::Result<()> {
++        if !["auto", "avc", "hevc"].contains(&codec.as_str()) {
++            return Err(fdo::Error::InvalidArgs(format!(
++                "codec must be auto|avc|hevc, not {codec}"
++            )));
++        }
++        save_codec(&id, &codec);
++        self.st.lock().await.codec.insert(id, codec);
++        Ok(())
++    }
++
++    /// The saved choice for a receiver ("auto" when none).
++    async fn get_codec(&self, id: String) -> String {
++        match self.st.lock().await.codec.get(&id).cloned() {
++            Some(c) => c,
++            None => saved_codecs().remove(&id).unwrap_or_else(|| "auto".into()),
++        }
++    }
++
+     async fn stop_mirror(&self, id: String) -> fdo::Result<()> {
+         let tx = self.st.lock().await.mirrors.get(&id).cloned();
+         let tx = tx.ok_or_else(|| fdo::Error::InvalidArgs(format!("not mirroring: {id}")))?;
+@@ -470,10 +492,26 @@ async fn start_mirror(
+     let (c, r) = c
+         .zip(r)
+         .ok_or_else(|| fdo::Error::Failed("receiver went away".into()))?;
+-    let prefer = welcome["bench"]["prefer"]
+-        .as_str()
+-        .unwrap_or("video/avc")
+-        .to_string();
++    // HEVC carries the same picture in less data. The receiver's own pick favours H.264 unless HEVC is clearly faster
++    // to decode; here HEVC also wins when it decodes about as fast (within 1 ms), as long as the receiver has a decoder
++    // for it and its bench ran. A person's choice (SetCodec) beats both.
++    let bench_ms = |mime: &str| welcome["bench"][mime]["ms"].as_f64();
++    let has_hevc = welcome["decoders"]
++        .as_array()
++        .is_some_and(|d| d.iter().any(|m| m.as_str() == Some("video/hevc")));
++    let chosen = match st.lock().await.codec.get(id).cloned() {
++        Some(c) => c,
++        None => saved_codecs().get(id).cloned().unwrap_or_default(),
++    };
++    let prefer = match (chosen.as_str(), bench_ms("video/avc"), bench_ms("video/hevc")) {
++        ("avc", _, _) => "video/avc".to_string(),
++        ("hevc", _, _) if has_hevc => "video/hevc".to_string(),
++        (_, Some(avc), Some(hevc)) if has_hevc && hevc <= avc + 1.0 => "video/hevc".to_string(),
++        _ => welcome["bench"]["prefer"]
++            .as_str()
++            .unwrap_or("video/avc")
++            .to_string(),
++    };
+     let size = if requested != (0, 0) {
+         display::Size {
+             width: requested.0,
+@@ -1025,6 +1063,27 @@ pub(crate) fn config_dir() -> io::Result<std::path::PathBuf> {
+     Ok(dir)
+ }
+ 
++/// The video codec chosen per receiver, kept in ~/.config/luch/codec (one `id=codec` line each), so that the choice
++/// survives restarts and holds whichever front-end starts the show.
++fn saved_codecs() -> HashMap<String, String> {
++    let text = config_dir()
++        .and_then(|d| std::fs::read_to_string(d.join("codec")))
++        .unwrap_or_default();
++    text.lines()
++        .filter_map(|l| l.split_once('='))
++        .map(|(k, v)| (k.to_string(), v.trim().to_string()))
++        .collect()
++}
++
++fn save_codec(id: &str, codec: &str) {
++    let mut all = saved_codecs();
++    all.insert(id.to_string(), codec.to_string());
++    if let Ok(d) = config_dir() {
++        let text: String = all.iter().map(|(k, v)| format!("{k}={v}\n")).collect();
++        let _ = std::fs::write(d.join("codec"), text);
++    }
++}
++
+ fn sender_id() -> io::Result<String> {
+     let dir = config_dir()?;
+     let path = dir.join("id");

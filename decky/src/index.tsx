@@ -1,9 +1,11 @@
 import {
   ButtonItem,
+  ConfirmModal,
   DropdownItem,
   PanelSection,
   PanelSectionRow,
   ToggleField,
+  showModal,
   staticClasses,
 } from "@decky/ui";
 import { callable, definePlugin } from "@decky/api";
@@ -18,6 +20,7 @@ type Receiver = {
   mirroring: boolean;
   source: string;
   size: string;
+  codec: string;
 };
 
 type State = {
@@ -34,6 +37,7 @@ const state = callable<[], State>("state");
 const choose = callable<[string, string, string], void>("choose");
 const start = callable<[string, string, string], void>("start");
 const stop = callable<[string], void>("stop");
+const chooseCodec = callable<[string, string], void>("choose_codec");
 const setLocalAudio = callable<[boolean], void>("set_local_audio");
 const setDimScreen = callable<[boolean], void>("set_dim_screen");
 
@@ -51,9 +55,19 @@ const STR: Record<string, [string, string]> = {
     "Луч не запущен. Запустите службу luchd (flatpak run toxblh.luch.Luch).",
   ],
   mirroring: ["Mirroring — press to stop", "Идёт показ — нажмите, чтобы остановить"],
+  busyTitle: ["A show is already running", "Показ уже идёт"],
+  busyText: [
+    "Showing to %s. Stop it first, or show to both?",
+    "Сейчас идёт показ на: %s. Остановить его перед новым или показывать на оба?",
+  ],
+  stopAndStart: ["Stop it and start", "Остановить и начать"],
+  both: ["Show to both", "Показывать на оба"],
+  cancel: ["Cancel", "Отмена"],
   connected: ["Connected", "Подключён"],
   mode: ["Mode", "Режим"],
   size: ["Size", "Размер"],
+  codec: ["Video codec", "Видеокодек"],
+  codecAuto: ["Auto", "Авто"],
   sound: ["Sound", "Звук"],
   alsoHere: ["Also play on this device", "Играть звук и на этом устройстве"],
   screen: ["Screen", "Экран"],
@@ -108,9 +122,36 @@ function Content() {
               <ButtonItem
                 layout="below"
                 onClick={async () => {
-                  if (r.mirroring) await stop(r.id);
-                  else await start(r.id, r.source, r.size);
-                  refresh();
+                  if (r.mirroring) {
+                    await stop(r.id);
+                    refresh();
+                    return;
+                  }
+                  // Another show is running: ask what to do with it first.
+                  const others = s.receivers.filter((x) => x.mirroring && x.id !== r.id);
+                  if (others.length === 0) {
+                    await start(r.id, r.source, r.size);
+                    refresh();
+                    return;
+                  }
+                  showModal(
+                    <ConfirmModal
+                      strTitle={t("busyTitle")}
+                      strDescription={t("busyText").replace("%s", others.map((x) => x.name).join(", "))}
+                      strOKButtonText={t("stopAndStart")}
+                      strMiddleButtonText={t("both")}
+                      strCancelButtonText={t("cancel")}
+                      onOK={async () => {
+                        for (const o of others) await stop(o.id);
+                        await start(r.id, r.source, r.size);
+                        refresh();
+                      }}
+                      onMiddleButton={async () => {
+                        await start(r.id, r.source, r.size);
+                        refresh();
+                      }}
+                    />,
+                  );
                 }}
                 description={r.mirroring ? t("mirroring") : r.connected ? t("connected") : r.model}
               >
@@ -125,6 +166,21 @@ function Content() {
                 selectedOption={r.source}
                 onChange={async (o) => {
                   await choose(r.id, o.data, r.size);
+                  refresh();
+                }}
+              />
+            </PanelSectionRow>
+            <PanelSectionRow>
+              <DropdownItem
+                label={t("codec")}
+                rgOptions={[
+                  { data: "auto", label: t("codecAuto") },
+                  { data: "hevc", label: "HEVC (H.265)" },
+                  { data: "avc", label: "H.264" },
+                ]}
+                selectedOption={r.codec ?? "auto"}
+                onChange={async (o) => {
+                  await chooseCodec(r.id, o.data);
                   refresh();
                 }}
               />

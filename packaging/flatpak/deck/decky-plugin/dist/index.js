@@ -86,6 +86,7 @@ const state = callable("state");
 const choose = callable("choose");
 const start = callable("start");
 const stop = callable("stop");
+const chooseCodec = callable("choose_codec");
 const setLocalAudio = callable("set_local_audio");
 const setDimScreen = callable("set_dim_screen");
 // Steam UI language: Russian if the Deck is set to Russian, English otherwise.
@@ -101,9 +102,19 @@ const STR = {
         "Луч не запущен. Запустите службу luchd (flatpak run toxblh.luch.Luch).",
     ],
     mirroring: ["Mirroring — press to stop", "Идёт показ — нажмите, чтобы остановить"],
+    busyTitle: ["A show is already running", "Показ уже идёт"],
+    busyText: [
+        "Showing to %s. Stop it first, or show to both?",
+        "Сейчас идёт показ на: %s. Остановить его перед новым или показывать на оба?",
+    ],
+    stopAndStart: ["Stop it and start", "Остановить и начать"],
+    both: ["Show to both", "Показывать на оба"],
+    cancel: ["Cancel", "Отмена"],
     connected: ["Connected", "Подключён"],
     mode: ["Mode", "Режим"],
     size: ["Size", "Размер"],
+    codec: ["Video codec", "Видеокодек"],
+    codecAuto: ["Auto", "Авто"],
     sound: ["Sound", "Звук"],
     alsoHere: ["Also play on this device", "Играть звук и на этом устройстве"],
     screen: ["Screen", "Экран"],
@@ -144,17 +155,42 @@ function Content() {
             s.receivers.map((r) => (window.SP_REACT.createElement("div", { key: r.id },
                 window.SP_REACT.createElement(DFL.PanelSectionRow, null,
                     window.SP_REACT.createElement(DFL.ButtonItem, { layout: "below", onClick: async () => {
-                            if (r.mirroring)
+                            if (r.mirroring) {
                                 await stop(r.id);
-                            else
+                                refresh();
+                                return;
+                            }
+                            // Another show is running: ask what to do with it first.
+                            const others = s.receivers.filter((x) => x.mirroring && x.id !== r.id);
+                            if (others.length === 0) {
                                 await start(r.id, r.source, r.size);
-                            refresh();
+                                refresh();
+                                return;
+                            }
+                            DFL.showModal(window.SP_REACT.createElement(DFL.ConfirmModal, { strTitle: t("busyTitle"), strDescription: t("busyText").replace("%s", others.map((x) => x.name).join(", ")), strOKButtonText: t("stopAndStart"), strMiddleButtonText: t("both"), strCancelButtonText: t("cancel"), onOK: async () => {
+                                    for (const o of others)
+                                        await stop(o.id);
+                                    await start(r.id, r.source, r.size);
+                                    refresh();
+                                }, onMiddleButton: async () => {
+                                    await start(r.id, r.source, r.size);
+                                    refresh();
+                                } }));
                         }, description: r.mirroring ? t("mirroring") : r.connected ? t("connected") : r.model },
                         r.mirroring ? "■ " : "▶ ",
                         r.name)),
                 window.SP_REACT.createElement(DFL.PanelSectionRow, null,
                     window.SP_REACT.createElement(DFL.DropdownItem, { label: t("mode"), rgOptions: (s.sources ?? []).map((v) => ({ data: v, label: srcTitle(v) })), selectedOption: r.source, onChange: async (o) => {
                             await choose(r.id, o.data, r.size);
+                            refresh();
+                        } })),
+                window.SP_REACT.createElement(DFL.PanelSectionRow, null,
+                    window.SP_REACT.createElement(DFL.DropdownItem, { label: t("codec"), rgOptions: [
+                            { data: "auto", label: t("codecAuto") },
+                            { data: "hevc", label: "HEVC (H.265)" },
+                            { data: "avc", label: "H.264" },
+                        ], selectedOption: r.codec ?? "auto", onChange: async (o) => {
+                            await chooseCodec(r.id, o.data);
                             refresh();
                         } })),
                 window.SP_REACT.createElement(DFL.PanelSectionRow, null,

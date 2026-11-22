@@ -1,0 +1,84 @@
+diff --git a/luch-kms/src/kms.c b/luch-kms/src/kms.c
+index 7d44202..674a7b1 100644
+--- a/luch-kms/src/kms.c
++++ b/luch-kms/src/kms.c
+@@ -42,6 +42,70 @@ static int64_t mono_us(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC,
+ #define DIE(...) do { fprintf(stderr, "luch-kms: " __VA_ARGS__); fputc('\n', stderr); exit(1); } while (0)
+ static void ck(int r, const char *what) { if (r < 0) { char s[128]; av_strerror(r, s, sizeof s); DIE("%s: %s", what, s); } }
+ 
++
++// Mesa's radeonsi HEVC encoder leaves slice_loop_filter_across_slices_enabled_flag out of the slice header, while the PPS
++// that ffmpeg writes says pps_loop_filter_across_slices_enabled_flag = 1, i.e. that the flag is there: every decoder
++// reads a broken header and shows garbage. When the first IDR slice shows the flag missing, the flag is cleared in each
++// PPS we send (one slice per picture, so across-slice filtering is no loss). An encoder that writes it correctly is left alone.
++static int hevc_pps_fix = -1; // -1 not decided yet, 0 stream is fine, 1 clear the flag in the PPS
++
++static int rbit(const uint8_t *b, int pos) { return (b[pos >> 3] >> (7 - (pos & 7))) & 1; }
++static unsigned rue(const uint8_t *b, int *pos) {
++    int z = 0;
++    while (z < 24 && !rbit(b, *pos)) { (*pos)++; z++; }
++    (*pos)++;
++    unsigned v = 0;
++    for (int i = 0; i < z; i++) v = v << 1 | rbit(b, (*pos)++);
++    return (1u << z) - 1 + v;
++}
++
++static void hevc_fix_pps(uint8_t *d, int n) {
++    uint8_t *pps = NULL;
++    for (int i = 0; i + 4 < n; i++) {
++        if (d[i] || d[i + 1] || d[i + 2] != 1) continue;
++        uint8_t *nal = d + i + 3;
++        int t = (nal[0] >> 1) & 0x3f, left_in_nal = n - (i + 3);
++        if (t == 34) pps = nal;
++        if ((t != 19 && t != 20) || hevc_pps_fix >= 0) continue;
++        uint8_t r[24] = {0};
++        for (int k = 0, m = 0; k < 24 && k < left_in_nal; k++) {
++            if (k >= 2 && nal[k] == 3 && !nal[k - 1] && !nal[k - 2]) continue; // emulation prevention
++            r[m++] = nal[k];
++        }
++        int pos = 16; // after the NAL unit header
++        if (!rbit(r, pos++)) continue; // first_slice_segment_in_pic_flag
++        pos++; // no_output_of_prior_pics_flag
++        rue(r, &pos); // slice_pic_parameter_set_id
++        if (rue(r, &pos) != 2) continue; // an I slice
++        pos += 2; // slice_sao_luma_flag, slice_sao_chroma_flag (the SPS has SAO on)
++        rue(r, &pos); // slice_qp_delta
++        int rem = 8 - (pos & 7), tail = r[pos >> 3] & ((1 << rem) - 1);
++        int aligned_here = tail == (1 << (rem - 1)); // a 1 and zeros up to the byte end: byte_alignment() right now
++        if (rem == 1 && aligned_here && r[(pos >> 3) + 1] == 0x80) aligned_here = 0; // a flag, the alignment in the next byte
++        hevc_pps_fix = aligned_here;
++        fprintf(stderr, "luch-kms: HEVC slice header %s slice_loop_filter_across_slices_enabled_flag%s\n",
++                aligned_here ? "lacks" : "has", aligned_here ? ": clearing it in the PPS" : "");
++    }
++    if (hevc_pps_fix != 1 || !pps) return;
++    // Find the flag in the PPS by its syntax (the first 6 bytes must not hold emulation prevention).
++    uint8_t r[16] = {0};
++    for (int k = 0; k < 16; k++) r[k] = pps[k];
++    if (r[2] == 0 && r[3] == 0 && r[4] == 3) return;
++    int pos = 16;
++    rue(r, &pos); rue(r, &pos);            // pps_id, sps_id
++    pos += 1 + 1 + 3 + 1 + 1;              // dependent_slice_segments, output_flag_present, extra bits, sign hiding, cabac_init
++    rue(r, &pos); rue(r, &pos); rue(r, &pos); // num_ref_idx l0, l1, init_qp
++    pos += 1 + 1;                          // constrained_intra_pred, transform_skip
++    int cu_qp_delta = rbit(r, pos++);
++    if (cu_qp_delta) rue(r, &pos);         // diff_cu_qp_delta_depth
++    rue(r, &pos); rue(r, &pos);            // cb, cr qp offsets
++    pos += 1 + 1 + 1 + 1;                  // slice chroma qp offsets present, weighted pred, bipred, transquant bypass
++    int tiles = rbit(r, pos++);
++    pos++;                                 // entropy_coding_sync
++    if (tiles || (pos >> 3) >= 8) return;
++    pps[pos >> 3] &= ~(0x80 >> (pos & 7)); // pps_loop_filter_across_slices_enabled_flag := 0
++}
++
+ static PFNGLEGLIMAGETARGETTEXTURE2DOESPROC img_to_tex;
+ 
+ // ---------- EGL / GLES ----------
+@@ -422,6 +486,8 @@ int luch_kms_main(int argc, char **argv) {
+         ck(avcodec_send_frame(c, f), "send_frame");
+         av_frame_free(&f);
+         while (avcodec_receive_packet(c, pkt) == 0) {
++            if ((pkt->flags & AV_PKT_FLAG_KEY) && !strcmp(codec_name, "hevc_vaapi") && av_packet_make_writable(pkt) >= 0)
++                hevc_fix_pps(pkt->data, pkt->size);
+             if (!bench) {
+                 uint8_t h[13]; uint32_t len = pkt->size; uint64_t cap = (uint64_t)t0;
+                 for (int i = 0; i < 4; i++) h[i] = len >> (24 - 8 * i);

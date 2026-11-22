@@ -39,6 +39,17 @@ if [ "$need" = 1 ] && [ -f "$BACKUP/main.py" ] && [ -d "$HB/plugins" ]; then
     systemctl restart plugin_loader
 fi
 
+# 2b. The fast-mode helper in the plugin must be the one that ships with the installed Flatpak (an update brings fixes to it).
+LOC=$(runuser -u "$LUCH_USER" -- flatpak info --show-location toxblh.luch.Luch 2>/dev/null || true)
+if [ -n "$LOC" ] && [ -f "$LOC/files/share/luch/helper/luch-kms" ] && [ -d "$PLUG/helper" ] &&
+   ! cmp -s "$LOC/files/share/luch/helper/luch-kms" "$PLUG/helper/luch-kms"; then
+    say "the helper in the plugin is older than the one in the Flatpak, updating it"
+    systemctl stop plugin_loader; pkill -x luch-kms || true; sleep 1
+    cp -a "$LOC/files/share/luch/helper/." "$PLUG/helper/" && chmod 755 "$PLUG/helper/luch-kms"
+    [ -d "$BACKUP/helper" ] && cp -a "$LOC/files/share/luch/helper/." "$BACKUP/helper/"
+    systemctl start plugin_loader
+fi
+
 # 3. Decky Loader does not run or does not answer: restart it, and if that does not help, reinstall it
 #    (luch-decky-install.sh: the ALS mirror first, GitHub if ALS does not answer, at most once in 12 hours).
 if ! loader_ok; then
