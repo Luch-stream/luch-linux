@@ -5,9 +5,12 @@
 #   luch-setup --remove   take everything it installed away
 #   luch-setup --list     what it puts where
 #   luch-setup --dry-run  show what it would do, change nothing
-# Decky Loader is installed if missing and updated if outdated, with Decky's own installer. Besides, luch-deckyheal
-# (a root timer it sets up) puts the plugin back and restarts or reinstalls Decky Loader if an update breaks them.
+# Decky Loader is left alone: it is installed (with Decky's own installer) only if there is none, and never updated or
+# replaced (a modified Loader, such as the Russian build, would be overwritten). LUCH_MANAGE_DECKY=1 gives the old
+# behaviour: update it if outdated, and reinstall it if it breaks. luch-deckyheal (a root timer it sets up) puts the
+# plugin back and restarts Decky Loader if an update breaks them.
 set -euo pipefail
+MANAGE_DECKY=${LUCH_MANAGE_DECKY:-0}
 
 DRY=0
 
@@ -21,7 +24,7 @@ $PLUGIN_DIR   the Decky Loader plugin and the fast-mode helper (needs root: the 
 $UNIT   starts luchd with your session
 ~/.local/share/plasma/plasmoids/toxblh.luch.panel   the Luch widget for the system tray (a popup to pick the receiver and the mode)
 /etc/systemd/system/luch-deckyheal.{service,timer}, /var/lib/luch/, /etc/luch/   the self-heal: at boot and every 15 minutes it
-    puts the plugin back and restarts or reinstalls Decky Loader if an update broke them (journalctl -u luch-deckyheal)
+    puts the plugin back and restarts Decky Loader if an update broke them (journalctl -u luch-deckyheal)
 EOF
 }
 
@@ -53,11 +56,11 @@ export LC_ALL=C.UTF-8
 t() { if [ "$RU" = 1 ]; then echo "$2"; else echo "$1"; fi; }
 TITLE=$(t "Installing Luch on your Steam Deck" "Установка Луча на ваш Steam Deck")
 DONE_MSG=$(t "Luch is installed and ready to use" "Луч успешно установлен и готов к работе")
-STAGES=("$(t 'Updating Decky Loader' 'Обновление DeckyLoader')" "$(t 'Installing the plugin' 'Установка плагина')"
+STAGES=("$(t 'Checking Decky Loader' 'Проверка DeckyLoader')" "$(t 'Installing the plugin' 'Установка плагина')"
         "$(t 'Installing Luch' 'Установка Луча')" "$(t 'Checking that it works' 'Проверка работоспособности')")
 
 if [ "$DRY" = 1 ]; then
-    echo "[dry-run] would install Decky Loader if missing, or update it if a newer release exists (ALS mirror, then GitHub)"
+    echo "[dry-run] would install Decky Loader only if there is none (LUCH_MANAGE_DECKY=1: also update it)"
     echo "Luch will put on this system:"; list; exit 0
 fi
 
@@ -71,9 +74,12 @@ LOGO="$LOC/files/share/luch/luch.png"
 kd() { host env XDG_DATA_DIRS="$HOME/.local/share/flatpak/exports/share:/var/lib/flatpak/exports/share:/usr/local/share:/usr/share" kdialog --icon toxblh.luch.Luch "$@"; }
 
 cur=$(host cat "$HOME/homebrew/services/.loader.version" 2>/dev/null || true)
-new=$(host env LUCH_USER="$USER_NAME" bash "$LOC/files/share/luch/deckyheal/luch-decky-install.sh" latest 2>/dev/null || true)
 need_decky=0
-if [ -z "$cur" ] || ! host test -d "$PLUGINS" || { [ -n "$new" ] && [ "$cur" != "$new" ]; }; then need_decky=1; fi
+if [ -z "$cur" ] || ! host test -d "$PLUGINS"; then need_decky=1; fi
+if [ "$MANAGE_DECKY" = 1 ]; then
+    new=$(host env LUCH_USER="$USER_NAME" bash "$LOC/files/share/luch/deckyheal/luch-decky-install.sh" latest 2>/dev/null || true)
+    if [ -n "$new" ] && [ "$cur" != "$new" ]; then need_decky=1; fi
+fi
 
 # All the root work is one pkexec (one password prompt). It prints a line after each stage it finishes.
 ROOT_SCRIPT="
@@ -91,7 +97,7 @@ ROOT_SCRIPT="
     rm -rf /var/lib/luch/plugin; cp -a '$PLUGIN_DIR' /var/lib/luch/plugin
     install -m755 '$LOC/files/share/luch/deckyheal/luch-deckyheal.sh' /var/lib/luch/luch-deckyheal.sh
     install -m644 '$LOC/files/share/luch/deckyheal/luch-deckyheal.service' '$LOC/files/share/luch/deckyheal/luch-deckyheal.timer' /etc/systemd/system/
-    echo 'LUCH_USER=$USER_NAME' > /etc/luch/heal.conf
+    printf 'LUCH_USER=$USER_NAME\nLUCH_MANAGE_DECKY=$MANAGE_DECKY\n' > /etc/luch/heal.conf
     systemctl daemon-reload; systemctl enable --now luch-deckyheal.timer
     if grep -qsE '^disable-(user-service-)?publishing=yes' /etc/avahi/avahi-daemon.conf; then sed -i -E 's/^(disable-(user-service-)?publishing)=yes/\\1=no/' /etc/avahi/avahi-daemon.conf; systemctl restart avahi-daemon; fi
     systemctl restart plugin_loader

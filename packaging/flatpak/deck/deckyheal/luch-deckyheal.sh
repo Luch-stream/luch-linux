@@ -3,7 +3,8 @@
 # Steam update took away: Decky Loader itself (unit, binary, a loader that does not answer) and the Luch plugin.
 # Everything it does goes to the journal: journalctl -u luch-deckyheal
 set -u
-. /etc/luch/heal.conf                      # LUCH_USER=<the Deck user>
+. /etc/luch/heal.conf                      # LUCH_USER=<the Deck user>, LUCH_MANAGE_DECKY=0|1
+LUCH_MANAGE_DECKY=${LUCH_MANAGE_DECKY:-0}
 HOME_DIR=$(getent passwd "$LUCH_USER" | cut -d: -f6)
 HB=$HOME_DIR/homebrew
 PLUG=$HB/plugins/Luch
@@ -58,12 +59,12 @@ if grep -qsE '^disable-(user-service-)?publishing=yes' /etc/avahi/avahi-daemon.c
     runuser -u "$LUCH_USER" -- systemctl --user restart luchd-flatpak.service 2>/dev/null || true
 fi
 
-# 3. Decky Loader does not run or does not answer: restart it, and if that does not help, reinstall it
-#    (luch-decky-install.sh: the ALS mirror first, GitHub if ALS does not answer, at most once in 12 hours).
+# 3. Decky Loader does not run or does not answer: restart it. It is reinstalled only when there is no Loader at all, or
+#    with LUCH_MANAGE_DECKY=1 (a modified Loader, such as the Russian build, must not be replaced by the official one).
 if ! loader_ok; then
     say "Decky Loader is not healthy, restarting it"
     systemctl restart plugin_loader 2>/dev/null; sleep 20
-    if ! loader_ok; then
+    if ! loader_ok && { [ "$LUCH_MANAGE_DECKY" = 1 ] || [ ! -x "$HB/services/PluginLoader" ]; }; then
         last=$(cat "$STAMP" 2>/dev/null || echo 0)
         if [ $(( $(date +%s) - last )) -lt 43200 ]; then
             say "Decky Loader is still down; it was reinstalled less than 12 hours ago, waiting"
