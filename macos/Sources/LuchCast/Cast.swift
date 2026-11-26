@@ -18,6 +18,8 @@ public struct CastOptions {
     public var rate: Double?
     public var mime: String?
     public var poster: String?
+    /// The same video in several qualities, best first ([url, mime, w, h]); the receiver plays what its screen shows.
+    public var sources: [[String: Any]] = []
 
     public static let passedHeaders = ["Referer", "User-Agent", "Origin", "Cookie", "Authorization"]
 
@@ -35,6 +37,9 @@ public struct CastOptions {
         mime = json["mime"] as? String
         poster = json["poster"] as? String
         subs = json["subs"] as? [String] ?? []
+        sources = (json["sources"] as? [[String: Any]] ?? [])
+            .filter { ($0["url"] as? String).map(Cast.isURL) ?? false }
+            .prefix(12).map { $0 }
         for (k, v) in json["headers"] as? [String: Any] ?? [:] {
             guard let name = CastOptions.passedHeaders.first(where: { $0.caseInsensitiveCompare(k) == .orderedSame }),
                   let value = v as? String, !value.contains("\r"), !value.contains("\n") else { continue }
@@ -224,9 +229,21 @@ public enum Cast {
         let (url, via) = try shareOne(first, mime: m, relay: relay, o: o, server: server, client: client, me: me)
         var src: [String: Any] = ["url": url]
         if !m.isEmpty { src["mime"] = m }
+        var list: [[String: Any]] = []
+        for s in o.sources {
+            // Every quality travels the way the first one does.
+            let sm = s["mime"] as? String ?? m
+            let (u, _) = try shareOne(s["url"] as? String ?? "", mime: sm, relay: via == "sender", o: o, server: server,
+                                      client: client, me: me)
+            var e: [String: Any] = ["url": u]
+            if !sm.isEmpty { e["mime"] = sm }
+            for k in ["w", "h", "codec"] { if let v = s[k] { e[k] = v } }
+            list.append(e)
+        }
+        if list.isEmpty { list = [src] }
         var title = o.title ?? name(first)
         if o.title == nil, let dot = title.lastIndex(of: ".") { title = String(title[..<dot]) }
-        var msg: [String: Any] = ["t": "media", "via": via, "src": [src], "title": title]
+        var msg: [String: Any] = ["t": "media", "via": via, "src": list, "title": title]
         if o.start > 0 { msg["start"] = o.start }
         if o.paused { msg["paused"] = true }
         if let r = o.rate { msg["rate"] = r }

@@ -134,6 +134,16 @@ final class CastTests: XCTestCase {
         XCTAssertEqual(link["via"] as? String, "direct")
         XCTAssertEqual(link["headers"] as? [String: String], ["Cookie": "a=1"])
 
+        var q = try CastOptions(json: ["via": "sender", "sources": [["url": "https://cdn.example/720/a.mp4", "h": 720],
+                                                                     ["url": "https://cdn.example/360/a.mp4", "h": 360],
+                                                                     ["url": "file:///etc/passwd"]]])
+        q.title = "A"
+        let qm = try Cast.build(["https://cdn.example/360/a.mp4"], o: q, server: s, client: "192.168.1.30", me: "192.168.1.20")
+        let qs = qm["src"] as? [[String: Any]] ?? []
+        XCTAssertEqual(qs.count, 2)
+        XCTAssertEqual(qs.first?["h"] as? Int, 720)
+        XCTAssertTrue((qs.first?["url"] as? String ?? "").hasPrefix("http://192.168.1.20:"))
+
         let yt = try Cast.build(["https://youtu.be/dQw4w9WgXcQ?t=42"], o: CastOptions(), server: s, client: "192.168.1.30", me: "192.168.1.20")
         XCTAssertEqual(yt["t"] as? String, "open_app")
         XCTAssertEqual(yt["start"] as? Double, 42)
