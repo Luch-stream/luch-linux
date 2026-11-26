@@ -442,6 +442,9 @@ public final class Engine {
             if let charging = msg["charging"] as? NSNumber { deviceCharging = charging.boolValue }
             if let thermal = msg["thermal"] as? String { deviceThermal = thermal }
             if let headroom = (msg["thermal_headroom"] as? NSNumber)?.doubleValue { deviceHeadroom = headroom }
+        case "media_key":
+            // The TV's remote, for the player on this Mac (PROTOCOL.md 4d).
+            MediaKeys.post(msg["key"] as? String ?? "")
         case "error":
             log("<- error: \(msg)")
         case "stop", "bye":

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import AppKit
 import CoreGraphics
+import LuchCast
 import LuchEngine
 import ScreenCaptureKit
 import LuchLocal
@@ -124,10 +125,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - local API (luchctl)
 
+    let caster = Caster()
+
     private func startLocalServer() {
         let server = LocalServer()
         server.handler = { [weak self] request in
             guard let self else { return ["error": "app is shutting down"] }
+            // What waits for a receiver's answer runs here, on the socket's thread, not on the main one.
+            if Caster.commands.contains(request["cmd"] as? String ?? "") {
+                var known: [Receiver] = []
+                DispatchQueue.main.sync { known = self.receivers }
+                return self.caster.handle(request, receivers: known)
+            }
             var response: [String: Any] = [:]
             // The socket thread must not touch AppKit state directly.
             DispatchQueue.main.sync { response = self.handleLocal(request) }

@@ -13,7 +13,28 @@ func call(_ request: [String: Any]) -> [String: Any] {
 }
 
 let args = Array(CommandLine.arguments.dropFirst())
+if NativeHost.startedByBrowser(args) { NativeHost.run() }
 let command = args.first ?? "list"
+
+func fail(_ response: [String: Any]) {
+    if let error = response["error"] as? String {
+        print("error: \(error)")
+        exit(1)
+    }
+}
+
+/// `[receiver] rest`: the first word is a receiver's name or id when more words follow and it is not a file or link.
+func receiverAnd(_ words: [String], isWord: (String) -> Bool) -> (String?, [String]) {
+    guard let first = words.first, words.count > 1 || !isWord(first) else { return (nil, words) }
+    if isWord(first) { return (nil, words) }
+    return (first, Array(words.dropFirst()))
+}
+
+func withReceiver(_ request: [String: Any], _ name: String?) -> [String: Any] {
+    var r = request
+    if let name { r["name"] = name; r["id"] = name }
+    return r
+}
 
 switch command {
 case "list":
@@ -111,6 +132,97 @@ case "stop":
     if let error = response["error"] as? String { print("error: \(error)"); exit(1) }
     print("stopped")
 
+case "cast":
+    var items: [String] = []
+    var options: [String: Any] = [:]
+    var subs: [String] = []
+    var i = 1
+    var name: String?
+    while i < args.count {
+        let a = args[i]
+        func value() -> String { i += 1; return i < args.count ? args[i] : "" }
+        switch a {
+        case "--title": options["title"] = value()
+        case "--start": options["start"] = Double(value().split(separator: ":").reduce(0.0) { $0 * 60 + (Double($1) ?? 0) })
+        case "--sub": subs.append(URL(fileURLWithPath: value()).standardizedFileURL.path)
+        case "--relay": options["via"] = "sender"
+        case "--paused": options["paused"] = true
+        case "--to": name = value()
+        default:
+            items.append(a.contains("://") ? a : URL(fileURLWithPath: (a as NSString).expandingTildeInPath).standardizedFileURL.path)
+        }
+        i += 1
+    }
+    if !subs.isEmpty { options["subs"] = subs }
+    guard !items.isEmpty else { print("usage: luchctl cast <file|link>... [--to receiver] [--title T] [--start m:ss] [--sub file] [--relay]"); exit(2) }
+    let response = (try? LocalClient.request(withReceiver(["cmd": "cast", "items": items, "options": options], name), timeout: 60))
+        ?? ["error": "Luch.app is not running"]
+    fail(response)
+    switch response["kind"] as? String ?? "" {
+    case "media": print("playing on the receiver; `luchctl media` follows it")
+    case "doc": print("the document is on the receiver; `luchctl page next` turns its pages")
+    case "app": print("opened in the TV's own app")
+    default: print("on the receiver")
+    }
+
+case "media":
+    let words = Array(args.dropFirst())
+    let verbs: Set<String> = ["play", "pause", "toggle", "seek", "skip", "rate", "audio", "sub", "state"]
+    let (name, rest) = receiverAnd(words) { verbs.contains($0) }
+    if rest.isEmpty {
+        let r = call(withReceiver(["cmd": "media_state"], name))
+        fail(r)
+        let s = r["state"] as? [String: Any] ?? [:]
+        print(s.isEmpty ? "(nothing playing)" : "\(s["state"] ?? "?") \(s["pos"] ?? 0) / \(s["dur"] ?? "-")")
+        exit(0)
+    }
+    var cmd: [String: Any] = ["do": rest[0]]
+    let arg = rest.count > 1 ? rest[1] : ""
+    switch rest[0] {
+    case "seek": cmd["pos"] = arg.split(separator: ":").reduce(0.0) { $0 * 60 + (Double($1) ?? 0) }
+    case "skip": cmd["by"] = Double(arg) ?? 10
+    case "rate": cmd["rate"] = Double(arg) ?? 1
+    case "audio": cmd["id"] = arg
+    case "sub": cmd["id"] = arg == "off" ? NSNull() : arg as Any
+    default: break
+    }
+    fail(call(withReceiver(["cmd": "media_cmd", "media": cmd], name)))
+
+case "sleep":
+    fail(call(withReceiver(["cmd": "sleep"], args.count > 1 ? args[1] : nil)))
+
+case "volume":
+    let words = Array(args.dropFirst())
+    let (name, rest) = receiverAnd(words) { ["+", "-", "up", "down", "mute", "unmute"].contains($0) || Int($0) != nil }
+    let r = call(withReceiver(["cmd": "volume", "what": rest.first ?? "+0"], name))
+    fail(r)
+    let v = r["volume"] as? [String: Any] ?? [:]
+    print("\(v["level"] ?? "?")%\((v["muted"] as? Bool) == true ? " (muted)" : "")")
+
+case "page":
+    let words = Array(args.dropFirst())
+    let (name, rest) = receiverAnd(words) { ["next", "prev", "+", "-"].contains($0) || Int($0) != nil }
+    let r = call(withReceiver(["cmd": "page", "what": rest.first ?? "next"], name))
+    fail(r)
+    print(r["page"] as? String ?? "")
+
+case "stop-cast":
+    fail(call(withReceiver(["cmd": "stop_cast"], args.count > 1 ? args[1] : nil)))
+
+case "browser":
+    guard args.count > 1, args[1] == "install" else { print("usage: luchctl browser install"); exit(2) }
+    let exe = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath().standardizedFileURL.path
+    let support = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
+    do {
+        let done = try NativeHost.install(exe: exe, support: support)
+        if done.isEmpty { print("no Chrome, Chromium, Brave, Edge, Yandex, Arc or Firefox found") }
+        done.forEach { print($0) }
+        print("now add the Luch extension to the browser (browser-extension/ in luch-linux)")
+    } catch {
+        print("error: \(error.localizedDescription)")
+        exit(1)
+    }
+
 case "ping":
     let response = call(["cmd": "ping"])
     print((response["ok"] as? Bool) == true ? "app is running" : "no response")
@@ -119,6 +231,9 @@ default:
     print("""
     usage: luchctl list | mirror [name] [--codec auto|h264|hevc] [--profile baseline|main|high]
                           [--frame-ms N] | stats | state | stop | ping
+                   | cast <file|link>... [--to r] [--title T] [--start m:ss] [--sub file] [--relay] | stop-cast [r]
+                   | media [r] [play|pause|toggle|seek m:ss|skip s|rate x|audio id|sub id|sub off]
+                   | volume [r] [0..100|+|-|mute|unmute] | page [r] next|prev|<n> | sleep [r] | browser install
     """)
     exit(2)
 }

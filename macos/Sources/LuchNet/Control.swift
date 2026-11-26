@@ -151,6 +151,44 @@ public final class ControlChannel {
         return nil
     }
 
+    /// Blocks until a message whose `t` is one of `types` arrives (others stay queued), or the timeout expires.
+    public func waitForAny(_ types: Set<String>, timeout: TimeInterval) -> [String: Any]? {
+        let deadline = Date().addingTimeInterval(timeout)
+        cond.lock()
+        defer { cond.unlock() }
+        while Date() < deadline {
+            if let idx = inbox.firstIndex(where: { types.contains($0["t"] as? String ?? "") }) {
+                return inbox.remove(at: idx)
+            }
+            if closed { return nil }
+            cond.wait(until: deadline)
+        }
+        return nil
+    }
+
+    /// Drops what is queued (older answers that must not be taken for the next one).
+    public func drain() {
+        cond.lock()
+        inbox.removeAll()
+        cond.unlock()
+    }
+
+    /// This Mac's address on the connection: what the receiver reaches us at.
+    public var localAddress: String {
+        var a = sockaddr_in()
+        var len = socklen_t(MemoryLayout<sockaddr_in>.size)
+        withUnsafeMutablePointer(to: &a) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { _ = getsockname(fd, $0, &len) } }
+        var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+        inet_ntop(AF_INET, &a.sin_addr, &buf, socklen_t(INET_ADDRSTRLEN))
+        return String(cString: buf)
+    }
+
+    public var isClosed: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return closed
+    }
+
     private func readLoop() {
         var buf = [UInt8](repeating: 0, count: 65536)
         var pending = Data()

@@ -166,3 +166,24 @@ average.
   front of every IDR — the receiver configures its decoder without `csd-0`.
 - The warm filter walks the chroma plane once per frame: well under a millisecond at 1080p, no Core
   Image and no extra buffer.
+
+## Casting
+
+Besides mirroring, the Mac can hand a receiver things to play or show by itself, in their own quality
+(luch-android PROTOCOL.md 4b-4g), exactly as the Linux sender does:
+
+```sh
+luchctl cast film.mkv film.en.srt          # the TV plays the file itself; a 4K file in 4K whatever this screen is
+luchctl cast ~/Pictures/*.jpg              # photos, left/right on the remote
+luchctl cast report.pdf                    # a PDF page by page; text too (cupsfilter), office files with LibreOffice
+luchctl cast https://youtu.be/<id>         # opens in the TV's own YouTube app
+luchctl cast https://example.com/v.m3u8    # the TV fetches the link; --relay passes it through this Mac
+luchctl media pause                        # play | pause | toggle | seek 1:30 | skip -10 | rate 1.5 | audio a2 | sub s0
+luchctl volume 3 | page next | sleep | stop-cast
+luchctl browser install                    # lets the Luch browser extension (luch-linux browser-extension/) reach the app
+```
+
+Luch.app serves cast files on TCP port 47810 to that receiver only (a random token per file); macOS asks to let the
+app accept incoming connections the first time. While mirroring, the TV remote's media keys (play/pause, next,
+previous) are passed on as the Mac's own media keys, so Music, Spotify or a browser's video obey them; macOS asks
+for Accessibility access for that once.
