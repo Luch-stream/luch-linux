@@ -33,11 +33,16 @@ const IFACE = `<node>
     <method name="AnswerQuiet"><arg name="hide" type="b" direction="in"/></method>
     <method name="Pair"><arg name="id" type="s" direction="in"/><arg name="code" type="s" direction="in"/><arg type="s" direction="out"/></method>
     <method name="Pairing"><arg name="id" type="s" direction="in"/><arg type="s" direction="out"/></method>
+    <method name="Direct"><arg name="key" type="s" direction="in"/><arg type="s" direction="out"/></method>
+    <method name="DirectOff"><arg type="s" direction="out"/></method>
+    <method name="DirectStatus"><arg type="s" direction="out"/></method>
+    <method name="DirectOffers"><arg type="s" direction="out"/></method>
     <property name="WebUrl" type="s" access="read"/>
     <property name="Quiet" type="s" access="readwrite"/>
     <signal name="ReceiversChanged"/>
     <signal name="FindProgress"><arg name="status" type="s"/></signal>
     <signal name="PairChanged"><arg name="id" type="s"/><arg name="state" type="s"/></signal>
+    <signal name="DirectChanged"><arg name="status" type="s"/></signal>
     <signal name="QuietAsk"/>
   </interface>
 </node>`;
@@ -84,8 +89,22 @@ const T = RU ? {
     paired: name => `${name}: сопряжено`,
     findHarder: 'Искать настойчивее (Bluetooth, звук, QR-код)',
     rungs: {mdns: 'сеть (mDNS)', scan: 'все адреса сети', ble: 'Bluetooth',
-        sound: 'звук ТВ через микрофон — на ТВ выберите «Сказать адрес»', qr: 'QR-код ТВ через камеру'},
+        sound: 'звук ТВ через микрофон — на ТВ выберите «Сказать адрес»', qr: 'QR-код ТВ через камеру',
+        direct: 'ТВ, к которым можно подключиться напрямую'},
     trying: what => `Ищу: ${what}…`,
+    direct: 'Подключиться напрямую (Wi-Fi Direct)…',
+    directTo: name => `Подключиться к ${name} напрямую (Wi-Fi Direct)…`,
+    directTitle: name => name ? `Подключиться к ${name} напрямую?` : 'Подключиться напрямую к ТВ рядом?',
+    directBody: net => (net ? `Этот компьютер отключится от «${net}» на время показа и потом вернётся.`
+        : 'Wi-Fi этого компьютера подключится к сети ТВ на время показа.') +
+        ' ТВ спросит разрешения на своём экране.',
+    directGo: 'Подключиться',
+    directOff: net => net ? `Отключиться от сети ТВ (вернуться в «${net}»)` : 'Отключиться от сети ТВ',
+    directOn: name => `${name}: подключено напрямую`,
+    directSteps: {looking: 'ищу ТВ рядом по Bluetooth', opening: 'открываю канал Bluetooth',
+        pairing: 'сопряжение', asking: 'разрешите подключение на ТВ', joining: 'подключаюсь к сети ТВ',
+        connecting: 'подключаюсь к ТВ'},
+    directing: (name, step) => `Напрямую${name ? ` к ${name}` : ''}: ${step}…`,
 } : {
     title: 'Luch',
     header: 'Screen mirroring',
@@ -124,8 +143,21 @@ const T = RU ? {
     findHarder: 'Search harder (Bluetooth, sound, QR code)',
     rungs: {mdns: 'the network (mDNS)', scan: 'every address of the network', ble: 'Bluetooth',
         sound: 'the TV\u2019s sound through the microphone: on the TV, choose \u201cSay the address\u201d',
-        qr: 'the TV\u2019s QR code through the camera'},
+        qr: 'the TV\u2019s QR code through the camera', direct: 'TVs that connect directly'},
     trying: what => `Looking: ${what}…`,
+    direct: 'Connect directly (Wi-Fi Direct)…',
+    directTo: name => `Connect directly to ${name} (Wi-Fi Direct)…`,
+    directTitle: name => name ? `Connect directly to ${name}?` : 'Connect directly to a TV nearby?',
+    directBody: net => (net ? `This computer leaves \u201c${net}\u201d while showing, and comes back after.`
+        : 'This computer\u2019s Wi-Fi joins the TV\u2019s network while showing.') +
+        ' The TV asks on its screen first.',
+    directGo: 'Connect',
+    directOff: net => net ? `Leave the TV\u2019s network (back to \u201c${net}\u201d)` : 'Leave the TV\u2019s network',
+    directOn: name => `${name}: connected directly`,
+    directSteps: {looking: 'looking for TVs nearby over Bluetooth', opening: 'opening the Bluetooth channel',
+        pairing: 'pairing', asking: 'allow the connection on the TV', joining: 'joining the TV\u2019s network',
+        connecting: 'connecting to the TV'},
+    directing: (name, step) => `Directly${name ? ` to ${name}` : ''}: ${step}…`,
 };
 
 /** A D-Bus error's own message, without the "GDBus.Error:...: " prefix. */
@@ -145,6 +177,18 @@ function findLine(json, t) {
         return null;
     const now = (p.rungs ?? []).filter(r => r.state === 'running').map(r => t.rungs[r.rung] ?? r.rung);
     return now.length > 0 ? t.trying(now.join(', ')) : null;
+}
+
+/** What a direct connection is doing (DirectChanged JSON), for the menu; null when it is not under way. */
+function directLine(json, t) {
+    let s;
+    try {
+        s = JSON.parse(json);
+    } catch (e) {
+        return null;
+    }
+    const step = t.directSteps[s?.step];
+    return step ? t.directing(s.name ?? '', step) : null;
 }
 
 // luchd's refusal while a receiver waits for the code on its screen (Connect, Mirror, Cast...).
@@ -178,6 +222,33 @@ function askCode(name) {
         ]);
         dialog.open();
         global.stage.set_key_focus(entry);
+    });
+}
+
+/** A question with Cancel and `yes`; true when the person chose `yes`. */
+function confirm(title, body, yes) {
+    const dialog = new ModalDialog.ModalDialog({destroyOnClose: true});
+    const box = new St.BoxLayout({vertical: true, style: 'spacing: 12px; max-width: 420px;'});
+    box.add_child(new St.Label({text: title, style: 'font-weight: bold; font-size: 1.2em;'}));
+    const text = new St.Label({text: body});
+    text.clutter_text.line_wrap = true;
+    box.add_child(text);
+    dialog.contentLayout.add_child(box);
+    return new Promise(resolve => {
+        let answered = false;
+        const done = value => {
+            if (answered)
+                return;
+            answered = true;
+            dialog.close();
+            resolve(value);
+        };
+        dialog.connect('closed', () => done(false));
+        dialog.setButtons([
+            {label: T.cancel, action: () => done(false), key: Clutter.KEY_Escape},
+            {label: yes, action: () => done(true), default: true},
+        ]);
+        dialog.open();
     });
 }
 
@@ -238,6 +309,8 @@ class LuchToggle extends QuickMenuToggle {
         this._lastId = null;
         this._statsTimer = 0;
         this._finding = null; // what the discovery ladder is trying, from FindProgress
+        this._direct = {offers: [], leaves: null}; // TVs that offer a direct connection (DirectOffers)
+        this._directState = {step: 'idle'}; // where a direct connection stands (DirectChanged)
 
         this.menu.setHeader(ICON, T.title, T.header);
         this._section = new PopupMenu.PopupMenuSection();
@@ -260,6 +333,10 @@ class LuchToggle extends QuickMenuToggle {
                 this._finding = findLine(status, T);
                 this._render(null);
             });
+            this._directId = proxy.connectSignal('DirectChanged', (_p, _sender, [status]) => this._onDirect(status));
+            proxy.DirectStatusAsync().then(([status]) => {
+                this._directState = JSON.parse(status);
+            }).catch(() => {}); // an older luchd
             this._quiet = new QuietAsker(proxy, askQuestion, T);
             this._quietId = proxy.connectSignal('QuietAsk', () => this._quiet.onAsk());
             this._ownerId = proxy.connect('notify::g-name-owner', () => this._discover());
@@ -297,6 +374,35 @@ class LuchToggle extends QuickMenuToggle {
         }
     }
 
+    // A direct connection's steps: the menu follows them; its end is told.
+    _onDirect(json) {
+        const s = JSON.parse(json);
+        this._directState = s;
+        const name = s.name ?? T.title;
+        if (s.step === 'on')
+            Main.notify(T.directOn(name), '');
+        else if (s.step === 'failed')
+            Main.notify(T.failed(name), s.reason ?? '');
+        else if (s.step === 'back')
+            Main.notify(T.title, s.note ?? '');
+        this._render(null);
+    }
+
+    // Asked first: it takes this computer off its Wi-Fi while showing.
+    async _connectDirectly(key, name) {
+        let leaves = this._direct.leaves;
+        try {
+            leaves = JSON.parse((await this._proxy.DirectOffersAsync())[0]).leaves;
+        } catch (e) {}
+        if (!await confirm(T.directTitle(name), T.directBody(leaves), T.directGo))
+            return;
+        try {
+            await this._proxy.DirectAsync(key);
+        } catch (e) {
+            Main.notify(T.failed(name ?? T.title), reason(e));
+        }
+    }
+
     get _mirroring() {
         return this._rows.filter(r => r[7]);
     }
@@ -317,6 +423,12 @@ class LuchToggle extends QuickMenuToggle {
             [this._rows] = await this._proxy.ReceiversAsync();
         } catch (e) {
             this._rows = [];
+        }
+        try {
+            const [json] = await this._proxy.DirectOffersAsync();
+            this._direct = JSON.parse(json);
+        } catch (e) {
+            this._direct = {offers: [], leaves: null}; // an older luchd
         }
         try {
             const [json] = await this._proxy.KnownAsync();
@@ -344,6 +456,22 @@ class LuchToggle extends QuickMenuToggle {
         if (!note && !this._finding && this._rows.length === 0 && this._proxy?.g_name_owner) {
             this._section.addAction(T.findHarder, () => this._proxy.FindAsync('all')
                 .catch(e => logError(e, 'Luch: find')));
+        }
+        // The last way: straight over the TV's own Wi-Fi network, for a TV heard over Bluetooth that no network
+        // reaches. Never without asking.
+        const directing = directLine(JSON.stringify(this._directState), T);
+        if (directing) {
+            this._section.addMenuItem(new PopupMenu.PopupMenuItem(directing, {reactive: false}));
+        } else if (this._directState.step === 'on') {
+            this._section.addAction(T.directOff(this._directState.previous), () => this._proxy.DirectOffAsync()
+                .catch(e => Main.notify(T.failed(T.title), reason(e))));
+        } else if (this._proxy?.g_name_owner) {
+            const listed = key => this._rows.some(r => r[0].replace(/-/g, '').startsWith(key));
+            const offers = (this._direct.offers ?? []).filter(o => !listed(o.key));
+            for (const o of offers)
+                this._section.addAction(T.directTo(o.name), () => this._connectDirectly(o.key, o.name));
+            if (offers.length === 0 && !note && !this._finding && this._rows.length === 0)
+                this._section.addAction(T.direct, () => this._connectDirectly('', null));
         }
         for (const [id, name, model, , , , connected, isMirroring] of this._rows) {
             const sub = new PopupMenu.PopupSubMenuMenuItem(name, true);
@@ -514,6 +642,8 @@ class LuchToggle extends QuickMenuToggle {
             this._proxy.disconnectSignal(this._pairId);
         if (this._findId)
             this._proxy.disconnectSignal(this._findId);
+        if (this._directId)
+            this._proxy.disconnectSignal(this._directId);
         if (this._quietId)
             this._proxy.disconnectSignal(this._quietId);
         if (this._propId)

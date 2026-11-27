@@ -53,3 +53,16 @@ test('TVs without Luch are told by their id', () => {
     assert.ok(isTv('dlna:5f1c2e3d-0000-1000-8000-0123456789ab'));
     assert.ok(!isTv('3f0c2a8e-9d1b-4c7e-8a55-0b6f2d9e1c47'));
 });
+
+test('the menu follows a direct connection, and only while it is under way', () => {
+    const directLine = new Function('json', 't', ext.match(/function directLine\(json, t\) \{([\s\S]*?)\n\}/)[1]);
+    const t = {directSteps: {asking: 'allow the connection on the TV'},
+        directing: (name, step) => `Directly to ${name}: ${step}…`};
+    assert.equal(directLine(JSON.stringify({step: 'asking', name: 'Living room TV'}), t),
+        'Directly to Living room TV: allow the connection on the TV…');
+    for (const done of ['idle', 'on', 'back', 'failed'])
+        assert.equal(directLine(JSON.stringify({step: done}), t), null, done);
+    assert.equal(directLine('not json', t), null);
+    assert.match(ext, /<signal name="DirectChanged">/);
+    assert.match(luchd, /async fn direct_changed\(e: &SignalEmitter<'_>, status: &str\)/);
+});

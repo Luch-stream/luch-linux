@@ -51,11 +51,37 @@ pub fn card_in(props: &HashMap<String, OwnedValue>) -> Option<Card> {
     let md = props.get("ManufacturerData")?;
     let ZValue::Dict(d) = &**md else { return None };
     let v: OwnedValue = d.get(&COMPANY).ok()??;
-    Card::decode(&bytes(&v)?)
+    Card::decode_ble(&bytes(&v)?)
 }
 
 pub fn rssi_in(props: &HashMap<String, OwnedValue>) -> Option<i16> {
     props.get("RSSI").and_then(|v| i16::try_from(v).ok())
+}
+
+/// A heard device's Bluetooth address and its type ("public" or "random"), for a connection to it (direct.rs).
+pub async fn address(sys: &Connection, device: &str) -> Result<(String, String), String> {
+    let props: HashMap<String, OwnedValue> = sys
+        .call_method(
+            Some(BLUEZ),
+            device,
+            Some("org.freedesktop.DBus.Properties"),
+            "GetAll",
+            &("org.bluez.Device1",),
+        )
+        .await
+        .map_err(|e| format!("BlueZ no longer knows the TV ({e}): look for it again"))?
+        .body()
+        .deserialize()
+        .map_err(|e| e.to_string())?;
+    let text = |k: &str| {
+        props
+            .get(k)
+            .and_then(|v| String::try_from(v.try_clone().ok()?).ok())
+    };
+    Ok((
+        text("Address").ok_or("BlueZ gave no address")?,
+        text("AddressType").unwrap_or_else(|| "public".into()),
+    ))
 }
 
 /// Receivers by signal strength, nearest first; one per id (the strongest), unknown strength last.
@@ -280,6 +306,7 @@ mod tests {
             id: id.into(),
             addr: Some((Ipv4Addr::new(192, 168, 1, last), 47800)),
             token: None,
+            psm: None,
         }
     }
 
@@ -326,6 +353,16 @@ mod tests {
         let p = device_props(COMPANY, tv("3f0c2a8e", 20).encode(), Some(-61));
         assert_eq!(card_in(&p), Some(tv("3f0c2a8e", 20)));
         assert_eq!(rssi_in(&p), Some(-61));
+        // A receiver with no address on this network that offers a direct connection.
+        let direct = Card {
+            addr: None,
+            psm: Some(0x80),
+            ..tv("0b6f1c2a", 20)
+        };
+        assert_eq!(
+            card_in(&device_props(COMPANY, direct.encode(), None)),
+            Some(direct)
+        );
         // Someone else's test data under the same company id is not a card.
         assert_eq!(
             card_in(&device_props(COMPANY, vec![1, 2, 3, 4, 5, 6, 7, 8], None)),

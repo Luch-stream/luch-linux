@@ -3,6 +3,7 @@
 //! TVs without Luch (DLNA renderers, Chromecasts) are found too and play cast media (tv.rs).
 
 mod cast;
+mod direct;
 mod discovery;
 mod display;
 mod enc;
@@ -230,8 +231,9 @@ impl Luch {
     }
 
     /// Climbs the discovery ladder (PROTOCOL.md 1): "auto" (mDNS and a sweep of the LAN, then Bluetooth), "all"
-    /// (then also the TV's sound through the microphone and its QR code through the camera: only when the person
-    /// asked), or some of "mdns,scan,ble,sound,qr" at once. Progress comes as FindProgress.
+    /// (then also the TV's sound through the microphone, its QR code through the camera, and which TVs offer a direct
+    /// connection: only when the person asked), or some of "mdns,scan,ble,sound,qr,direct" at once. Progress comes as
+    /// FindProgress.
     async fn find(&self, mode: String, #[zbus(connection)] conn: &Connection) -> fdo::Result<()> {
         self.finder
             .start(conn, &mode)
@@ -242,6 +244,45 @@ impl Luch {
     /// The last FindProgress (JSON).
     async fn find_status(&self) -> String {
         self.finder.status().await
+    }
+
+    /// Connects to a receiver straight over its own Wi-Fi Direct network (PROTOCOL.md, "direct"), for when no network
+    /// joins this computer and the TV: over Bluetooth the TV is asked (its person allows it, or pairs), this computer
+    /// leaves its Wi-Fi for the TV's network while the session lasts and comes back after. Only on a person's request.
+    /// `key`: "" for the nearest TV offering it, else the start of its id or its name (DirectOffers). Returns at once
+    /// with {"leaves": the Wi-Fi network it leaves, or null}; the steps come as DirectChanged.
+    async fn direct(
+        &self,
+        key: String,
+        #[zbus(connection)] conn: &Connection,
+    ) -> fdo::Result<String> {
+        let ctx = direct::Ctx {
+            st: self.st.clone(),
+            sender_id: self.sender_id.clone(),
+            host: self.host.clone(),
+            ident: self.ident.clone(),
+        };
+        direct::start(ctx, conn, &key)
+            .await
+            .map_err(fdo::Error::Failed)
+    }
+
+    /// Ends the session over a TV's network and goes back to the Wi-Fi network before; says what it did.
+    async fn direct_off(&self, #[zbus(connection)] conn: &Connection) -> fdo::Result<String> {
+        direct::off(&self.st, conn)
+            .await
+            .map_err(fdo::Error::Failed)
+    }
+
+    /// Where a direct connection stands (JSON, as DirectChanged).
+    async fn direct_status(&self) -> String {
+        direct::status().to_string()
+    }
+
+    /// The TVs heard over Bluetooth lately that offer a direct connection, nearest first, and the Wi-Fi network this
+    /// computer would leave: {"offers":[{"key","name","rssi"}],"leaves":"<name>"|null}.
+    async fn direct_offers(&self) -> String {
+        direct::offered().await.to_string()
     }
 
     /// How each listed receiver was found, and its Bluetooth signal: {"<id>":{"via":["mdns","ble"],"rssi":-48}}.
@@ -1353,6 +1394,9 @@ impl Luch {
     /// What the discovery ladder is trying (JSON, as FindStatus).
     #[zbus(signal)]
     async fn find_progress(e: &SignalEmitter<'_>, status: &str) -> zbus::Result<()>;
+    /// A direct connection's step (JSON, as DirectStatus).
+    #[zbus(signal)]
+    async fn direct_changed(e: &SignalEmitter<'_>, status: &str) -> zbus::Result<()>;
 
     /// A receiver's `media_state` changed (JSON); {"state":"stopped"} when it ended.
     #[zbus(signal)]
@@ -1569,32 +1613,65 @@ async fn open_channel(
 ) -> io::Result<Opened> {
     stream.set_nodelay(true)?;
     let addrs = (stream.local_addr()?.ip(), stream.peer_addr()?.ip());
-    let (rd, mut wr, receiver_fp): (Box<dyn AsyncRead + Send + Unpin>, Writer, _) = match ident {
-        Some(me) => {
-            let (connector, pin) = me.connector(pinned)?;
-            let name = tokio_rustls::rustls::pki_types::ServerName::IpAddress(addrs.1.into());
-            let tls = timeout(HANDSHAKE_TIMEOUT, connector.connect(name, stream))
-                .await
-                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timed out"))?
-                .map_err(|e| {
-                    if e.to_string().contains(pair::PIN_MISMATCH) {
-                        io::Error::new(io::ErrorKind::PermissionDenied, pair::PIN_MISMATCH)
-                    } else {
-                        e
-                    }
-                })?;
-            let fp = *pin.seen.lock().unwrap();
-            let (rd, wr) = tokio::io::split(tls);
-            (Box::new(rd), Box::new(wr), fp)
-        }
+    let (rd, wr, receiver_fp) = match ident {
+        Some(me) => tls_halves(stream, addrs.1, me, pinned).await?,
         None => {
             let (rd, wr) = stream.into_split();
-            (Box::new(rd), Box::new(wr), None)
+            (
+                Box::new(rd) as Box<dyn AsyncRead + Send + Unpin>,
+                Box::new(wr) as Writer,
+                None,
+            )
         }
     };
+    greet(rd, wr, addrs, receiver_fp, hello, ident.is_some(), pinned).await
+}
+
+/// TLS to a receiver over any stream (TCP, or the Bluetooth channel of a direct connection, direct/mod.rs): its two
+/// ends and the receiver's certificate, taken only if it is `pinned` (when there is one).
+async fn tls_halves<S>(
+    stream: S,
+    peer: std::net::IpAddr,
+    me: &pair::Identity,
+    pinned: Option<pair::Fingerprint>,
+) -> io::Result<(
+    Box<dyn AsyncRead + Send + Unpin>,
+    Writer,
+    Option<pair::Fingerprint>,
+)>
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    let (connector, pin) = me.connector(pinned)?;
+    let name = tokio_rustls::rustls::pki_types::ServerName::IpAddress(peer.into());
+    let tls = timeout(HANDSHAKE_TIMEOUT, connector.connect(name, stream))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timed out"))?
+        .map_err(|e| {
+            if e.to_string().contains(pair::PIN_MISMATCH) {
+                io::Error::new(io::ErrorKind::PermissionDenied, pair::PIN_MISMATCH)
+            } else {
+                e
+            }
+        })?;
+    let fp = *pin.seen.lock().unwrap();
+    let (rd, wr) = tokio::io::split(tls);
+    Ok((Box::new(rd), Box::new(wr), fp))
+}
+
+/// The hello (made the TLS one over `tls`) and the receiver's first answer.
+async fn greet(
+    rd: Box<dyn AsyncRead + Send + Unpin>,
+    mut wr: Writer,
+    addrs: (std::net::IpAddr, std::net::IpAddr),
+    receiver_fp: Option<pair::Fingerprint>,
+    hello: &Value,
+    tls: bool,
+    pinned: Option<pair::Fingerprint>,
+) -> io::Result<Opened> {
     let mut rd = BufReader::new(rd);
     let mut hello = hello.clone();
-    if ident.is_some() {
+    if tls {
         hello["v"] = json!(p::VERSION_TLS);
         if pinned.is_none() {
             hello["pair"] = json!(true);
@@ -1647,8 +1724,11 @@ async fn install(
             st.secure.remove(&id);
         }
     }
-    // Remembered with its MAC (the handshake has just filled the ARP table), to wake it later.
-    wake::remember(&id, &r.name, &r.model, &r.address);
+    // Remembered with its MAC (the handshake has just filled the ARP table), to wake it later; not on the TV's own
+    // network of a direct connection, where its address and MAC wake nothing later.
+    if !direct::carries(&r.address) {
+        wake::remember(&id, &r.name, &r.model, &r.address);
+    }
     eprintln!(
         "[luchd] connected to {} ({}:{} via {}{})",
         r.name,
@@ -1706,59 +1786,16 @@ async fn pairing(
     mut codes: mpsc::Receiver<CodeTyped>,
 ) {
     let Opened {
-        mut first,
+        first,
         mut rd,
         mut wr,
         addrs,
         ..
     } = o;
     let name = r.name.clone();
-    let deadline = Instant::now() + Duration::from_secs(130);
-    // The welcome, or why not; and Pair's caller when a code was typed.
-    let result: Result<(Value, Option<PairReply>), (String, Option<PairReply>)> = async {
-        loop {
-            if first["t"] == "pair_refused" {
-                return Err((pair::explain(&pair::refused(&first), &name), None));
-            }
-            if first["t"] != "pair" {
-                return Err((format!("{name}: unexpected {first}"), None));
-            }
-            let state = pair_state(&first, &name);
-            st.lock().await.pairing.insert(id.clone(), state.clone());
-            pair_changed(&conn, &id, &state).await;
-            if first["step"] == "allow" {
-                // The TV asks its person first; its next word is the code step or a refusal.
-                first = match tokio::time::timeout_at(deadline, read_msg(&mut rd)).await {
-                    Ok(Ok(Some(v))) => v,
-                    Ok(_) => return Err((format!("{name} closed the connection"), None)),
-                    Err(_) => return Err((format!("nobody answered on {name} in time"), None)),
-                };
-                continue;
-            }
-            // The code is on the TV: wait for it from here, or for the TV to give up (fill_buf is cancel-safe).
-            let (code, reply) = tokio::select! {
-                c = codes.recv() => match c {
-                    Some(c) => c,
-                    None => return Err(("luchd is stopping".into(), None)),
-                },
-                _ = rd.fill_buf() => {
-                    let v = read_msg(&mut rd).await.ok().flatten().unwrap_or(Value::Null);
-                    return Err((pair::explain(&pair::refused(&v), &name), None));
-                }
-                _ = tokio::time::sleep_until(deadline) => {
-                    let _ = send(&mut wr, &json!({"t": "bye"})).await;
-                    return Err((format!("no code was entered for {name} in time"), None));
-                }
-            };
-            return match pair::code_check(&mut rd, &mut wr, &code, &me, &theirs).await {
-                Ok(()) => match timeout(HANDSHAKE_TIMEOUT, read_msg(&mut rd)).await {
-                    Ok(Ok(Some(w))) if w["t"] == "welcome" => Ok((w, Some(reply))),
-                    _ => Err((format!("{name} paired but sent no welcome"), Some(reply))),
-                },
-                Err(f) => Err((pair::explain(&f, &name), Some(reply))),
-            };
-        }
-    }
+    let result = pair_on(
+        &st, &conn, &id, &name, first, &mut rd, &mut wr, &me, &theirs, &mut codes,
+    )
     .await;
     st.lock().await.codes.remove(&id);
     match result {
@@ -1795,6 +1832,70 @@ async fn pairing(
                 let _ = reply.send(Err(why));
             }
         }
+    }
+}
+
+/// A receiver asking for pairing on an open channel (`first` is its `pair`): waits for its allow when it asks that
+/// first and for the code typed here (Pair under `key`, the name Pairing and PairChanged use too), and runs the code
+/// check. The welcome after it, or why not; and Pair's caller when a code was typed. Gives up after two minutes.
+#[allow(clippy::too_many_arguments)]
+async fn pair_on(
+    st: &Shared,
+    conn: &Connection,
+    key: &str,
+    name: &str,
+    mut first: Value,
+    rd: &mut Reader,
+    wr: &mut Writer,
+    me: &pair::Fingerprint,
+    theirs: &pair::Fingerprint,
+    codes: &mut mpsc::Receiver<CodeTyped>,
+) -> Result<(Value, Option<PairReply>), (String, Option<PairReply>)> {
+    let deadline = Instant::now() + Duration::from_secs(130);
+    loop {
+        if first["t"] == "pair_refused" {
+            return Err((pair::explain(&pair::refused(&first), name), None));
+        }
+        if first["t"] != "pair" {
+            return Err((format!("{name}: unexpected {first}"), None));
+        }
+        let state = pair_state(&first, name);
+        st.lock()
+            .await
+            .pairing
+            .insert(key.to_string(), state.clone());
+        pair_changed(conn, key, &state).await;
+        if first["step"] == "allow" {
+            // The TV asks its person first; its next word is the code step or a refusal.
+            first = match tokio::time::timeout_at(deadline, read_msg(&mut *rd)).await {
+                Ok(Ok(Some(v))) => v,
+                Ok(_) => return Err((format!("{name} closed the connection"), None)),
+                Err(_) => return Err((format!("nobody answered on {name} in time"), None)),
+            };
+            continue;
+        }
+        // The code is on the TV: wait for it from here, or for the TV to give up (fill_buf is cancel-safe).
+        let (code, reply) = tokio::select! {
+            c = codes.recv() => match c {
+                Some(c) => c,
+                None => return Err(("luchd is stopping".into(), None)),
+            },
+            _ = rd.fill_buf() => {
+                let v = read_msg(&mut *rd).await.ok().flatten().unwrap_or(Value::Null);
+                return Err((pair::explain(&pair::refused(&v), name), None));
+            }
+            _ = tokio::time::sleep_until(deadline) => {
+                let _ = send(&mut *wr, &json!({"t": "bye"})).await;
+                return Err((format!("no code was entered for {name} in time"), None));
+            }
+        };
+        return match pair::code_check(&mut *rd, &mut *wr, &code, me, theirs).await {
+            Ok(()) => match timeout(HANDSHAKE_TIMEOUT, read_msg(&mut *rd)).await {
+                Ok(Ok(Some(w))) if w["t"] == "welcome" => Ok((w, Some(reply))),
+                _ => Err((format!("{name} paired but sent no welcome"), Some(reply))),
+            },
+            Err(f) => Err((pair::explain(&f, name), Some(reply))),
+        };
     }
 }
 
@@ -3077,6 +3178,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     gstreamer::init()?;
     mirror::restore_leftovers();
     mirror::restore_audio();
+    // Back to this computer's own Wi-Fi if luchd stopped while on a TV's network.
+    tokio::spawn(direct::go_back_after_restart());
     // Notification banners back on if a crash left them off (quiet.rs).
     quiet::with(|_| ());
     let id = sender_id()?;
@@ -3257,7 +3360,7 @@ mod tests {
 
     /// A TV made of Rust for the pairing tests: its own certificate, any client certificate let through and
     /// remembered, and a script for what it says after the hello.
-    mod tv {
+    pub(crate) mod tv {
         use super::*;
         use tokio_rustls::rustls::{
             self,
