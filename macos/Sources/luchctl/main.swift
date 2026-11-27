@@ -123,9 +123,34 @@ case "mirror":
         positionals.append(args[index])
         index += 1
     }
-    if let name = positionals.first { request["name"] = name }
+    let (name, source, which) = MirrorSource.split(positionals) { word in
+        (call(["cmd": "receivers"])["receivers"] as? [[String: Any]] ?? []).contains {
+            ($0["name"] as? String)?.lowercased() == word.lowercased() || $0["id"] as? String == word
+        }
+    }
+    if let name { request["name"] = name }
+    if let source {
+        guard let parsed = MirrorSource.parse(source) else {
+            print("usage: luchctl mirror [r] [fast|monitor|window|virtual|audio|asis|extend|speed|quality|mac] [which]")
+            exit(2)
+        }
+        request["source"] = source
+        if let which { request["which"] = which }
+        // No display or window named, several there: picked here, on the terminal.
+        if which == nil, parsed == .monitor(nil) || parsed == .window(nil) {
+            let what = parsed == .window(nil) ? "windows" : "displays"
+            let all = (call(["cmd": what])[what] as? [[String: Any]] ?? []).compactMap { e -> ReceiverEntry? in
+                guard let id = e["id"] as? String, let name = e["name"] as? String else { return nil }
+                return ReceiverEntry(id: id, name: name)
+            }
+            if all.count > 1, let picked = SourceChoice.ask(String(what.dropLast()), all) {
+                request["which"] = "#" + picked.id
+            }
+        }
+    }
     let response = call(request)
     if let error = response["error"] as? String { print("error: \(error)"); exit(1) }
+    if let asking = response["asking"] as? String { print(asking) }
     print("mirroring to \(response["receiver"] as? String ?? "?")")
 
 case "stats":
@@ -270,8 +295,9 @@ case "ping":
 
 default:
     print("""
-    usage: luchctl list | mirror [name] [--codec auto|h264|hevc] [--profile baseline|main|high]
-                          [--frame-ms N] | stats | state | stop | ping
+    usage: luchctl list | mirror [r] [fast|monitor|window|virtual|audio|asis|extend|speed|quality|mac] [display|window]
+                          [--codec auto|h264|hevc] [--profile baseline|main|high] [--frame-ms N]
+                   | stats | state | stop | ping
                    | cast <file|link>... [--to r] [--title T] [--start m:ss] [--sub file] [--relay] | stop-cast [r]
                    | media [r] [play|pause|toggle|seek m:ss|skip s|rate x|audio id|sub id|sub off]
                    | volume [r] [0..100|+|-|mute|unmute] | page [r] next|prev|<n> | sleep [r] | browser install
