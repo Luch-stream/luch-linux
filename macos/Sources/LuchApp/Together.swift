@@ -8,7 +8,7 @@ import LuchNet
 import LuchProto
 
 final class Together {
-    static let commands: Set<String> = ["group", "group_stats", "offset", "audio", "latency"]
+    static let commands: Set<String> = ["group", "group_stats", "offset", "audio", "latency", "calibrate"]
 
     /// What the app around it knows and does; set once at launch, called on the main thread.
     struct Hooks {
@@ -27,7 +27,9 @@ final class Together {
     }
 
     var hooks = Hooks()
-    private let store = SyncStore.shared
+    let store = SyncStore.shared
+    /// A calibration runs (Calibrate.swift).
+    let calibrating = OneAtATime()
     private let lock = NSLock()
     private var group: GroupSession?
     private var lab: LatencyLab?
@@ -67,6 +69,7 @@ final class Together {
             case "offset": return try setOffset(request)
             case "audio": return try setAudio(request)
             case "latency": return try latency(request)
+            case "calibrate": return try calibrate()
             default: return ["error": "unknown command"]
             }
         } catch {
@@ -74,11 +77,11 @@ final class Together {
         }
     }
 
-    private func onMain<T>(_ run: () -> T) -> T {
+    func onMain<T>(_ run: () -> T) -> T {
         Thread.isMainThread ? run() : DispatchQueue.main.sync(execute: run)
     }
 
-    private func currentGroup() -> GroupSession? {
+    func currentGroup() -> GroupSession? {
         lock.lock()
         defer { lock.unlock() }
         return group
@@ -256,7 +259,7 @@ final class Together {
 
     // MARK: - menu
 
-    private func show(_ text: String) {
+    func show(_ text: String) {
         lock.lock()
         status = text
         lock.unlock()
@@ -291,6 +294,7 @@ final class Together {
             let item = NSMenuItem.label(Self.delayLine(g.stats["group"] as? [String: Any] ?? [:]))
             statusItem = item
             menu.addItem(item)
+            menu.addItem(calibrateItem(g))
             menu.addItem(.run("Stop Playing Together", symbol: "stop.circle") { [weak self] in
                 DispatchQueue.global(qos: .userInitiated).async { self?.stop() }
             })

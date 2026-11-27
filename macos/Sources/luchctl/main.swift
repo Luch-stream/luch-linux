@@ -188,6 +188,9 @@ case "group":
 case "offset":
     offsetCommand(args)
 
+case "calibrate":
+    calibrateCommand(args)
+
 case "audio":
     audioCommand(args)
 
@@ -413,6 +416,6 @@ default:
            only through Shortcuts, so the app adds two shortcuts the first time
            pair: the first connection to a receiver shows a code on the TV, typed here (any command that connects
            asks for it too); both then know each other and later connections need nothing. forget: pair again next time
-    """ + "\n" + togetherUsage)
+    """ + "\n" + togetherUsage + "\n" + calibrateUsage)
     exit(2)
 }

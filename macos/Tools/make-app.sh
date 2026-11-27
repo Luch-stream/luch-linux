@@ -48,7 +48,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>NSBluetoothAlwaysUsageDescription</key>
     <string>Luch finds receivers nearby over Bluetooth, and learns your TV remote's power key to turn the TV on.</string>
     <key>NSMicrophoneUsageDescription</key>
-    <string>Luch listens for a TV saying its address by sound, only while you ask it to find receivers that way.</string>
+    <string>Luch listens for a TV saying its address by sound, or times the TVs' sound to play a group together, only while you ask it to.</string>
     <key>NSCameraUsageDescription</key>
     <string>Luch reads the QR code on a TV's screen, only while you ask it to find receivers that way.</string>
     <key>NSLocationUsageDescription</key>
