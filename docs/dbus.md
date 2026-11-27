@@ -31,6 +31,15 @@ camera for the TV's QR code. Every receiver found any way is checked with a real
 `Discovered()` says how each was found. Receivers heard over Bluetooth are listed nearest (strongest signal) first,
 the others by name. One found other than by mDNS leaves the list when it no longer answers at the next climb.
 
+Where no network joins the computer and the TV at all (client isolation, no common LAN), a TV whose Bluetooth card
+offers it can be reached **directly** (`Direct`): over a Bluetooth LE channel to the TV (L2CAP, the PSM in its card)
+the daemon runs the TV's usual TLS (pinned; pairing with the code if not paired yet) and asks for its Wi-Fi Direct
+network; the TV asks its person, makes the network and hands over its name and passphrase; the computer joins it as
+a plain Wi-Fi network through NetworkManager (a volatile connection, never the default route, so Ethernet keeps the
+internet), connects to the TV there like to any receiver, and goes back to its own Wi-Fi when that session ends or
+on `DirectOff` (or at the next start, after a crash). Never automatic: it takes the computer off its Wi-Fi. The
+ladder's `direct` way (part of `all`) only says which TVs offer it.
+
 ### TVs without Luch
 
 TVs that do not run Luch are in the same list and play what `Cast` gives them ([other-tvs.md](other-tvs.md)):
@@ -87,8 +96,8 @@ once every 30 s; luchd climbs it once by itself a second after it starts.
 
 Climbs the discovery ladder; returns at once, progress comes as `FindProgress`. `mode`: `auto` (mDNS and the
 sweep of the LAN, then Bluetooth), `all` (then also sound and the camera, which need the person: the TV says its
-address when asked, the code is held up to the camera), or a comma-separated list of `mdns`, `scan`, `ble`,
-`sound`, `qr` to try at once. A climb already running is left to finish. Invalid modes fail with `InvalidArgs`.
+address when asked, the code is held up to the camera; and which TVs nearby offer a direct connection), or a
+comma-separated list of `mdns`, `scan`, `ble`, `sound`, `qr`, `direct` to try at once. A climb already running is left to finish. Invalid modes fail with `InvalidArgs`.
 `luchctl find [mode]` (default `all`) prints what it tries.
 
 ### `FindStatus() → s`
@@ -98,8 +107,32 @@ The last `FindProgress` as JSON (see below); `"running": false` with no rungs be
 ### `Discovered() → s`
 
 How each listed receiver was found: `{"<id>":{"via":["mdns","scan"],"rssi":-48}}`. `via` holds `mdns`, `scan`,
-`ble`, `sound`, `qr` (its QR link through `AddReceiver`) or `manual`; `rssi` (dBm) is the Bluetooth signal when it
-was heard, else `null`.
+`ble`, `sound`, `qr` (its QR link through `AddReceiver`), `manual` or `direct` (over its own Wi-Fi network);
+`rssi` (dBm) is the Bluetooth signal when it was heard, else `null`.
+
+### `Direct(s key) → s`
+
+Connects to a TV over its own Wi-Fi Direct network (see above). `key`: `""` for the nearest TV offering it, else
+the start of its id (as its Bluetooth card says it, 8 hex digits) or its name; a TV not heard lately is listened
+for first (12 s). Returns at once with `{"leaves": "<the Wi-Fi network this computer leaves>"|null}`; the steps
+come as `DirectChanged`. A TV not paired yet asks for pairing: `PairChanged` and `Pair` then use `key`'s 8 hex
+digits as the id. Fails at once without NetworkManager or Wi-Fi, while another one is under way, or while on a TV's
+network already. `luchctl direct [r]`.
+
+### `DirectOff() → s`
+
+Ends the session over the TV's network and goes back to the Wi-Fi network before; returns what it did ("back on
+'Home'"). `luchctl direct off`.
+
+### `DirectStatus() → s`
+
+Where it stands, as `DirectChanged` says it.
+
+### `DirectOffers() → s`
+
+`{"offers": [{"key": "0b6f1c2a", "name": "Living room TV", "rssi": -52}], "leaves": "Home"|null}`: the TVs heard
+over Bluetooth in the last 2 minutes that offer a direct connection, nearest first (named when this computer knows
+them), and the Wi-Fi network a direct connection would leave, for the question to ask first.
 
 ### `AddReceiver(s link) → s`
 
@@ -406,6 +439,14 @@ What the discovery ladder is trying, on every change:
 `state`: `waiting`, `running`, `done`, `failed` (the note says why: "Bluetooth is off", "no Bluetooth adapter"),
 `skipped` (a receiver was found before it was needed). The last one has `"running": false`. The GNOME menu shows
 the running rungs instead of "Searching…", and offers "Search harder" (`Find("all")`) when the list is empty.
+
+### `DirectChanged(s status)`
+
+A direct connection's step: `{"step": "...", "name": "Living room TV", ...}`. `step`: `idle`, `looking` (listening
+over Bluetooth), `opening` (the TV's Bluetooth channel), `pairing` (with `key`, for `Pair`), `asking` (the TV asks
+its person), `joining` (with `ssid`, `band`), `connecting`, `on` (with `id`, `ssid`, `previous`: the network to go
+back to), `back` (with `note`) or `failed` (with `reason`). The GNOME menu follows it, offers "Connect directly
+(Wi-Fi Direct)…" (asking first) and then "Leave the TV's network".
 ### `QuietAsk()`
 
 A presentation or a mirroring session began, `Quiet` is `ask` and nobody has answered yet: ask the person (the GNOME

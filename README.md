@@ -145,6 +145,7 @@ luchctl list
 luchctl refresh                           # rescan now; updates arrive asynchronously in TUI/watch
 luchctl find                              # mDNS gets nowhere: every LAN address, Bluetooth, the TV's sound, its QR code
 luchctl add 192.168.1.20                  # a receiver by its address or QR link
+luchctl direct "Living room TV"           # no common network: join the TV's own Wi-Fi (asked on the TV), back after
 luchctl mirror                            # fast mode; the receiver name is optional when there is only one
 luchctl mirror "XGIMI MoGo 4 Laser" window # or monitor | window | virtual
 luchctl stats                             # live latency, fps, bitrate
@@ -213,7 +214,9 @@ tries every one it knows for that receiver:
   on the same LAN segment (mDNS does not cross routers). luchd also asks every address of the subnet and listens
   over Bluetooth by itself; `luchctl find` goes further (on the TV choose "Say the address by sound", or hold the
   laptop's camera up to the TV's QR code) and says what it tries. Client isolation (many hotels) keeps devices
-  apart altogether: then only the TV's own hotspot or a cable helps.
+  apart altogether: then `luchctl direct` (or "Connect directly" in the menu) asks the TV over Bluetooth for its own
+  Wi-Fi Direct network and joins it while showing; the laptop leaves its Wi-Fi meanwhile (Ethernet stays) and comes
+  back when the session ends or on `luchctl direct off`. It needs NetworkManager and a receiver that offers it.
 - `fast` fails with «needs CAP_SYS_ADMIN»: run the `setcap` line again (reinstalling drops it).
 - Logs: `journalctl --user -u luchd -f`. `LUCH_PROBE=1` in the service environment prints
   per-stage latency.
