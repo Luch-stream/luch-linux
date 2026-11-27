@@ -415,7 +415,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         startMirror(receivers[0])
     }
 
-    private func startMirror(_ receiver: Receiver, soundOnly: Bool = false) {
+    private func startMirror(_ receiver: Receiver, soundOnly: Bool = false, extend: Bool = false) {
         // Switching sessions: let the receiver close the previous one first, otherwise it tears
         // down the new session a few hundred ms after start.
         if let old = engine {
@@ -426,14 +426,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.global(qos: .userInitiated).async {
                 old.stop(reason: "switch")
                 Thread.sleep(forTimeInterval: 0.8)
-                DispatchQueue.main.async { [weak self] in self?.beginMirror(receiver, soundOnly: soundOnly) }
+                DispatchQueue.main.async { [weak self] in self?.beginMirror(receiver, soundOnly: soundOnly, extend: extend) }
             }
             return
         }
-        beginMirror(receiver, soundOnly: soundOnly)
+        beginMirror(receiver, soundOnly: soundOnly, extend: extend)
     }
 
-    private func beginMirror(_ receiver: Receiver, soundOnly: Bool) {
+    private func beginMirror(_ receiver: Receiver, soundOnly: Bool, extend: Bool) {
         if !CGPreflightScreenCaptureAccess() {
             // The system dialog only comes forward for a regular, active app; a background
             // accessory app gets an immediate "declined" with no window at all.
@@ -474,6 +474,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let frameMs = frameMsOverride { options.audioFrameMs = frameMs }
         options.profile = profileOverride
         options.soundOnly = soundOnly
+        options.extend = extend
         let engine = Engine(options: options)
         engine.shareArt = { [caster] file, client, me in caster.shareArt(file, client: client, me: me) }
         engine.onStats = { [weak self] stats in
@@ -492,7 +493,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         self.engine = engine
         currentReceiverID = receiver.id
         currentReceiver = receiver
-        state = "Connecting to \(receiver.name)…"
+        state = extend ? "Connecting to \(receiver.name)… the first time, choose Extend in the macOS dialog"
+            : "Connecting to \(receiver.name)…"
         rebuildMenu()
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
@@ -502,6 +504,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let batteryNote = engine.deviceOnBattery ? " · 🔋 on battery" : ""
                 DispatchQueue.main.async {
                     self?.state = soundOnly ? "Playing sound on \(receiver.name)"
+                        : extend ? "Extended to \(receiver.name) · \(codec)"
                         : "Mirroring to \(receiver.name) · \(codec)\(batteryNote)"
                     self?.rebuildMenu()
                 }
@@ -640,6 +643,9 @@ extension AppDelegate {
         let m = NSMenu()
         let mirroringHere = currentReceiverID == r.id
         m.addItem(.run("Mirror Screen", symbol: "rectangle.on.rectangle") { [weak self] in self?.startMirror(r) })
+        m.addItem(.run("Extend Screen", symbol: "rectangle.split.2x1") { [weak self] in
+            self?.startMirror(r, extend: true)
+        })
         m.addItem(.run("Play Sound Only", symbol: "hifispeaker") { [weak self] in self?.startMirror(r, soundOnly: true) })
         if mirroringHere {
             m.addItem(.run("Stop Mirroring", symbol: "stop.circle") { [weak self] in self?.stopMirror() })

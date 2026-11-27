@@ -29,13 +29,28 @@ public final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate {
     private var frames = 0
     private var audioBuffers = 0
 
-    public func start(displayIndex: Int?, width: Int, height: Int, fps: Int, audio: Bool,
-                      fit: FitMode = .crop) async throws {
-        let content = try await Self.shareableContent()
+    /// `displayID`: that display (a virtual screen), waited for as it comes up: the first time for a TV, macOS asks
+    /// whether to extend the desktop onto it or mirror this one, and shows it only once that is answered. Else
+    /// `displayIndex`.
+    public func start(displayIndex: Int?, displayID: CGDirectDisplayID? = nil, width: Int, height: Int, fps: Int,
+                      audio: Bool, fit: FitMode = .crop) async throws {
+        var content = try await Self.shareableContent()
+        if let id = displayID {
+            if !content.displays.contains(where: { $0.displayID == id }) {
+                log("capture: waiting for screen \(id) (macOS may ask: Extend or Mirror)")
+            }
+            for _ in 0..<600 where !content.displays.contains(where: { $0.displayID == id }) {
+                try await Task.sleep(nanoseconds: 100_000_000)
+                content = try await Self.shareableContent()
+            }
+        }
         guard !content.displays.isEmpty else { throw CaptureError.noDisplays }
         let displays = content.displays
         let display: SCDisplay
-        if let index = displayIndex {
+        if let id = displayID {
+            guard let d = displays.first(where: { $0.displayID == id }) else { throw CaptureError.noDisplays }
+            display = d
+        } else if let index = displayIndex {
             guard index >= 0 && index < displays.count else { throw CaptureError.badDisplay(index, displays.count) }
             display = displays[index]
         } else {

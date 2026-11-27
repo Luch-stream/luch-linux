@@ -21,6 +21,7 @@ func usage() -> Never {
       luch mirror [<name>] [--ip A.B.C.D] [--iface en0] [--port N] [--display N]
                   [--fps N] [--bitrate KBPS] [--size WxH] [--seconds N] [--no-audio]
                   [--codec auto|h264|hevc] [--profile baseline|main|high] [--synthetic]
+                  [--extend]   (a screen of its own for the TV, beside this Mac's)
       luch sound [<name>] [--ip A.B.C.D] [--port N] [--seconds N] [--synthetic]
     """
     FileHandle.standardError.write(Data((text + "\n").utf8))
@@ -90,6 +91,7 @@ func parse(_ argv: [String]) -> Args {
             guard let profile = VideoProfile(rawValue: value) else { usage() }
             a.options.profile = profile
         case "--synthetic": a.options.synthetic = true
+        case "--extend": a.options.extend = true
         case "-h", "--help": usage()
         default:
             if flag.hasPrefix("-") { usage() }

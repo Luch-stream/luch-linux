@@ -96,6 +96,8 @@ public struct MirrorOptions {
     public var synthetic = false
     /// The receiver as a speaker (PROTOCOL.md 4d): the Mac's sound and no picture.
     public var soundOnly = false
+    /// A screen of its own for the TV, beside this Mac's (a virtual display), instead of a copy of this one.
+    public var extend = false
     /// Tell the receiver what this Mac plays (`now_playing`), whatever the session shows.
     public var nowPlaying = true
     public init() {}
@@ -124,6 +126,7 @@ public enum EngineError: Error, LocalizedError {
     case socket
     case encoder
     case noSoundOnly
+    case noVirtualScreen
 
     public var errorDescription: String? {
         switch self {
@@ -133,6 +136,7 @@ public enum EngineError: Error, LocalizedError {
         case .socket: return "cannot open the media socket"
         case .encoder: return "cannot create the video encoder"
         case .noSoundOnly: return "this receiver cannot play sound only"
+        case .noVirtualScreen: return "macOS made no second screen for the TV"
         }
     }
 }
@@ -233,6 +237,7 @@ public final class Engine {
     private var lastLatency: UInt64 = 0
     private var audioFrames: UInt64 = 0
     private var watcher: NowPlayingWatcher?
+    private var virtualScreen: VirtualScreen?
     private var artLink: (path: String, link: String?)?
 
     public init(options: MirrorOptions) {
@@ -263,10 +268,20 @@ public final class Engine {
             try startSound(ctl, caps: caps, receiver: r)
             return
         }
-        let plan = CodecPlanner.plan(caps: caps, receiverID: r.id, options: options)
+        var planned = options
+        // A screen of the TV's own takes the TV's shape: nothing to crop or fit.
+        if planned.extend { planned.sizeMode = .client }
+        let plan = CodecPlanner.plan(caps: caps, receiverID: r.id, options: planned)
         self.plan = plan
         deviceOnBattery = caps.onBattery
         log("plan: \(plan.codec.label) \(plan.width)x\(plan.height)@\(plan.fps) audio=\(plan.audio) — \(plan.reason)")
+        if options.extend {
+            guard let v = VirtualScreen(name: caps.name, width: plan.width, height: plan.height, fps: plan.fps,
+                                        serial: VirtualScreen.serial(for: r.id)) else {
+                throw EngineError.noVirtualScreen
+            }
+            virtualScreen = v
+        }
 
         var start: [String: Any] = ["t": "start", "mode": "mirror",
                                     "video": ["codec": plan.codec.rawValue, "width": plan.width,
@@ -377,6 +392,8 @@ public final class Engine {
             done.signal()
         }
         _ = done.wait(timeout: .now() + 2)
+        // Only once nothing captures it: windows on it go back to this Mac's screen.
+        virtualScreen = nil
         running = false
         streaming = false
         log("done")
@@ -475,7 +492,8 @@ public final class Engine {
             : (w: plan?.width ?? options.width, h: plan?.height ?? options.height, fps: plan?.fps ?? options.fps)
         Task {
             do {
-                try await capture.start(displayIndex: options.display, width: size.w, height: size.h,
+                try await capture.start(displayIndex: options.display, displayID: self.virtualScreen?.displayID,
+                                        width: size.w, height: size.h,
                                         fps: size.fps, audio: audio, fit: options.fit)
             } catch {
                 failure = error
