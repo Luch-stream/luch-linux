@@ -67,6 +67,21 @@ final class PresentTests: XCTestCase {
         XCTAssertEqual(Show.widthStep(99999), 3840)
     }
 
+    func testSlidesAreDrawnAsWideAsAskedAndTurnedAsShown() {
+        let doc = PDFDocument()
+        let page = PDFPage()
+        page.setBounds(CGRect(x: 0, y: 0, width: 400, height: 300), for: .mediaBox)
+        doc.insert(page, at: 0)
+        let size = { (png: Data?) -> [Int] in
+            guard let png else { return [] }
+            return [16, 20].map { at in png.subdata(in: at..<(at + 4)).reduce(0) { $0 << 8 | Int($1) } }
+        }
+        XCTAssertEqual(size(Show.png(doc, page: 0, width: 320)), [320, 240])
+        page.rotation = 90
+        XCTAssertEqual(size(Show.png(doc, page: 0, width: 300)), [300, 400], "a turned page is drawn standing")
+        XCTAssertNil(Show.png(doc, page: 1, width: 320))
+    }
+
     func testTheWebsocketKeyIsAnsweredAsTheRfcSays() {
         XCTAssertEqual(WebSocket.accept(key: "dGhlIHNhbXBsZSBub25jZQ=="), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
     }
@@ -296,6 +311,12 @@ final class PresentTests: XCTestCase {
         h = nil
         XCTAssertNil(h)
         XCTAssertEqual(b.on, true)
+        // Quitting mid-session puts them back; the session's own end later changes nothing.
+        let late = q.hold()
+        XCTAssertEqual(b.on, false)
+        q.endAll()
+        XCTAssertEqual(b.on, true)
+        withExtendedLifetime(late) {}
     }
 
     func testACrashLeftBannersOffAndTheNextStartTurnsThemOn() {

@@ -7,7 +7,8 @@ import LuchNet
 import LuchProto
 
 final class Caster {
-    static let commands: Set<String> = ["cast", "media_cmd", "media_state", "stop_cast", "sleep", "volume", "page", "receiver_modes"]
+    static let commands: Set<String> = ["cast", "media_cmd", "media_state", "stop_cast", "sleep", "volume", "page", "receiver_modes",
+                                         "present", "annotate", "quiet"]
 
     private let lock = NSLock()
     private var sessions: [String: CastSession] = [:]
@@ -25,7 +26,10 @@ final class Caster {
         return showing.count == 1 ? showing[0] : nil
     }
 
-    private func session(_ r: Receiver) throws -> CastSession {
+    /// The presenter view, the black screen and do-not-disturb (Presenter.swift).
+    let presenter = Presenter()
+
+    func session(_ r: Receiver) throws -> CastSession {
         lock.lock()
         if let s = sessions[r.id], s.isOpen {
             lock.unlock()
@@ -34,6 +38,7 @@ final class Caster {
         lock.unlock()
         let s = try CastSession.open(r)
         s.onShowing = { [weak self] in self?.onChange?() }
+        s.onMessage = { [weak self] m in self?.presenter.heard(r.id, m) }
         lock.lock()
         sessions[r.id] = s
         lock.unlock()
@@ -57,7 +62,7 @@ final class Caster {
         return handle(q, receivers: [r])
     }
 
-    private func files() throws -> FileServer {
+    func files() throws -> FileServer {
         lock.lock()
         defer { lock.unlock() }
         if let server { return server }
@@ -78,6 +83,7 @@ final class Caster {
     }
 
     func handle(_ request: [String: Any], receivers: [Receiver], mirroring: String? = nil) -> [String: Any] {
+        if request["cmd"] as? String == "quiet" { return presenter.quiet(request["mode"] as? String) }
         guard let r = find(request, in: receivers, mirroring: mirroring) else {
             let names = receivers.map { "\"\($0.name)\"" }.joined(separator: ", ")
             if request["id"] == nil, request["name"] == nil, receivers.count > 1 {
@@ -115,6 +121,11 @@ final class Caster {
                 return ["ok": true, "volume": try session(r).volume(request["what"] as? String ?? "")]
             case "page":
                 return ["ok": true, "page": try session(r).page(request["what"] as? String ?? "next")]
+            case "present":
+                return ["ok": true, "url": try presenter.present(request["file"] as? String ?? "", on: r, caster: self)]
+            case "annotate":
+                try presenter.annotate(request["msg"] as? [String: Any] ?? [:], on: r, session: existing(r.id))
+                return ["ok": true]
             case "receiver_modes":
                 return ["ok": true, "modes": try session(r).welcome["modes"] ?? []]
             default:

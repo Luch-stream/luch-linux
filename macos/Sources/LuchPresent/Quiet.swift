@@ -74,6 +74,14 @@ public final class Quiet {
         apply()
     }
 
+    /// The app quits: banners back as they were, whatever still runs.
+    public func endAll() {
+        lock.lock()
+        defer { lock.unlock() }
+        sessions = 0
+        apply()
+    }
+
     /// The person's answer to the question: hide notifications (true) or not; kept until the app quits.
     public func answer(_ hide: Bool) {
         lock.lock()

@@ -195,3 +195,19 @@ What plays comes from MediaRemote, the source of Control Center's player. Since 
 own processes and returns nothing to other apps, so a small library (`libLuchNowPlaying.dylib`, in the app's
 Frameworks) is loaded into the system `/usr/bin/perl`, which is one of them, and reports changes as JSON lines; the
 open mediaremote-adapter does the same. If Apple closes that too, the TV simply shows no title.
+
+## Presenting
+
+`luchctl present [r] talk.pptx` (or *Present…* in a TV's menu) shows a PDF or a presentation on the TV and opens the
+presenter view in the browser: the current and next slide, the speaker notes, a timer. The mouse over the slide is
+the TV's laser pointer, dragging draws, a clicker or the arrow keys turn the slides; the TV draws pointer and ink
+itself (PROTOCOL.md 4h). It is luchd's own page (`luchd/src/present.html`, `present.js`; `Tools/sync-present.sh`
+copies them), served on 127.0.0.1 only; slides are drawn with PDFKit. Notes come from the `.pptx`/`.odp` itself, or a
+PDF's `.pdfpc` file or sticky notes. `luchctl blank [r] on|off` (*Black Screen* in the menu) blacks out the TV, also
+while mirroring.
+
+`luchctl quiet ask|on|off` (*Do Not Disturb While Presenting*): macOS has no API for Focus, so the app makes two
+shortcuts with Shortcuts' Set Focus action, *Luch Quiet On* and *Luch Quiet Off*, and Shortcuts asks to add them the
+first time; `ask` asks once while the app runs. A Focus already on is left alone when macOS lets the app read
+`~/Library/DoNotDisturb/DB/Assertions.json` (Full Disk Access on some versions). While mirroring, macOS itself hides
+notifications unless *Allow notifications when mirroring or sharing the display* is on.

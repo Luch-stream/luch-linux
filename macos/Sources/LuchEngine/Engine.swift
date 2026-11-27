@@ -283,6 +283,11 @@ public final class Engine {
         try begin(ctl, caps: caps, receiver: r)
     }
 
+    /// Pointer, ink and blank (PROTOCOL.md 4h) on this session's channel: only the sender of what is shown may draw.
+    public func send(_ msg: [String: Any]) {
+        control?.send(msg)
+    }
+
     /// Changes how this Mac's screen is shown (as it is, at the TV's mode, or extended) while the session runs:
     /// a new start on the same connection, which the receiver takes as the same sender's, so nobody is asked to
     /// Allow again and the TV keeps its screen up.

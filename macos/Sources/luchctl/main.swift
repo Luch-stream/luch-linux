@@ -244,6 +244,31 @@ case "page":
     fail(r)
     print(r["page"] as? String ?? "")
 
+case "present" where (2...3).contains(args.count):
+    // A PDF or a presentation on the receiver, the presenter view here (current and next slide, notes, timer).
+    let (name, file) = args.count == 3 ? (args[1], args[2]) : (nil, args[1])
+    let path = URL(fileURLWithPath: (file as NSString).expandingTildeInPath).standardizedFileURL.path
+    let r = callPicking(withReceiver(["cmd": "present", "file": path], name), timeout: 120)
+    fail(r)
+    let url = r["url"] as? String ?? ""
+    print("presenter view: \(url)")
+    let open = Process()
+    open.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+    open.arguments = [url]
+    if (try? open.run()) == nil { print("(open it in a browser)") }
+
+case "blank" where (2...3).contains(args.count):
+    let (name, word) = args.count == 3 ? (args[1], args[2]) : (nil, args[1])
+    guard word == "on" || word == "off" else { print("error: blank on|off, not \(word)"); exit(1) }
+    fail(callPicking(withReceiver(["cmd": "annotate", "msg": ["t": "blank", "on": word == "on"]], name)))
+
+case "quiet" where args.count <= 2:
+    // Do not disturb while presenting or mirroring; ask: the app asks once.
+    let r = call(args.count == 2 ? ["cmd": "quiet", "mode": args[1]] : ["cmd": "quiet"])
+    fail(r)
+    if args.count == 1 { print(r["mode"] as? String ?? "?") }
+    if let note = r["note"] as? String { print(note) }
+
 case "stop-cast":
     fail(callPicking(withReceiver(["cmd": "stop_cast"], args.count > 1 ? args[1] : nil)))
 
@@ -274,7 +299,12 @@ default:
                           [--frame-ms N] | stats | state | stop | ping
                    | cast <file|link>... [--to r] [--title T] [--start m:ss] [--sub file] [--relay] | stop-cast [r]
                    | media [r] [play|pause|toggle|seek m:ss|skip s|rate x|audio id|sub id|sub off]
-                   | volume [r] [0..100|+|-|mute|unmute] | page [r] next|prev|<n> | sleep [r] | browser install
+                   | volume [r] [0..100|+|-|mute|unmute] | page [r] next|prev|<n> | blank [r] on|off
+                   | present [r] <file> | quiet [ask|on|off] | sleep [r] | browser install
+           present: shows a PDF or a presentation on the receiver and opens the presenter view here (current and
+           next slide, notes, timer; the mouse is a laser pointer, dragging draws, a clicker turns the slides)
+           quiet: hide notification banners while presenting or mirroring (ask: the app asks once); macOS allows it
+           only through Shortcuts, so the app adds two shortcuts the first time
     """)
     exit(2)
 }

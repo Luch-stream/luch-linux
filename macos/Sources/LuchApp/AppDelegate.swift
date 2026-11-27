@@ -80,7 +80,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private let menu = NSMenu()
     private let discovery = Discovery()
-    private var engine: Engine?
+    /// Do-not-disturb follows a mirroring session (sound only does not count).
+    private var engine: Engine? { didSet { caster.presenter.mirroring(engine.map { !$0.options.soundOnly } ?? false) } }
     private var state = "Idle"
     private var statsLine = "Not streaming"
     private var statsItem: NSMenuItem?
@@ -122,6 +123,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         discovery.publish(name: identity.name, id: identity.id)
         startLocalServer()
         caster.onChange = { [weak self] in DispatchQueue.main.async { self?.rebuildMenu() } }
+        setUpPresenting { [weak self] id in self?.currentReceiverID == id ? self?.engine : nil }
 
         rebuildMenu()
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.tick() }
@@ -386,6 +388,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(display)
 
         menu.addItem(.separator())
+
+        menu.addItem(quietItem())
 
         let launch = NSMenuItem(title: "Mirror on launch", action: #selector(toggleMirrorOnLaunch), keyEquivalent: "")
         launch.target = self
@@ -706,6 +710,7 @@ extension AppDelegate {
         m.addItem(.run(linkTitle, enabled: link != nil, symbol: "link") { [weak self] in
             if let link { self?.send(["cmd": "cast", "items": [link]], to: r) }
         })
+        presentingItems(r, mirroringHere: mirroringHere).forEach(m.addItem)
 
         if let s = caster.existing(r.id), let kind = s.showing {
             m.addItem(.separator())
@@ -810,7 +815,7 @@ extension AppDelegate {
     }
 
     /// Off the main thread (it waits for the TV); a refusal is shown, not swallowed.
-    private func send(_ request: [String: Any], to r: Receiver) {
+    func send(_ request: [String: Any], to r: Receiver) {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             let response = self.caster.run(request, on: r)
