@@ -17,6 +17,7 @@ mod pair;
 mod present;
 mod quiet;
 mod reports;
+mod sync;
 mod tv;
 mod volume;
 mod wake;
@@ -522,7 +523,59 @@ impl Luch {
         if !self.st.lock().await.conns.contains_key(&id) {
             self.connect(id.clone(), conn).await?;
         }
-        start_mirror(&self.st, conn, &id, &source, (width, height)).await
+        start_mirror(&self.st, conn, &id, &source, (width, height), None).await
+    }
+
+    /// Mirrors to several receivers in step (PROTOCOL.md 4k): `ids[0]` shows the picture, the others present what
+    /// `roles` says ("video", "audio" or "both"; `roles[0]` is the first one's). `mode` "interactive" keeps the
+    /// picture as fast as alone and lets the sound wait for it; "watch" gives everyone the same delay of at least 150
+    /// ms, for rooms of speakers and walls of TVs. Every receiver must be connected and announce sync.
+    async fn mirror_group(
+        &self,
+        ids: Vec<String>,
+        roles: Vec<String>,
+        source: String,
+        mode: String,
+        #[zbus(connection)] conn: &Connection,
+    ) -> fdo::Result<()> {
+        let mode = sync::Mode::parse(&mode).ok_or_else(|| {
+            fdo::Error::InvalidArgs(format!("mode must be interactive|watch, not {mode}"))
+        })?;
+        if ids.len() < 2 || ids.len() != roles.len() {
+            return Err(fdo::Error::InvalidArgs(
+                "two or more receivers, one role each".into(),
+            ));
+        }
+        for id in &ids {
+            if !self.st.lock().await.conns.contains_key(id) {
+                self.connect(id.clone(), conn).await?;
+            }
+        }
+        let group = GroupRequest {
+            role: roles[0].clone(),
+            members: ids[1..]
+                .iter()
+                .cloned()
+                .zip(roles[1..].iter().cloned())
+                .collect(),
+            mode,
+        };
+        start_mirror(&self.st, conn, &ids[0], &source, (0, 0), Some(group)).await
+    }
+
+    /// A receiver's own correction in ms (positive = later), for the output route it uses now: the slider of a group.
+    /// Saved, and applied at once when it is playing in a group.
+    async fn set_offset(&self, id: String, ms: f64) -> fdo::Result<()> {
+        if !(-1000.0..=1000.0).contains(&ms) {
+            return Err(fdo::Error::InvalidArgs(format!(
+                "offset {ms} ms is beyond ±1 s"
+            )));
+        }
+        save_offset(&sync::offset_key(&id, &last_route(&id)), ms);
+        if self.st.lock().await.mirrors.contains_key(&id) {
+            self.send_to(&id, json!({"t": "offset", "ms": ms})).await?;
+        }
+        Ok(())
     }
 
     /// Capture sources usable on this machine, best first (`fast`, `fast169`, `virtual`, `monitor`, `window`).
@@ -2026,12 +2079,21 @@ async fn media_changed(conn: &Connection, id: &str, state: &Value) {
 // ---------- mirroring ----------
 
 /// Body of the D-Bus `Mirror` method and of the web receiver's auto-start: one session to `id`.
+/// A group to mirror to (PROTOCOL.md 4k): the other receivers and what each presents, and the mode.
+struct GroupRequest {
+    /// The target's own role, then (id, role) of every other member.
+    role: String,
+    members: Vec<(String, String)>,
+    mode: sync::Mode,
+}
+
 async fn start_mirror(
     st: &Shared,
     conn: &Connection,
     id: &str,
     source: &str,
     requested: (u32, u32),
+    group: Option<GroupRequest>,
 ) -> fdo::Result<()> {
     let source_name = source;
     let mirror169 = source == "fast169";
@@ -2128,6 +2190,13 @@ async fn start_mirror(
         .address
         .parse()
         .map_err(|_| fdo::Error::Failed(format!("not IPv4: {}", r.address)))?;
+    let (group, member_ids) = match group {
+        Some(g) => {
+            let ids = g.members.iter().map(|(i, _)| i.clone()).collect::<Vec<_>>();
+            (Some(build_group(st, id, &r.name, &welcome, g).await?), ids)
+        }
+        None => (None, Vec::new()),
+    };
     let target = mirror::Target {
         name: r.name.clone(),
         address,
@@ -2152,11 +2221,16 @@ async fn start_mirror(
             .is_some(),
         }),
         id: id.to_string(),
+        group,
     };
     let (stop_tx, stop_rx) = mpsc::channel(1);
     let stats = mirror::Stats::default();
     {
         let mut s = st.lock().await;
+        // Every member of a group is busy with it: StopMirror on any of them ends the group.
+        for m in &member_ids {
+            s.mirrors.insert(m.clone(), stop_tx.clone());
+        }
         s.mirrors.insert(id.to_string(), stop_tx);
         s.stats.insert(id.to_string(), stats.clone());
         s.sources.insert(id.to_string(), source_name.to_string());
@@ -2208,10 +2282,115 @@ async fn start_mirror(
             s.mirrors.remove(&id);
             s.stats.remove(&id);
             s.sources.remove(&id);
+            for m in &member_ids {
+                s.mirrors.remove(m);
+            }
         }
         changed(&conn).await;
     });
     Ok(())
+}
+
+/// The members of a group, each connected, able to sync (its welcome says so) and not busy; with their saved
+/// corrections.
+async fn build_group(
+    st: &Shared,
+    id: &str,
+    name: &str,
+    welcome: &Value,
+    g: GroupRequest,
+) -> fdo::Result<mirror::Group> {
+    let role_ok = |r: &str| matches!(r, "video" | "audio" | "both");
+    if !role_ok(&g.role) || g.role == "audio" {
+        return Err(fdo::Error::InvalidArgs(
+            "the first receiver shows the picture: role video or both".into(),
+        ));
+    }
+    if !sync::capable(welcome) {
+        return Err(fdo::Error::NotSupported(format!(
+            "{name} cannot play in step yet: update it"
+        )));
+    }
+    let offset = |id: &str| saved_offset(&sync::offset_key(id, &last_route(id))).unwrap_or(0.0);
+    let mut members = Vec::new();
+    for (mid, role) in g.members {
+        if !role_ok(&role) || mid == id {
+            return Err(fdo::Error::InvalidArgs(format!(
+                "bad member {mid} ({role})"
+            )));
+        }
+        let s = st.lock().await;
+        let (c, r, w) = (s.conns.get(&mid), s.found.get(&mid), s.welcomes.get(&mid));
+        let (Some(c), Some(r)) = (c, r) else {
+            return Err(fdo::Error::Failed(format!("{mid} is not connected")));
+        };
+        if !w.is_some_and(sync::capable) {
+            return Err(fdo::Error::NotSupported(format!(
+                "{} cannot play in step yet: update it",
+                r.name
+            )));
+        }
+        if s.mirrors.contains_key(&mid) {
+            return Err(fdo::Error::Failed(format!("{} is busy", r.name)));
+        }
+        let audio = limits::start_audio("on", w.unwrap_or(&Value::Null), mirror::AUDIO_FRAME_MS);
+        members.push(mirror::Member {
+            who: mirror::MemberId {
+                id: mid.clone(),
+                name: r.name.clone(),
+                role,
+                offset_ms: offset(&mid),
+            },
+            address: r
+                .address
+                .parse()
+                .map_err(|_| fdo::Error::Failed(format!("not IPv4: {}", r.address)))?,
+            ifname: r.ifname.clone(),
+            audio,
+            cmd: c.cmd.clone(),
+            events: c.events.subscribe(),
+        });
+    }
+    Ok(mirror::Group {
+        id: uuid::Uuid::new_v4().to_string(),
+        timeline: u32::from_be_bytes(uuid::Uuid::new_v4().as_bytes()[..4].try_into().unwrap()),
+        mode: g.mode,
+        tolerance_ms: 20.0,
+        floor_ms: 150.0,
+        primary: mirror::MemberId {
+            id: id.to_string(),
+            name: name.to_string(),
+            role: g.role,
+            offset_ms: offset(id),
+        },
+        members,
+    })
+}
+
+/// A receiver's correction for one output route (sync::offset_key), saved across restarts.
+pub(crate) fn saved_offset(key: &str) -> Option<f64> {
+    saved_choices("sync-offsets")
+        .get(key)
+        .and_then(|v| v.parse().ok())
+}
+
+fn save_offset(key: &str, ms: f64) {
+    save_choice("sync-offsets", key, &format!("{ms}"));
+}
+
+/// Keeps the output route a receiver reported, for the correction of its next group.
+pub(crate) fn remember_route(id: &str, route: &str) {
+    if last_route(id) != route {
+        save_choice("sync-routes", id, route);
+    }
+}
+
+/// The output route a receiver last reported ("unknown" before it ever did).
+fn last_route(id: &str) -> String {
+    saved_choices("sync-routes")
+        .get(id)
+        .cloned()
+        .unwrap_or_else(|| "unknown".into())
 }
 
 // ---------- web receiver ----------
@@ -2625,7 +2804,7 @@ async fn run_web<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
 
     // One tap on the TV starts the whole thing; `?mode=none` keeps it manual.
     if mode != "none" {
-        if let Err(e) = start_mirror(&st, &dbus, &id, &mode, (0, 0)).await {
+        if let Err(e) = start_mirror(&st, &dbus, &id, &mode, (0, 0), None).await {
             let _ = cmd_tx
                 .send(Cmd::Send(json!({"t": "error", "msg": e.to_string()})))
                 .await;

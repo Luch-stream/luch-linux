@@ -249,4 +249,23 @@ mod tests {
             "repeat"
         );
     }
+
+    /// A newer sender (PROTOCOL.md 4k) sets the playout delay in the last field and a timeline flag on its first
+    /// frame. This receiver predates both: it must read and assemble those packets exactly as before.
+    #[test]
+    fn a_newer_senders_packets_read_as_before() {
+        let mut b = vec![0u8; 24];
+        b[0] = 1;
+        b[1] = 1 | 8; // IDR, and the new timeline flag
+        b[4..6].copy_from_slice(&1u16.to_be_bytes());
+        b[16..20].copy_from_slice(&3u32.to_be_bytes());
+        b[22..24].copy_from_slice(&1500u16.to_be_bytes()); // D = 150 ms
+        b.extend_from_slice(&[7, 8, 9]);
+        let (h, rest) = Header::parse(&b).unwrap();
+        assert_eq!((h.kind, h.index, h.data_shards, h.len), (1, 0, 1, 3));
+        let mut a = Assembler::new();
+        let f = a.push(&h, rest).frame.expect("the frame is shown at once");
+        assert!(f.idr);
+        assert_eq!(f.data, vec![7, 8, 9]);
+    }
 }

@@ -57,7 +57,14 @@ pub enum Step {
 impl Input {
     /// Listens on (a clone of) the session's video socket: input comes back on the flow the video goes out on.
     /// Nothing is injected before `grant(true)`.
-    pub fn start(video: &UdpSocket, injector: Injector) -> std::io::Result<Self> {
+    /// `clock`: in a group, the pts clock once it runs; the clock requests that come on this socket (a receiver
+    /// without sound sends them on its video flow, PROTOCOL.md 4k) are answered here, as this is the socket's only
+    /// reader.
+    pub fn start(
+        video: &UdpSocket,
+        injector: Injector,
+        clock: Arc<std::sync::OnceLock<crate::sync::Now>>,
+    ) -> std::io::Result<Self> {
         let sock = video.try_clone()?;
         // A timeout, not O_NONBLOCK: that flag would be shared with the encoder thread's sending socket.
         sock.set_read_timeout(Some(Duration::from_millis(100)))?;
@@ -75,13 +82,26 @@ impl Input {
                 let mut buf = [0u8; 2048];
                 while !st.load(Ordering::Relaxed) {
                     match sock.recv(&mut buf) {
-                        Ok(n) => match wire::parse(&buf[..n]) {
-                            // A full queue means the injector is behind: the newer state will follow.
-                            Ok(p) => {
-                                let _ = tx.try_send(p);
+                        Ok(n) => {
+                            let pkt = &buf[..n];
+                            // Both are kind 3: input carries the grant's token where a clock request has its pts
+                            // and length, so a datagram without the token that reads as a request is one.
+                            if pkt.get(12..20) != Some(&token.to_be_bytes()[..]) {
+                                if let Some(r) =
+                                    clock.get().and_then(|now| crate::sync::answer(pkt, now))
+                                {
+                                    let _ = sock.send(&r);
+                                    continue;
+                                }
                             }
-                            Err(e) => eprintln!("[luchd] input: dropped a datagram ({e})"),
-                        },
+                            match wire::parse(pkt) {
+                                // A full queue means the injector is behind: the newer state will follow.
+                                Ok(p) => {
+                                    let _ = tx.try_send(p);
+                                }
+                                Err(e) => eprintln!("[luchd] input: dropped a datagram ({e})"),
+                            }
+                        }
                         Err(e)
                             if matches!(
                                 e.kind(),

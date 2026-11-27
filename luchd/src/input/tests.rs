@@ -97,7 +97,12 @@ async fn portal_session_permission_and_injection() {
     let remote = Arc::new(remote);
     let geo = Geometry::from_stream(remote.position, remote.size, (1920, 1080), None);
     let (video, rx) = flow();
-    let input = Input::start(&video, Injector::new(Some(remote.clone()), false, geo)).unwrap();
+    let input = Input::start(
+        &video,
+        Injector::new(Some(remote.clone()), false, geo),
+        Default::default(),
+    )
+    .unwrap();
     let grant = input.message(Answer::Once);
     assert_eq!(grant["grant"], "once");
     assert_eq!(
@@ -229,6 +234,7 @@ async fn portal_session_permission_and_injection() {
     let input = Input::start(
         &video,
         Injector::new(Some(Arc::new(pointer_only)), false, geo),
+        Default::default(),
     )
     .unwrap();
     assert_eq!(
@@ -275,7 +281,7 @@ async fn the_permission_steps() {
     let geo = Geometry::alone(1920.0, 1080.0);
     let (video, _rx) = flow();
     // uinput stands in for "something can be injected" without a portal.
-    let mut i = Input::start(&video, Injector::new(None, true, geo)).unwrap();
+    let mut i = Input::start(&video, Injector::new(None, true, geo), Default::default()).unwrap();
     assert_eq!(i.remembered(false), None);
     assert_eq!(i.request(), Step::Ask);
     assert_eq!(i.request(), Step::Wait, "one question at a time");
@@ -292,7 +298,7 @@ async fn the_permission_steps() {
         "asked again in the session: the same answer"
     );
 
-    let mut i = Input::start(&video, Injector::new(None, true, geo)).unwrap();
+    let mut i = Input::start(&video, Injector::new(None, true, geo), Default::default()).unwrap();
     assert_eq!(i.request(), Step::Ask);
     assert_eq!(
         i.answer(Answer::No),
@@ -306,15 +312,41 @@ async fn the_permission_steps() {
     );
 
     // "Always" before: granted at the start, no question.
-    let mut i = Input::start(&video, Injector::new(None, true, geo)).unwrap();
+    let mut i = Input::start(&video, Injector::new(None, true, geo), Default::default()).unwrap();
     assert_eq!(i.remembered(true).unwrap()["grant"], "always");
     assert!(matches!(i.request(), Step::Reply(m) if m["grant"] == "always"));
 
     // Nothing to inject with: no, without asking, even after an "always".
-    let mut i = Input::start(&video, Injector::new(None, false, geo)).unwrap();
+    let mut i = Input::start(&video, Injector::new(None, false, geo), Default::default()).unwrap();
     assert_eq!(i.remembered(true), None);
     assert_eq!(
         i.request(),
         Step::Reply(serde_json::json!({"t": "input", "grant": "no"}))
+    );
+}
+
+/// A receiver without sound sends its clock requests on the video flow too (PROTOCOL.md 4k): the input reader, the
+/// socket's only reader, answers them once the pts clock is there.
+#[tokio::test]
+async fn clock_requests_on_the_input_socket_are_answered() {
+    let geo = Geometry::alone(1920.0, 1080.0);
+    let (video, rx) = flow();
+    rx.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let clock: Arc<std::sync::OnceLock<crate::sync::Now>> = Arc::default();
+    let _i = Input::start(&video, Injector::new(None, false, geo), clock.clone()).unwrap();
+    let _ = clock.set(Arc::new(|| Some(1_000_000)));
+    let mut req = vec![0u8; 32];
+    req[0] = crate::sync::KIND_CLOCK;
+    req[8..12].copy_from_slice(&9u32.to_be_bytes());
+    req[16..20].copy_from_slice(&8u32.to_be_bytes());
+    req[24..32].copy_from_slice(&0xabcdefu64.to_be_bytes());
+    rx.send(&req).unwrap();
+    let mut buf = [0u8; 64];
+    let n = rx.recv(&mut buf).unwrap();
+    assert_eq!(n, 48);
+    assert_eq!(buf[1], crate::sync::F_REPLY);
+    assert_eq!(
+        u64::from_be_bytes(buf[32..40].try_into().unwrap()),
+        1_000_000
     );
 }

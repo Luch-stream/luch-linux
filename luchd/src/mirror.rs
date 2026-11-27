@@ -7,7 +7,7 @@ use std::{
     net::{Ipv4Addr, SocketAddrV4, UdpSocket},
     os::fd::{AsRawFd, OwnedFd},
     sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -77,6 +77,95 @@ pub struct Target {
     pub input: Option<crate::input::Config>,
     /// The receiver's id: what an "always" is remembered by.
     pub id: String,
+    /// Played in step with other receivers (PROTOCOL.md 4k), None for a session of its own as before.
+    pub group: Option<Group>,
+}
+
+/// A group session (PROTOCOL.md 4k): this target and its other members present every frame at pts + D.
+pub struct Group {
+    pub id: String,
+    pub timeline: u32,
+    pub mode: crate::sync::Mode,
+    pub tolerance_ms: f64,
+    pub floor_ms: f64,
+    /// The target's own part: its id (for its correction), role and correction.
+    pub primary: MemberId,
+    pub members: Vec<Member>,
+}
+
+/// Who a member is and what it presents.
+#[derive(Clone)]
+pub struct MemberId {
+    pub id: String,
+    pub name: String,
+    /// "video", "audio" or "both".
+    pub role: String,
+    pub offset_ms: f64,
+}
+
+/// Another receiver of a group: its control channel and where its streams go.
+pub struct Member {
+    pub who: MemberId,
+    pub address: Ipv4Addr,
+    pub ifname: String,
+    pub audio: Option<Value>,
+    pub cmd: mpsc::Sender<Cmd>,
+    pub events: broadcast::Receiver<Value>,
+}
+
+impl MemberId {
+    fn video(&self) -> bool {
+        self.role != "audio"
+    }
+
+    fn audio(&self) -> bool {
+        self.role != "video"
+    }
+}
+
+/// Waits for a receiver's `ready` (or its refusal) after a start.
+async fn await_ready(events: &mut broadcast::Receiver<Value>) -> Result<Value, String> {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            match events.recv().await {
+                Ok(v) if v["t"] == "ready" => return Ok(v),
+                Ok(v) if v["t"] == "error" || v["t"] == "stop" => {
+                    return Err(format!("receiver: {v}"))
+                }
+                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
+                Err(_) => return Err("control channel closed".to_string()),
+            }
+        }
+    })
+    .await
+    .map_err(|_| "receiver did not answer start".to_string())?
+}
+
+fn port_of(ready: &Value, k: &str) -> Option<u16> {
+    ready[k]
+        .as_u64()
+        .filter(|p| *p > 0 && *p < 65536)
+        .map(|p| p as u16)
+}
+
+/// A member's start: the streams of its role, and its part of the group.
+fn member_start(
+    video: &Value,
+    audio: &Option<Value>,
+    (id, timeline, mode, tolerance_ms): (&str, u32, crate::sync::Mode, f64),
+    who: &MemberId,
+) -> Value {
+    let mut start = if who.video() {
+        json!({"t": "start", "mode": "mirror", "video": video})
+    } else {
+        json!({"t": "start", "mode": "audio"})
+    };
+    if let (true, Some(a)) = (who.audio(), audio) {
+        start["audio"] = a.clone();
+    }
+    start["group"] =
+        crate::sync::group_block(id, timeline, &who.role, mode, tolerance_ms, who.offset_ms);
+    start
 }
 
 fn parse_size(s: &str) -> Option<(u32, u32)> {
@@ -567,7 +656,9 @@ pub enum Cmd {
     Send(Value),
 }
 
-/// Luch v1 datagram header (24 bytes, big-endian).
+/// Luch v1 datagram header (24 bytes, big-endian). The last field, the playout delay D (PROTOCOL.md 4k), is
+/// written per receiver by `Tx` and left 0 here.
+#[allow(clippy::too_many_arguments)]
 pub fn header(
     kind: u8,
     flags: u8,
@@ -629,32 +720,18 @@ impl Seal {
 /// The GCM tag after each sealed frame.
 pub const TAG: usize = 16;
 
-/// One UDP socket per media kind, pinned to the LAN interface — or a websocket for the web receiver.
-struct Tx {
-    out: Out,
-    /// Sealed when the receiver gave a key (TLS); the web receiver's websocket is TLS already.
+/// One receiver of a kind's stream: its socket, pinned to the LAN interface, and the playout delay D (0.1 ms) its
+/// packets carry. A receiver that left the group is skipped. Sealed when that receiver gave a key (TLS): each
+/// receiver of a group has its own.
+pub struct Dest {
+    sock: UdpSocket,
+    delay: AtomicU16,
+    alive: AtomicBool,
     seal: Option<Seal>,
-    kind: u8,
-    seq: AtomicU32,
-    warned: AtomicBool,
-    bytes: AtomicU64,
-    lat_sum: AtomicU64, // host latency, 0.1 ms units, summed over frames
 }
 
-enum Out {
-    Udp(UdpSocket),
-    /// Whole frame per message (websocket framing is reliable and ordered); on a full channel
-    /// drop the frame and ask for an IDR — the browser lags, the stream must not.
-    Ws(mpsc::Sender<Vec<u8>>, Arc<AtomicBool>),
-}
-
-/// Shards per burst before a short pause, so a big IDR doesn't overflow the Wi-Fi queue.
-const BURST: usize = 16;
-const BURST_GAP: Duration = Duration::from_micros(250);
-
-impl Tx {
+impl Dest {
     fn open(
-        kind: u8,
         ifname: &str,
         to: SocketAddrV4,
         dscp: u32,
@@ -666,40 +743,156 @@ impl Tx {
         s.set_tos_v4(dscp << 2)?; // CS5 video / CS6 audio -> Wi-Fi WMM video/voice queues
         s.set_send_buffer_size(1 << 20)?;
         s.connect(&to.into())?;
-        Ok(Tx {
-            out: Out::Udp(s.into()),
+        Ok(Dest {
             seal,
+            ..Dest::of(s.into())
+        })
+    }
+
+    fn of(sock: UdpSocket) -> Self {
+        Dest {
+            sock,
+            delay: AtomicU16::new(0),
+            alive: AtomicBool::new(true),
+            seal: None,
+        }
+    }
+}
+
+/// Where one receiver's stream goes: its interface, its address and its media key (from its `ready`, TLS only).
+type MediaTo = (String, SocketAddrV4, Option<Vec<u8>>);
+
+/// One media kind's stream to its receivers over UDP — or a websocket for the web receiver.
+struct Tx {
+    out: Out,
+    kind: u8,
+    seq: AtomicU32,
+    warned: AtomicBool,
+    bytes: AtomicU64,
+    lat_sum: AtomicU64, // host latency, 0.1 ms units, summed over frames
+    /// A group's stream: its first frame carries the new-timeline flag.
+    timeline: AtomicBool,
+}
+
+enum Out {
+    /// Every receiver of this kind: one, or the members of a group.
+    Udp(Vec<Dest>),
+    /// Whole frame per message (websocket framing is reliable and ordered); on a full channel
+    /// drop the frame and ask for an IDR — the browser lags, the stream must not.
+    Ws(mpsc::Sender<Vec<u8>>, Arc<AtomicBool>),
+}
+
+/// Shards per burst before a short pause, so a big IDR doesn't overflow the Wi-Fi queue.
+const BURST: usize = 16;
+const BURST_GAP: Duration = Duration::from_micros(250);
+
+impl Tx {
+    /// The same stream to several receivers (a group), each on its own socket.
+    /// `to`: each receiver's interface, address and media key (from its `ready`, over TLS only).
+    fn open_many(kind: u8, to: &[MediaTo], dscp: u32) -> std::io::Result<Self> {
+        let dests = to
+            .iter()
+            .map(|(ifname, addr, key)| {
+                Dest::open(ifname, *addr, dscp, key.as_deref().and_then(Seal::new))
+            })
+            .collect::<std::io::Result<Vec<_>>>()?;
+        Ok(Self::udp(kind, dests))
+    }
+
+    fn udp(kind: u8, dests: Vec<Dest>) -> Self {
+        Tx {
+            out: Out::Udp(dests),
             kind,
             seq: AtomicU32::new(0),
             warned: AtomicBool::new(false),
             bytes: AtomicU64::new(0),
             lat_sum: AtomicU64::new(0),
-        })
+            timeline: AtomicBool::new(false),
+        }
+    }
+
+    /// This stream plays to a group: its first frame says its pts start anew.
+    fn start_timeline(&self) {
+        self.timeline.store(true, Ordering::Relaxed);
+    }
+
+    fn dests(&self) -> &[Dest] {
+        match &self.out {
+            Out::Udp(d) => d,
+            Out::Ws(..) => &[],
+        }
+    }
+
+    /// Sets the playout delay D (0.1 ms) of receiver `i`'s packets, from the next packet on.
+    fn set_delay(&self, i: usize, units: u16) {
+        if let Some(d) = self.dests().get(i) {
+            d.delay.store(units, Ordering::Relaxed);
+        }
+    }
+
+    /// Stops sending to receiver `i` (it left the group).
+    fn drop_dest(&self, i: usize) {
+        if let Some(d) = self.dests().get(i) {
+            d.alive.store(false, Ordering::Relaxed);
+        }
+    }
+
+    /// Answers the receivers' clock requests (PROTOCOL.md 4k) on every socket, with t2 and t3 from `now_us` (the pts
+    /// clock), until this Tx is dropped. A thread per receiver: a request is answered the moment it is read.
+    /// `skip_first`: the first socket already has a reader (the receiver's input, which answers the clock too); two
+    /// readers on one socket would each take datagrams meant for the other.
+    fn answer_clock(self: &Arc<Self>, now_us: crate::sync::Now, skip_first: bool) {
+        for (i, d) in self.dests().iter().enumerate().skip(skip_first as usize) {
+            let Ok(sock) = d.sock.try_clone() else {
+                continue;
+            };
+            let _ = sock.set_read_timeout(Some(Duration::from_millis(200)));
+            let (weak, now_us) = (Arc::downgrade(self), now_us.clone());
+            std::thread::Builder::new()
+                .name(format!("luchd-clock-{i}"))
+                .spawn(move || {
+                    let mut buf = [0u8; 128];
+                    while weak.strong_count() > 0 {
+                        let n = match sock.recv(&mut buf) {
+                            Ok(n) => n,
+                            // Timeouts, and the ICMP "unreachable" of a receiver not listening yet: go on.
+                            Err(_) => continue,
+                        };
+                        if let Some(r) = crate::sync::answer(&buf[..n], &now_us) {
+                            let _ = sock.send(&r);
+                        }
+                    }
+                })
+                .ok();
+        }
     }
 
     fn ws(kind: u8, tx: mpsc::Sender<Vec<u8>>, want_idr: Arc<AtomicBool>) -> Self {
         Tx {
             out: Out::Ws(tx, want_idr),
-            seal: None,
             kind,
             seq: AtomicU32::new(0),
             warned: AtomicBool::new(false),
             bytes: AtomicU64::new(0),
             lat_sum: AtomicU64::new(0),
+            timeline: AtomicBool::new(false),
         }
     }
 
-    /// The UDP socket, for the input that comes back on the same flow.
-    fn udp(&self) -> Option<&UdpSocket> {
-        match &self.out {
-            Out::Udp(s) => Some(s),
-            Out::Ws(..) => None,
-        }
+    /// The first receiver's UDP socket, for the input that comes back on the same flow.
+    fn first_socket(&self) -> Option<&UdpSocket> {
+        self.dests().first().map(|d| &d.sock)
     }
 
     // ponytail: one send() per shard; sendmmsg/UDP_SEGMENT if the syscall count ever shows up in profiles.
     fn send_frame(&self, data: &[u8], flags: u8, pts_us: u64, host_lat: u16) {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
+        // In a group, the first frame of a pipeline marks its pts as starting anew (PROTOCOL.md 4k).
+        let flags = if seq == 0 && self.timeline.load(Ordering::Relaxed) {
+            flags | crate::sync::F_TIMELINE
+        } else {
+            flags
+        };
         self.bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
         self.lat_sum.fetch_add(host_lat as u64, Ordering::Relaxed);
         if seq == 0 {
@@ -713,51 +906,73 @@ impl Tx {
                 data.len()
             );
         }
-        let sealed;
-        let data = match &self.seal {
-            Some(seal) => {
-                // The header as every shard will carry it (bar the index): the shard count is authenticated too.
-                let len = data.len() + TAG;
-                let shards = len.div_ceil(SHARD).max(1) as u16;
-                let h = header(
-                    self.kind,
-                    flags,
-                    0,
-                    shards,
-                    seq,
-                    pts_us as u32,
-                    len as u32,
-                    host_lat,
-                );
-                sealed = seal.seal(&h, data);
-                &sealed[..]
-            }
-            None => data,
-        };
-        let shards = data.len().div_ceil(SHARD).max(1);
         match &self.out {
-            Out::Udp(sock) => {
+            Out::Udp(dests) => {
+                // Each receiver's frame: sealed with its own key over the header it will carry, its own delay D
+                // included (PROTOCOL.md 4, 4k), so the receiver authenticates exactly what it gets.
+                let frames: Vec<(&Dest, std::borrow::Cow<[u8]>)> = dests
+                    .iter()
+                    .filter(|d| d.alive.load(Ordering::Relaxed))
+                    .map(|d| {
+                        let delay = d.delay.load(Ordering::Relaxed);
+                        let body = match &d.seal {
+                            Some(seal) => {
+                                let len = data.len() + TAG;
+                                let shards = len.div_ceil(SHARD).max(1) as u16;
+                                let mut h = header(
+                                    self.kind,
+                                    flags,
+                                    0,
+                                    shards,
+                                    seq,
+                                    pts_us as u32,
+                                    len as u32,
+                                    host_lat,
+                                );
+                                h[22..24].copy_from_slice(&delay.to_be_bytes());
+                                std::borrow::Cow::Owned(seal.seal(&h, data))
+                            }
+                            None => std::borrow::Cow::Borrowed(data),
+                        };
+                        (d, body)
+                    })
+                    .collect();
+                let most = frames
+                    .iter()
+                    .map(|(_, b)| b.len().div_ceil(SHARD).max(1))
+                    .max()
+                    .unwrap_or(0);
                 let mut pkt = Vec::with_capacity(HEADER + SHARD);
-                for (i, chunk) in data.chunks(SHARD).enumerate() {
+                // Shard by shard to every receiver, so none of a group waits for the others' whole frame.
+                for i in 0..most {
                     if i > 0 && i % BURST == 0 {
                         std::thread::sleep(BURST_GAP); // ponytail: fixed pacing, ~3 ms for a 200 KB IDR
                     }
-                    pkt.clear();
-                    pkt.extend_from_slice(&header(
-                        self.kind,
-                        flags,
-                        i as u16,
-                        shards as u16,
-                        seq,
-                        pts_us as u32,
-                        data.len() as u32,
-                        host_lat,
-                    ));
-                    pkt.extend_from_slice(chunk); // last shard is not padded; receiver uses frame_len
-                                                  // A lost datagram is recovered by the receiver's keyframe request; just report the first failure.
-                    if let Err(e) = sock.send(&pkt) {
-                        if !self.warned.swap(true, Ordering::Relaxed) {
-                            eprintln!("[luchd] udp send (kind {}): {e}", self.kind);
+                    for (d, body) in &frames {
+                        let shards = body.len().div_ceil(SHARD).max(1);
+                        if i >= shards {
+                            continue;
+                        }
+                        let chunk =
+                            &body[(i * SHARD).min(body.len())..((i + 1) * SHARD).min(body.len())];
+                        pkt.clear();
+                        pkt.extend_from_slice(&header(
+                            self.kind,
+                            flags,
+                            i as u16,
+                            shards as u16,
+                            seq,
+                            pts_us as u32,
+                            body.len() as u32,
+                            host_lat,
+                        ));
+                        pkt[22..24].copy_from_slice(&d.delay.load(Ordering::Relaxed).to_be_bytes());
+                        pkt.extend_from_slice(chunk); // last shard is not padded; receiver uses frame_len
+                                                      // A lost datagram is recovered by the receiver's keyframe request; just report the first failure.
+                        if let Err(e) = d.sock.send(&pkt) {
+                            if !self.warned.swap(true, Ordering::Relaxed) {
+                                eprintln!("[luchd] udp send (kind {}): {e}", self.kind);
+                            }
                         }
                     }
                 }
@@ -1220,6 +1435,7 @@ fn spawn_kms(
     need_head: Arc<AtomicBool>,
     hevc: bool,
     size: Size,
+    pipeline: gst::Pipeline,
 ) -> Result<Grabber, String> {
     use std::io::{Read, Write};
     use std::process::{Command, Stdio};
@@ -1267,7 +1483,14 @@ fn spawn_kms(
                 break;
             }
             let now = mono_us();
-            let base = *base.get_or_insert(cap);
+            // The pts are the pipeline's running time, as the sound's are (and the clock a group's receivers follow):
+            // scanout time minus where the running time started on the monotonic clock. Before the pipeline runs,
+            // the first frame's time, as before.
+            let base = *base.get_or_insert_with(|| {
+                pipeline
+                    .current_running_time()
+                    .map_or(cap, |rt| now.saturating_sub(rt.useconds()))
+            });
             let lat = (now.saturating_sub(cap) / 100).min(u16::MAX as u64) as u16; // scanout flip -> encoded
             if idr {
                 need_head.store(true, Ordering::Relaxed);
@@ -1344,6 +1567,120 @@ fn round1(x: f64) -> f64 {
 }
 
 /// Runs one mirroring session until stopped (by us, the receiver, or an error).
+/// What a running group knows of its members, and the policy choosing its D (PROTOCOL.md 4k).
+struct GroupState {
+    who: Vec<MemberId>,
+    reports: Vec<crate::sync::Report>,
+    present: Vec<bool>,
+    /// Each member's correction in use, and the route it was chosen for.
+    offsets: Vec<(f64, Option<String>)>,
+    pending: Vec<(usize, f64)>,
+    policy: crate::sync::Policy,
+    started: std::time::Instant,
+    d: (f64, f64),
+}
+
+impl GroupState {
+    fn new(g: Group, tx: &mpsc::Sender<(usize, Value)>, cmds: &mut Vec<mpsc::Sender<Cmd>>) -> Self {
+        let mut who = vec![g.primary.clone()];
+        for (k, m) in g.members.into_iter().enumerate() {
+            let (tx, mut events) = (tx.clone(), m.events);
+            tokio::spawn(async move {
+                loop {
+                    match events.recv().await {
+                        Ok(v) => {
+                            if tx.send((k + 1, v)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => {}
+                        Err(_) => {
+                            let _ = tx.send((k + 1, json!({"t": "_closed"}))).await;
+                            break;
+                        }
+                    }
+                }
+            });
+            cmds.push(m.cmd);
+            who.push(m.who);
+        }
+        let n = who.len();
+        GroupState {
+            offsets: who.iter().map(|w| (w.offset_ms, None)).collect(),
+            who,
+            reports: vec![Default::default(); n],
+            present: vec![true; n],
+            pending: Vec::new(),
+            policy: crate::sync::Policy::new(g.mode, g.tolerance_ms, g.floor_ms),
+            started: std::time::Instant::now(),
+            d: (0.0, 0.0),
+        }
+    }
+
+    fn report(&mut self, k: usize, stats: &Value) {
+        let Some(r) = self.reports.get_mut(k) else {
+            return;
+        };
+        *r = crate::sync::Report::from_stats(stats);
+        // A new output route (a soundbar turned on, a speaker swapped): its own saved correction, or the preset.
+        if let Some(route) = r.route.clone() {
+            if self.offsets[k].1.as_deref() != Some(&route) {
+                crate::remember_route(&self.who[k].id, &route);
+                let key = crate::sync::offset_key(&self.who[k].id, &route);
+                let ms = crate::saved_offset(&key)
+                    .unwrap_or_else(|| crate::sync::route_preset_ms(&route, r.audio_ms));
+                self.offsets[k] = (ms, Some(route));
+                self.pending.push((k, ms));
+            }
+        }
+    }
+
+    fn left(&mut self, k: usize) {
+        if let Some(p) = self.present.get_mut(k) {
+            *p = false;
+        }
+    }
+
+    fn offsets_to_send(&mut self) -> Vec<(usize, f64)> {
+        std::mem::take(&mut self.pending)
+    }
+
+    /// Once a second: D from what the members reported, into every packet from now on; the group's stats.
+    fn tick(&mut self, video: &Tx, video_of: &[usize], audio: &Tx, audio_of: &[usize]) -> Value {
+        let live = |k: &usize| self.present[*k];
+        let video_pts: Vec<f64> = (0..self.who.len())
+            .filter(|k| live(k) && self.who[*k].video())
+            .filter_map(|k| self.reports[k].video_pts_ms)
+            .collect();
+        let need: Vec<f64> = (0..self.who.len())
+            .filter(|k| live(k) && (self.policy_needs_all() || self.who[*k].audio()))
+            .filter_map(|k| self.reports[k].need_ms)
+            .collect();
+        self.d = self
+            .policy
+            .update(self.started.elapsed().as_secs_f64(), &video_pts, &need);
+        let (dv, da) = (
+            crate::sync::header_units(self.d.0),
+            crate::sync::header_units(self.d.1),
+        );
+        (0..video_of.len()).for_each(|i| video.set_delay(i, dv));
+        (0..audio_of.len()).for_each(|i| audio.set_delay(i, da));
+        json!({"d_video_ms": self.d.0, "d_audio_ms": self.d.1,
+               "members": self.who.iter().zip(&self.reports).zip(&self.offsets).zip(&self.present)
+                   .map(|(((w, r), o), p)| json!({"id": w.id, "name": w.name, "role": w.role, "present": p,
+                        "need_ms": r.need_ms, "video_pts_ms": r.video_pts_ms, "route": r.route, "offset_ms": o.0}))
+                   .collect::<Vec<_>>()})
+    }
+
+    fn policy_needs_all(&self) -> bool {
+        matches!(self.policy_mode(), crate::sync::Mode::Watching)
+    }
+
+    fn policy_mode(&self) -> crate::sync::Mode {
+        self.policy.mode()
+    }
+}
+
 pub async fn run(
     t: Target,
     cmd: mpsc::Sender<Cmd>,
@@ -1397,35 +1734,30 @@ pub async fn run(
         json!({"t": "start", "mode": "mirror",
             "video": {"codec": if hevc { "video/hevc" } else { "video/avc" }, "width": size.width, "height": size.height, "fps": FPS}})
     };
-    if let Some(a) = &t.audio {
+    let mut group = t.group;
+    let primary_audio = group.as_ref().is_none_or(|g| g.primary.audio());
+    if let (true, Some(a)) = (primary_audio, &t.audio) {
         start["audio"] = a.clone();
     }
-    cmd.send(Cmd::Send(start))
+    if let Some(g) = &group {
+        start["group"] = crate::sync::group_block(
+            &g.id,
+            g.timeline,
+            &g.primary.role,
+            g.mode,
+            g.tolerance_ms,
+            g.primary.offset_ms,
+        );
+    }
+    cmd.send(Cmd::Send(start.clone()))
         .await
         .map_err(|_| "control channel closed")?;
-    let ready = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match events.recv().await {
-                Ok(v) if v["t"] == "ready" => return Ok(v),
-                Ok(v) if v["t"] == "error" || v["t"] == "stop" => {
-                    return Err(format!("receiver: {v}"))
-                }
-                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                Err(_) => return Err("control channel closed".to_string()),
-            }
-        }
-    })
-    .await
-    .map_err(|_| "receiver did not answer start".to_string())??;
-
-    let port = |k: &str| {
-        ready[k]
-            .as_u64()
-            .filter(|p| *p > 0 && *p < 65536)
-            .map(|p| p as u16)
-    };
+    let ready = await_ready(&mut events).await?;
+    let port = |k: &str| port_of(&ready, k);
     // Web receivers take media over their websocket; everything else gets UDP sockets.
     let want_idr = Arc::new(AtomicBool::new(false));
+    // Which member (0 = the target) each video and audio destination belongs to.
+    let (mut video_of, mut audio_of): (Vec<usize>, Vec<usize>) = (vec![0], vec![0]);
     let (video, audio) = if let Some(ws) = t.ws.clone() {
         (
             Arc::new(Tx::ws(KIND_VIDEO, ws.clone(), want_idr.clone())),
@@ -1436,34 +1768,76 @@ pub async fn run(
             .zip(port("audio_port"))
             .ok_or(format!("bad ready: {ready}"))?;
         let io = |e: std::io::Error| format!("udp: {e}");
+        // A group: every member gets the streams of its role, each on its own sockets.
+        // Each receiver seals with the key of its own ready (PROTOCOL.md 4); one key serves both kinds.
         let key = media_key(&ready)?;
-        let seal = || key.as_deref().and_then(Seal::new);
+        let (mut vto, mut ato) = (Vec::new(), Vec::new());
+        let primary = group.as_ref().map(|g| g.primary.clone());
+        if primary.as_ref().is_none_or(|p| p.video()) {
+            vto.push((
+                t.ifname.clone(),
+                SocketAddrV4::new(t.address, vp),
+                key.clone(),
+                0,
+            ));
+        }
+        if primary.as_ref().is_none_or(|p| p.audio()) {
+            ato.push((t.ifname.clone(), SocketAddrV4::new(t.address, ap), key, 0));
+        }
+        if let Some(g) = group.as_mut() {
+            let video_block = start["video"].clone();
+            let gid = g.id.clone();
+            let info = (gid.as_str(), g.timeline, g.mode, g.tolerance_ms);
+            for (k, m) in g.members.iter_mut().enumerate() {
+                let st = member_start(&video_block, &m.audio, info, &m.who);
+                m.cmd
+                    .send(Cmd::Send(st))
+                    .await
+                    .map_err(|_| format!("{}: control channel closed", m.who.name))?;
+                let r = await_ready(&mut m.events)
+                    .await
+                    .map_err(|e| format!("{}: {e}", m.who.name))?;
+                let key = media_key(&r).map_err(|e| format!("{}: {e}", m.who.name))?;
+                if let (true, Some(vp)) = (m.who.video(), port_of(&r, "video_port")) {
+                    vto.push((
+                        m.ifname.clone(),
+                        SocketAddrV4::new(m.address, vp),
+                        key.clone(),
+                        k + 1,
+                    ));
+                }
+                if let (true, Some(ap)) = (m.who.audio(), port_of(&r, "audio_port")) {
+                    ato.push((
+                        m.ifname.clone(),
+                        SocketAddrV4::new(m.address, ap),
+                        key,
+                        k + 1,
+                    ));
+                }
+            }
+        }
+        let addrs = |v: &[(String, SocketAddrV4, Option<Vec<u8>>, usize)]| {
+            v.iter()
+                .map(|(i, a, k, _)| (i.clone(), *a, k.clone()))
+                .collect::<Vec<MediaTo>>()
+        };
+        video_of = vto.iter().map(|x| x.3).collect();
+        audio_of = ato.iter().map(|x| x.3).collect();
         (
-            Arc::new(
-                Tx::open(
-                    KIND_VIDEO,
-                    &t.ifname,
-                    SocketAddrV4::new(t.address, vp),
-                    40,
-                    seal(),
-                )
-                .map_err(io)?,
-            ),
-            Arc::new(
-                Tx::open(
-                    KIND_AUDIO,
-                    &t.ifname,
-                    SocketAddrV4::new(t.address, ap),
-                    48,
-                    seal(),
-                )
-                .map_err(io)?,
-            ),
+            Arc::new(Tx::open_many(KIND_VIDEO, &addrs(&vto), 40).map_err(io)?),
+            Arc::new(Tx::open_many(KIND_AUDIO, &addrs(&ato), 48).map_err(io)?),
         )
     };
 
-    // The receiver's input comes back on the video flow (PROTOCOL.md 4i); nothing is injected before a grant.
-    let mut input = match (&t.input, video.udp()) {
+    // The receiver's input comes back on the video flow (PROTOCOL.md 4i); nothing is injected before a grant. In a
+    // group its socket is the target's own (the first video destination when the target shows the picture), and the
+    // clock requests a receiver without sound sends there (4k) are answered by the same reader, once the pts clock
+    // is there.
+    let clock: Arc<std::sync::OnceLock<crate::sync::Now>> = Arc::default();
+    let input_sock = video
+        .first_socket()
+        .filter(|_| video_of.first() == Some(&0));
+    let mut input = match (&t.input, input_sock) {
         (Some(_), Some(sock)) if wants_input && crate::input::mode() != "off" => {
             use crate::input::{inject::Injector, map::Geometry};
             let remote = portal.as_ref().and_then(Capture::remote);
@@ -1478,7 +1852,11 @@ pub async fn run(
                 (None, None) => Geometry::alone(size.width as f64, size.height as f64),
             };
             let uinput = crate::input::mode() != "portal" && crate::input::uinput::allowed();
-            match crate::input::Input::start(sock, Injector::new(remote, uinput, geo)) {
+            match crate::input::Input::start(
+                sock,
+                Injector::new(remote, uinput, geo),
+                clock.clone(),
+            ) {
                 Ok(i) => Some(i),
                 Err(e) => {
                     eprintln!("[luchd] input: {e}");
@@ -1506,12 +1884,28 @@ pub async fn run(
         size,
         virtual_source,
     )?;
-    let need_head = wire(&p, video.clone(), audio, want_idr.clone(), size);
+    if group.is_some() {
+        // The pts clock is the pipeline's running time, the clock every pts here is on.
+        let pc = p.clone();
+        let now: crate::sync::Now =
+            Arc::new(move || pc.current_running_time().map(|t| t.useconds()));
+        let _ = clock.set(now.clone());
+        video.answer_clock(now.clone(), input.is_some());
+        audio.answer_clock(now, false);
+        video.start_timeline();
+        audio.start_timeline();
+    }
+    let need_head = wire(&p, video.clone(), audio.clone(), want_idr.clone(), size);
     let mut kms = if t.kms {
-        Some(spawn_kms(video.clone(), need_head, hevc, size)?)
+        Some(spawn_kms(video.clone(), need_head, hevc, size, p.clone())?)
     } else {
         None
     };
+    // A group's members: their events in one stream, tagged with the member's number (1..; 0 is the target).
+    let (member_tx, mut member_rx) = mpsc::channel::<(usize, Value)>(64);
+    let mut member_cmds: Vec<mpsc::Sender<Cmd>> = Vec::new();
+    let mut gs = group.map(|g| GroupState::new(g, &member_tx, &mut member_cmds));
+    drop(member_tx);
     if std::env::var_os("LUCH_PROBE").is_some() {
         probe_stages(&p);
     }
@@ -1567,10 +1961,21 @@ pub async fn run(
                 let sender = json!({"t": "sender_stats", "rtt_ms": rtt, "host_ms": round1(host_ms),
                                     "fps": df, "mbps": round1(mbps), "virtual_monitor": virtual_monitor, "encoder": if hevc { "hevc_vaapi" } else { "h264_vaapi" }, "res": format!("{}x{}", size.width, size.height)});
                 let _ = cmd.send(Cmd::Send(sender.clone())).await;
+                for c in &member_cmds {
+                    let _ = c.send(Cmd::Send(sender.clone())).await;
+                }
                 // Rough glass-to-glass estimate without the display: capture+encode + one-way network + decode.
                 let decode = rx_stats["decode_ms"].as_f64().unwrap_or(0.0);
                 let est = host_ms + rtt.as_f64().unwrap_or(0.0) / 2.0 + decode;
-                *stats.lock().unwrap() = json!({"sender": sender, "receiver": rx_stats, "est_ms": round1(est)});
+                let mut all = json!({"sender": sender, "receiver": rx_stats, "est_ms": round1(est)});
+                if let Some(g) = gs.as_mut() {
+                    all["group"] = g.tick(&video, &video_of, &audio, &audio_of);
+                    for (k, offset) in g.offsets_to_send() {
+                        let msg = Cmd::Send(json!({"t": "offset", "ms": offset}));
+                        let _ = if k == 0 { cmd.send(msg).await } else { member_cmds[k - 1].send(msg).await };
+                    }
+                }
+                *stats.lock().unwrap() = all;
             }
             _ = stop.recv() => {
                 let _ = cmd.send(Cmd::Send(json!({"t": "stop"}))).await;
@@ -1591,7 +1996,12 @@ pub async fn run(
                         k.idr();
                     }
                 }
-                Ok(v) if v["t"] == "stats" => rx_stats = v,
+                Ok(v) if v["t"] == "stats" => {
+                    if let Some(g) = gs.as_mut() {
+                        g.report(0, &v);
+                    }
+                    rx_stats = v;
+                }
                 Ok(v) if v["t"] == "input_request" => {
                     use crate::input::Step;
                     match (input.as_mut().map(|i| i.request()), &t.input) {
@@ -1621,6 +2031,30 @@ pub async fn run(
                 Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
                 Err(_) => break Ok("control channel closed"),
             },
+            Some((k, v)) = member_rx.recv() => match v["t"].as_str() {
+                Some("keyframe") => {
+                    want_idr.store(true, Ordering::Relaxed);
+                    if let Some(kms) = kms.as_mut() {
+                        kms.idr();
+                    }
+                }
+                Some("stats") => {
+                    if let Some(g) = gs.as_mut() {
+                        g.report(k, &v);
+                    }
+                }
+                Some("stop") | Some("_closed") => {
+                    // A member left: the others go on without it.
+                    eprintln!("[luchd] group member {k} left: {v}");
+                    for (tx, of) in [(&video, &video_of), (&audio, &audio_of)] {
+                        of.iter().enumerate().filter(|(_, m)| **m == k).for_each(|(i, _)| tx.drop_dest(i));
+                    }
+                    if let Some(g) = gs.as_mut() {
+                        g.left(k);
+                    }
+                }
+                _ => {}
+            },
             msg = bus.next() => match msg.as_ref().map(|m| m.view()) {
                 Some(gst::MessageView::Error(err)) => {
                     let _ = cmd.send(Cmd::Send(json!({"t": "stop"}))).await;
@@ -1631,6 +2065,9 @@ pub async fn run(
             },
         }
     };
+    for c in &member_cmds {
+        let _ = c.send(Cmd::Send(json!({"t": "stop"}))).await;
+    }
     let _ = p.set_state(gst::State::Null);
     if let Some(k) = kms {
         k.stop();
@@ -1721,20 +2158,10 @@ mod tests {
             std::net::SocketAddr::V4(a) => a,
             _ => unreachable!(),
         };
-        let tx = Tx {
-            out: Out::Udp(UdpSocket::bind("127.0.0.1:0").unwrap()),
-            seal: None,
-            kind: KIND_VIDEO,
-            seq: AtomicU32::new(7),
-            warned: AtomicBool::new(false),
-            bytes: AtomicU64::new(0),
-            lat_sum: AtomicU64::new(0),
-        };
-        let sock = match &tx.out {
-            Out::Udp(s) => s,
-            _ => unreachable!(),
-        };
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
         sock.connect(to).unwrap();
+        let tx = Tx::udp(KIND_VIDEO, vec![Dest::of(sock)]);
+        tx.seq.store(7, Ordering::Relaxed);
         let frame: Vec<u8> = (0..SHARD * 2 + 100).map(|i| i as u8).collect();
         tx.send_frame(&frame, F_IDR, 1234, 5);
         let mut got = Vec::new();
@@ -1785,60 +2212,168 @@ mod tests {
         assert!(media_key(&json!({"crypt": "chacha", "key": "AAEC"})).is_err());
     }
 
-    /// Sealed frames go out sharded like plain ones, the length counting the tag; opened, they are the frame.
+    /// Sealed frames go out sharded like plain ones, the length counting the tag; each receiver of a group gets its
+    /// own delay D in the header and its own seal over that header: opened the receiver's way (MediaCrypt.aad: the
+    /// header as received, index and parity bit cleared), they are the frame.
     #[test]
     fn a_sealed_frame_is_sharded_and_opens() {
-        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let key = [9u8; 16];
-        let tx = Tx {
-            out: Out::Udp(UdpSocket::bind("127.0.0.1:0").unwrap()),
-            seal: Seal::new(&key),
-            kind: KIND_VIDEO,
-            seq: AtomicU32::new(3),
-            warned: AtomicBool::new(false),
-            bytes: AtomicU64::new(0),
-            lat_sum: AtomicU64::new(0),
-        };
-        let Out::Udp(sock) = &tx.out else {
-            unreachable!()
-        };
-        sock.connect(rx.local_addr().unwrap()).unwrap();
+        let keys = [[9u8; 16], [7u8; 16]];
+        let (rx_a, mut da) = pair();
+        let (rx_b, mut db) = pair();
+        da.seal = Seal::new(&keys[0]);
+        db.seal = Seal::new(&keys[1]);
+        let tx = Tx::udp(KIND_VIDEO, vec![da, db]);
+        tx.seq.store(3, Ordering::Relaxed);
+        tx.start_timeline();
+        tx.set_delay(0, 1500);
+        tx.set_delay(1, 40);
         let frame: Vec<u8> = (0..SHARD + 10).map(|i| i as u8).collect();
         tx.send_frame(&frame, F_IDR, 1234, 5);
-        let (mut got, mut buf, mut first) = (Vec::new(), [0u8; 2000], [0u8; HEADER]);
-        for i in 0..2 {
-            let n = rx.recv(&mut buf).unwrap();
-            if i == 0 {
-                first.copy_from_slice(&buf[..HEADER]);
+        for (rx, key, delay) in [(&rx_a, keys[0], 1500u16), (&rx_b, keys[1], 40)] {
+            let (mut got, mut buf, mut first) = (Vec::new(), [0u8; 2000], [0u8; HEADER]);
+            for i in 0..2 {
+                let n = rx.recv(&mut buf).unwrap();
+                if i == 0 {
+                    first.copy_from_slice(&buf[..HEADER]);
+                }
+                got.extend_from_slice(&buf[HEADER..n]);
             }
-            got.extend_from_slice(&buf[HEADER..n]);
+            assert_eq!(u16::from_be_bytes([first[22], first[23]]), delay);
+            assert_eq!(
+                u32::from_be_bytes(first[16..20].try_into().unwrap()) as usize,
+                frame.len() + TAG
+            );
+            assert_ne!(
+                &got[..frame.len()],
+                &frame[..],
+                "on the wire it is not the frame"
+            );
+            let mut aad = first;
+            aad[1] &= !F_PARITY;
+            aad[2] = 0;
+            aad[3] = 0;
+            let mut nonce = [0u8; 12];
+            nonce[0] = KIND_VIDEO;
+            nonce[4..8].copy_from_slice(&first[8..12]);
+            let open = ring::aead::LessSafeKey::new(
+                ring::aead::UnboundKey::new(&ring::aead::AES_128_GCM, &key).unwrap(),
+            );
+            let plain = open
+                .open_in_place(
+                    ring::aead::Nonce::assume_unique_for_key(nonce),
+                    ring::aead::Aad::from(aad),
+                    &mut got,
+                )
+                .unwrap();
+            assert_eq!(plain, &frame[..]);
         }
-        assert_eq!(
-            u32::from_be_bytes(first[16..20].try_into().unwrap()) as usize,
-            frame.len() + TAG
-        );
-        assert_ne!(
-            &got[..frame.len()],
-            &frame[..],
-            "on the wire it is not the frame"
-        );
-        let mut aad = first;
-        aad[2] = 0;
-        aad[3] = 0;
-        let mut nonce = [0u8; 12];
-        nonce[0] = KIND_VIDEO;
-        nonce[4..8].copy_from_slice(&first[8..12]);
-        let open = ring::aead::LessSafeKey::new(
-            ring::aead::UnboundKey::new(&ring::aead::AES_128_GCM, &key).unwrap(),
-        );
-        let plain = open
-            .open_in_place(
-                ring::aead::Nonce::assume_unique_for_key(nonce),
-                ring::aead::Aad::from(aad),
-                &mut got,
-            )
+    }
+
+    fn pair() -> (UdpSocket, Dest) {
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        rx.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sock.connect(rx.local_addr().unwrap()).unwrap();
+        (rx, Dest::of(sock))
+    }
+
+    #[test]
+    fn a_group_gets_the_same_frame_each_with_its_own_delay() {
+        let (a, da) = pair();
+        let (b, db) = pair();
+        let (c, dc) = pair();
+        let tx = Tx::udp(KIND_AUDIO, vec![da, db, dc]);
+        tx.start_timeline();
+        tx.set_delay(0, 1500);
+        tx.set_delay(1, 0); // a receiver that plays at once
+        tx.drop_dest(2); // left the group
+        tx.send_frame(&[1, 2, 3], 0, 0x1_2345_6789, 4);
+        tx.send_frame(&[4], 0, 0x1_2345_6790, 4);
+        let mut buf = [0u8; 64];
+        for (rx, delay) in [(&a, 1500u16), (&b, 0)] {
+            let n = rx.recv(&mut buf).unwrap();
+            assert_eq!(&buf[HEADER..n], &[1, 2, 3]);
+            assert_eq!(u16::from_be_bytes([buf[22], buf[23]]), delay);
+            assert_eq!(
+                buf[1] & crate::sync::F_TIMELINE,
+                crate::sync::F_TIMELINE,
+                "the first frame"
+            );
+            assert_eq!(
+                u32::from_be_bytes(buf[12..16].try_into().unwrap()),
+                0x2345_6789
+            );
+            rx.recv(&mut buf).unwrap();
+            assert_eq!(buf[1] & crate::sync::F_TIMELINE, 0);
+        }
+        c.set_read_timeout(Some(Duration::from_millis(100)))
             .unwrap();
-        assert_eq!(plain, &frame[..]);
+        assert!(c.recv(&mut buf).is_err(), "nothing to a member that left");
+    }
+
+    #[test]
+    fn clock_requests_are_answered_on_the_media_socket() {
+        let (rx, d) = pair();
+        let tx = Arc::new(Tx::udp(KIND_AUDIO, vec![d]));
+        let sender = match &tx.out {
+            Out::Udp(d) => d[0].sock.local_addr().unwrap(),
+            _ => unreachable!(),
+        };
+        rx.connect(sender).unwrap();
+        let ticks = Arc::new(AtomicU64::new(1_000_000));
+        let t = ticks.clone();
+        tx.answer_clock(
+            Arc::new(move || Some(t.fetch_add(150, Ordering::Relaxed))),
+            false,
+        );
+        let mut req = vec![0u8; 32];
+        req[0] = crate::sync::KIND_CLOCK;
+        req[8..12].copy_from_slice(&9u32.to_be_bytes());
+        req[24..32].copy_from_slice(&0xabcdefu64.to_be_bytes());
+        rx.send(&req).unwrap();
+        let mut buf = [0u8; 64];
+        let n = rx.recv(&mut buf).unwrap();
+        assert_eq!(n, 48);
+        assert_eq!(buf[1], crate::sync::F_REPLY);
+        assert_eq!(u32::from_be_bytes(buf[8..12].try_into().unwrap()), 9);
+        let at = |o: usize| u64::from_be_bytes(buf[o..o + 8].try_into().unwrap());
+        assert_eq!((at(24), at(32), at(40)), (0xabcdef, 1_000_000, 1_000_150));
+        // Media packets that come back by mistake are not answered.
+        rx.send(&buf[..n]).unwrap();
+        rx.set_read_timeout(Some(Duration::from_millis(300)))
+            .unwrap();
+        assert!(rx.recv(&mut buf).is_err());
+        drop(tx); // the answering thread ends with the stream
+    }
+
+    #[test]
+    fn a_members_start_carries_its_role_and_the_group() {
+        let who = MemberId {
+            id: "spk".into(),
+            name: "Kitchen speaker".into(),
+            role: "audio".into(),
+            offset_ms: 12.5,
+        };
+        let video = json!({"codec": "video/avc", "width": 1920, "height": 1080, "fps": 60});
+        let audio =
+            Some(json!({"codec": "audio/opus", "rate": 48000, "channels": 2, "frame_ms": 5}));
+        let info = ("g", 3, crate::sync::Mode::Interactive, 20.0);
+        let s = member_start(&video, &audio, info, &who);
+        assert_eq!(s["mode"], "audio");
+        assert!(s.get("video").is_none());
+        assert_eq!(s["audio"]["rate"], 48000);
+        assert_eq!(s["group"]["role"], "audio");
+        assert_eq!(s["group"]["offset_ms"], 12.5);
+        let tv = MemberId {
+            role: "video".into(),
+            ..who
+        };
+        let s = member_start(&video, &audio, info, &tv);
+        assert_eq!(
+            (s["mode"].as_str(), s["video"]["fps"].as_u64()),
+            (Some("mirror"), Some(60))
+        );
+        assert!(s.get("audio").is_none());
     }
 
     #[tokio::test]

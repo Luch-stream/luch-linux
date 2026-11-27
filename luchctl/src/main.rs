@@ -58,6 +58,14 @@ trait Luch1 {
     #[zbus(property)]
     fn set_quiet(&self, mode: &str) -> zbus::Result<()>;
     fn latency_lab(&self, id: &str, on: bool) -> zbus::Result<String>;
+    fn mirror_group(
+        &self,
+        ids: &[String],
+        roles: &[String],
+        source: &str,
+        mode: &str,
+    ) -> zbus::Result<()>;
+    fn set_offset(&self, id: &str, ms: f64) -> zbus::Result<()>;
     #[zbus(signal)]
     fn receivers_changed(&self) -> zbus::Result<()>;
     #[zbus(signal)]
@@ -74,7 +82,8 @@ const USAGE: &str = "usage: luchctl [list | refresh | find [auto|all|mdns,scan,b
                 | volume [r] [0..100|+|-|mute|unmute] | page [r] next|prev|<n> | blank [r] on|off
                 | present [r] <file> | quiet [ask|on|off] | browser install
                 | pair [r] [code] | paired | forget <r> | web [allow|deny <code> | forget <n>]
-                | latency [on|off] [r] | latency analyze <video> [--out prefix] [--fps n] [--readout-ms ms]]
+                | latency [on|off] [r] | latency analyze <video> [--out prefix] [--fps n] [--readout-ms ms]
+                | group interactive|watch <r>[=role] <r>[=role]... [--source S] | offset <r> <ms>]
        r = receiver id or name, optional when there is only one; mirror defaults to fast; no arguments: interactive
        find: when the list stays empty (hotel Wi-Fi, a VPN): every address of the LAN, Bluetooth, then the TV's sound
        through the microphone and its QR code through the camera; add: a receiver by its QR link or address
@@ -91,7 +100,10 @@ const USAGE: &str = "usage: luchctl [list | refresh | find [auto|all|mdns,scan,b
        pair: the first connection to a receiver shows a code on the TV, typed here (any command that connects asks
        for it too); both then know each other and later connections need nothing. forget: pair again next time
        web: the browsers allowed to watch this screen (luchd's web receiver), and the one waiting to be allowed
-       latency: photon-to-photon latency with a phone filming both screens at 240 fps (docs/latency-lab.md)";
+       latency: photon-to-photon latency with a phone filming both screens at 240 fps (docs/latency-lab.md)
+       group: several receivers in step, the first one shows the picture; role video|audio|both (first: both, others:
+       audio, a speaker); interactive keeps the picture as fast as alone, watch delays all alike (rooms, TV walls);
+       offset: a receiver's own correction in ms (positive = later), for its output route";
 
 const LAB_STEPS: &str =
     "latency lab on: the page opens in the browser, the TV draws its own pattern in a corner.
@@ -244,6 +256,28 @@ fn need_one(
 }
 
 /// Receiver by id or name; with no key, the only receiver on the LAN.
+/// `group`'s receivers (`name` or `name=role`) and its `--source` (default fast).
+fn group_args<'a>(args: &[&'a str]) -> Result<(Vec<(&'a str, Option<&'a str>)>, &'a str), String> {
+    let (mut members, mut source) = (Vec::new(), "fast");
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if *a == "--source" {
+            source = it.next().ok_or("--source needs a source")?;
+            continue;
+        }
+        let (key, role) = match a.rsplit_once('=') {
+            Some((k, r)) if matches!(r, "video" | "audio" | "both") => (k, Some(r)),
+            Some((_, r)) => return Err(format!("role video|audio|both, not {r}")),
+            None => (*a, None),
+        };
+        members.push((key, role));
+    }
+    if members.len() < 2 {
+        return Err("a group has two or more receivers".into());
+    }
+    Ok((members, source))
+}
+
 async fn find_id(p: &Luch1Proxy<'_>, key: Option<&str>) -> Result<String, String> {
     let rows = p.receivers().await.map_err(|e| e.to_string())?;
     let Some(key) = key else {
@@ -378,6 +412,26 @@ async fn run(args: &[String]) -> Result<(), String> {
             .mirror(&find_id(&p, Some(key)).await?, source)
             .await
             .map_err(e)?,
+        ["group", mode, rest @ ..] if rest.len() >= 2 => {
+            let (members, source) = group_args(rest)?;
+            let (mut ids, mut roles) = (Vec::new(), Vec::new());
+            for (i, (key, role)) in members.into_iter().enumerate() {
+                ids.push(find_id(&p, Some(key)).await?);
+                roles.push(
+                    role.unwrap_or(if i == 0 { "both" } else { "audio" })
+                        .to_string(),
+                );
+            }
+            p.mirror_group(&ids, &roles, source, mode)
+                .await
+                .map_err(e)?
+        }
+        ["offset", key, ms] => {
+            let ms: f64 = ms.parse().map_err(|_| format!("offset in ms, not {ms}"))?;
+            p.set_offset(&find_id(&p, Some(key)).await?, ms)
+                .await
+                .map_err(e)?
+        }
         ["stats", key @ ..] if key.len() <= 1 => {
             let id = find_id(&p, key.first().copied()).await?;
             loop {
@@ -1222,6 +1276,24 @@ mod tests {
         assert_eq!(
             progress_lines(&later, &end),
             vec!["  ble done: Living room TV", "1 receiver found"]
+        );
+    }
+
+    #[test]
+    fn group_arguments() {
+        let (m, source) =
+            group_args(&["Living room TV", "Kitchen=audio", "--source", "monitor"]).unwrap();
+        assert_eq!(
+            m,
+            vec![("Living room TV", None), ("Kitchen", Some("audio"))]
+        );
+        assert_eq!(source, "monitor");
+        assert!(group_args(&["TV"]).is_err());
+        assert!(group_args(&["TV", "B=loud"]).is_err());
+        // A name with "=" in it that is not a role stays a name only when it has no role after it.
+        assert_eq!(
+            group_args(&["TV=both", "Den=video"]).unwrap().0[1],
+            ("Den", Some("video"))
         );
     }
 
