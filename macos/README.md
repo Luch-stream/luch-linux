@@ -9,7 +9,7 @@ describes, so no change is needed on the TV side.
 | Capture | ScreenCaptureKit: display, NV12 video range, cursor drawn in; the size follows the client |
 | Audio | ScreenCaptureKit system audio → libopus, 48 kHz stereo, CBR 128 kbit/s, 20 ms frames |
 | Video | VideoToolbox H.264 or HEVC, real time, no B-frames, IDR on request, Annex-B with SPS/PPS before every IDR |
-| Discovery | DNS-SD (Bonjour); every socket is pinned to the interface the receiver was announced on |
+| Discovery | DNS-SD (Bonjour), a sweep of the LAN, Bluetooth LE, the TV's sound and its QR code; every socket is pinned to a LAN interface, never a VPN's |
 | Control | Unix socket + JSON, the stand-in for the Linux sender's D-Bus API |
 
 ## Requirements
@@ -237,3 +237,24 @@ luchctl latency analyze clip.mov           # runs luch-latency (cargo install --
 ```
 
 The TV's menu has the same: its sound mode, a slider for its correction, and the latency lab.
+
+## Finding and waking receivers
+
+When Bonjour finds nothing (hotel Wi-Fi, a VPN, a mesh that drops multicast), the Mac climbs the same ladder as luchd
+(luch-android PROTOCOL.md 1): a sweep of every address of each LAN interface (never utun, ipsec or a VM bridge), then
+Bluetooth LE; on request also the TV saying its address by sound (microphone) and its QR code (camera). Microphone,
+camera and Bluetooth are asked for only when that way is used. The menu has Find Receivers and Add Receiver; TVs
+connected to before stay in it while they are off, with Wake.
+
+```sh
+luchctl find                                # all ways, what is tried as it goes; `find scan,ble` just those
+luchctl add 'luch://connect?host=…&t=…'     # the TV's QR link, or its address: luchctl add 192.168.1.20
+luchctl known                               # receivers talked to before, on or off, and how each wakes
+luchctl wake 'Living room TV'               # Wake-on-LAN; the remote's Bluetooth signal through another Luch device
+luchctl wake 'Living room TV' learn         # with the TV off, press its remote's power key near the Mac
+luchctl info | id | refresh
+```
+
+macOS lets no app advertise manufacturer data (CoreBluetooth sends only a name and service UUIDs, and IOBluetooth's
+HCI calls do nothing since the stack moved into bluetoothd), so the Mac can learn the remote's signal but not send
+it: a Luch receiver or phone that is on and lists `ble_wake` in its welcome sends it for the Mac.

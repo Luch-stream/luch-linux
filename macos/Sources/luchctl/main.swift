@@ -61,6 +61,8 @@ func chooseReceiver() -> String? {
     return ReceiverChoice.ask(all)?.id
 }
 
+if FindCommands.handles(args) { exit(FindCommands.run(args)) }
+
 switch command {
 case "list":
     let response = call(["cmd": "receivers"])
@@ -340,6 +342,8 @@ default:
                    | media [r] [play|pause|toggle|seek m:ss|skip s|rate x|audio id|sub id|sub off]
                    | volume [r] [0..100|+|-|mute|unmute] | page [r] next|prev|<n> | blank [r] on|off
                    | present [r] <file> | quiet [ask|on|off] | sleep [r] | browser install
+                   | find [auto|all|mdns,scan,ble,sound,qr] | add <link|host[:port]> | refresh | id | info [r]
+                   | known | wake [r] | wake <r> learn | wake <r> mac|ble <value>|off
            present: shows a PDF or a presentation on the receiver and opens the presenter view here (current and
            next slide, notes, timer; the mouse is a laser pointer, dragging draws, a clicker turns the slides)
            quiet: hide notification banners while presenting or mirroring (ask: the app asks once); macOS allows it
