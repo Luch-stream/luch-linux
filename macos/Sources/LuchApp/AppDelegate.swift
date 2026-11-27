@@ -81,7 +81,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let menu = NSMenu()
     private let discovery = Discovery()
     /// Do-not-disturb follows a mirroring session (sound only does not count).
-    private var engine: Engine? { didSet { caster.presenter.mirroring(engine.map { !$0.options.soundOnly } ?? false) } }
+    private(set) var engine: Engine? { didSet { caster.presenter.mirroring(engine.map { !$0.options.soundOnly } ?? false) } }
     private var state = "Idle"
     private var statsLine = "Not streaming"
     private var statsItem: NSMenuItem?
@@ -90,7 +90,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var pendingMenuRefresh = false
     private var menuOpen = false
     private var server: LocalServer?
-    private var currentReceiverID: String?
+    private(set) var currentReceiverID: String?
     private var currentReceiver: Receiver?
     private weak var warmPercent: NSTextField?
     /// Set from `luchctl mirror --frame-ms N`, for A/B testing the audio buffer without a rebuild.
@@ -201,6 +201,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let match = receivers.first { $0.id == wanted || $0.name == wanted }
                 ?? (receivers.count == 1 ? receivers[0] : nil)
             guard let receiver = match else { return ["error": "receiver not found"] }
+            if let word = request["source"] as? String {
+                guard let source = MirrorSource.parse(word, which: request["which"] as? String) else {
+                    return ["error": "mirror: fast|monitor|window|virtual|audio or asis|extend|speed|quality|mac"]
+                }
+                return mirror(source, on: receiver)
+            }
             let ultra = (request["ultra"] as? String).flatMap(UltraPriority.init(rawValue:))
             if request["ultra"] != nil, ultra == nil { return ["error": "ultra: speed, quality or mac"] }
             startMirror(receiver, extend: request["extend"] as? Bool, ultra: ultra)
@@ -228,6 +234,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case "stop":
             stopMirror()
             return ["ok": true]
+        case "displays", "windows":
+            return sources(request["cmd"] as? String ?? "")
         default:
             return ["error": "unknown command"]
         }
@@ -440,8 +448,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         startMirror(receivers[0])
     }
 
-    private func startMirror(_ receiver: Receiver, soundOnly: Bool = false, extend: Bool? = nil,
-                             ultra: UltraPriority? = nil) {
+    func startMirror(_ receiver: Receiver, soundOnly: Bool = false, extend: Bool? = nil,
+                     ultra: UltraPriority? = nil, window: CGWindowID? = nil, displayID: CGDirectDisplayID? = nil) {
         // Nothing asked for: the way chosen for this TV in its menu (also for mirror on launch and luchctl).
         let saved = Preferences.shared.screenMode(for: receiver.id)
         let ultra = ultra ?? (extend == nil && !soundOnly ? saved.ultra : nil)
@@ -456,14 +464,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.global(qos: .userInitiated).async {
                 old.stop(reason: "switch")
                 Thread.sleep(forTimeInterval: 0.8)
-                DispatchQueue.main.async { [weak self] in self?.beginMirror(receiver, soundOnly: soundOnly, extend: extend, ultra: ultra) }
+                DispatchQueue.main.async { [weak self] in
+                    self?.beginMirror(receiver, soundOnly: soundOnly, extend: extend, ultra: ultra, window: window,
+                                      displayID: displayID)
+                }
             }
             return
         }
-        beginMirror(receiver, soundOnly: soundOnly, extend: extend, ultra: ultra)
+        beginMirror(receiver, soundOnly: soundOnly, extend: extend, ultra: ultra, window: window, displayID: displayID)
     }
 
-    private func beginMirror(_ receiver: Receiver, soundOnly: Bool, extend: Bool, ultra: UltraPriority?) {
+    private func beginMirror(_ receiver: Receiver, soundOnly: Bool, extend: Bool, ultra: UltraPriority?,
+                             window: CGWindowID?, displayID: CGDirectDisplayID?) {
         if !CGPreflightScreenCaptureAccess() {
             // The system dialog only comes forward for a regular, active app; a background
             // accessory app gets an immediate "declined" with no window at all.
@@ -506,7 +518,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         options.soundOnly = soundOnly
         options.extend = extend
         options.ultra = ultra
+        options.window = window
+        options.displayID = displayID ?? (extend || ultra != nil || window != nil ? nil : self.displayID(for: receiver))
         let engine = Engine(options: options)
+        if !soundOnly { engine.input = inputControl(for: receiver) }
         engine.shareArt = { [caster] file, client, me in caster.shareArt(file, client: client, me: me) }
         engine.onWaitingForAllow = { [weak self] in
             DispatchQueue.main.async {
@@ -543,6 +558,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     self?.state = soundOnly ? "Playing sound on \(receiver.name)"
                         : extend ? "Extended to \(receiver.name) · \(codec)"
                         : ultra != nil ? "Mirroring to \(receiver.name) at its \(engine.ultraMode.map { "\($0)" } ?? "") · \(codec)"
+                        : window != nil ? "Showing a window on \(receiver.name) · \(codec)"
                         : "Mirroring to \(receiver.name) · \(codec)\(batteryNote)"
                     self?.rebuildMenu()
                 }
@@ -650,7 +666,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         log("app: setting changed while streaming, restarting (engine=\(engine != nil), receiver=\(receiver.name))")
-        startMirror(receiver)
+        // A window shown stays shown.
+        if let window = engine?.options.window { startMirror(receiver, extend: false, window: window) }
+        else { startMirror(receiver) }
     }
 
     @objc private func toggleMirrorOnLaunch() {
@@ -695,12 +713,14 @@ extension AppDelegate {
             if each == mode { item.state = .on }
             modeMenu.addItem(item)
         }
+        addScreenSources(to: modeMenu, for: r)
         modeItem.submenu = modeMenu
         m.addItem(modeItem)
         m.addItem(.run("Play Sound Only", symbol: "hifispeaker") { [weak self] in self?.startMirror(r, soundOnly: true) })
         if mirroringHere {
             m.addItem(.run("Stop Mirroring", symbol: "stop.circle") { [weak self] in self?.stopMirror() })
         }
+        inputItems(for: r).forEach(m.addItem)
 
         m.addItem(.separator())
         m.addItem(.run("Show File…", symbol: "doc") { [weak self] in self?.chooseFiles(for: r) })
@@ -887,13 +907,15 @@ extension AppDelegate: NSMenuDelegate {
 
 extension AppDelegate {
     /// A new way to show the screen takes effect at once when this TV is being mirrored to (sound only stays).
-    fileprivate func switchScreen(_ mode: ScreenMode, on r: Receiver) {
+    /// `window`: that window alone instead of the screen.
+    func switchScreen(_ mode: ScreenMode, on r: Receiver, window: CGWindowID? = nil) {
         guard let engine, currentReceiverID == r.id, engine.streaming, !engine.options.soundOnly else { return }
-        state = "Switching \(r.name) to \(mode.short)…"
+        state = "Switching \(r.name) to \(window == nil ? mode.short : "one window")…"
         rebuildMenu()
+        let display = mode == .asIs && window == nil ? displayID(for: r) : nil
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             do {
-                try engine.switchScreen(extend: mode == .extend, ultra: mode.ultra)
+                try engine.switchScreen(extend: mode == .extend, ultra: mode.ultra, window: window, displayID: display)
                 let codec = engine.plan?.codec.label ?? ""
                 let at = engine.ultraMode.map { " at its \($0)" } ?? ""
                 DispatchQueue.main.async {

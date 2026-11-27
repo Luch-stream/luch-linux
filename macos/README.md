@@ -140,13 +140,20 @@ python3 Tools/fakerecv.py --seconds 20 --out .tmp/capture.h264 &
   delivers ~1 fps on a still desktop);
 - menu bar with receiver list, live latency, warmth, quality, size, codec, bitrate, display and login item;
 - the client's battery, charging, thermal state and headroom, shown but never acted on silently;
-- `luchctl` over a Unix socket.
+- `luchctl` over a Unix socket;
+- what the TV shows, per TV in its **Screen** menu or `luchctl mirror [r] <source> [which]`, with luchd's
+  words and the Mac's: `fast`/`asis` (this screen as it is), `virtual`/`extend` (a second screen),
+  `speed`/`quality`/`mac` (drawn at one of the TV's modes), `monitor [n|name]` (one of several displays),
+  `window [app or title]` (one window alone, fitted into the TV's shape, followed as it moves), `audio`;
+- input from the TV (PROTOCOL.md 4i): a keyboard, mouse or touch screen on the receiver drives this Mac
+  (keys by position, the Mac's own layout makes the characters; a finger is the pointer). "Allow TV to
+  Control This Mac" in the TV's menu; the first use asks (once, always, no), then macOS asks once for
+  Accessibility. "Always" is kept per TV; "Take Back Control" ends it during a session.
 
 ## Not yet
 
-- window capture (`SCContentFilter(desktopIndependentWindow:)`), planned next;
-- virtual display / extend mode — no public API, would need `CGVirtualDisplay`;
-- input back-channel (touch, keyboard) — reserved in PROTOCOL.md §6, not implemented on either side.
+- gamepads from the TV: a virtual one needs a DriverKit HID driver (`com.apple.developer.hid.virtual.device`);
+- a stylus's pressure: the stylus is the pointer, as a finger.
 
 ## Numbers
 
