@@ -356,6 +356,9 @@ public final class Engine {
         deviceOnBattery = caps.onBattery
         log("plan: \(plan.codec.label) \(plan.width)x\(plan.height)@\(plan.fps) audio=\(plan.audio) — \(plan.reason)")
         if options.extend || options.ultra != nil {
+            // This Mac's own screen, taken before the TV's appears: macOS may make the new one the main display
+            // (it keeps each TV's screen arrangement by its serial), and the main display would then be the TV's.
+            let ownScreen = CGMainDisplayID()
             guard let v = VirtualScreen(name: caps.name, width: plan.width, height: plan.height, fps: plan.fps,
                                         serial: VirtualScreen.serial(for: r.id)) else {
                 throw EngineError.noVirtualScreen
@@ -363,8 +366,8 @@ public final class Engine {
             virtualScreen = v
             if options.ultra != nil {
                 // This Mac's screen shows a copy of the TV's: macOS draws the desktop once, at the TV's mode.
-                let main = CGMainDisplayID()
-                guard v.waitUntilShown(timeout: 60), let m = DisplayMirror(main, of: v.displayID) else {
+                guard v.waitUntilShown(timeout: 60), ownScreen != v.displayID,
+                      let m = DisplayMirror(ownScreen, of: v.displayID) else {
                     virtualScreen = nil
                     throw EngineError.noVirtualScreen
                 }
