@@ -40,6 +40,7 @@ const IFACE = `<node>
     <method name="DirectStatus"><arg type="s" direction="out"/></method>
     <method name="DirectOffers"><arg type="s" direction="out"/></method>
     <method name="Report"><arg name="text" type="s" direction="in"/><arg name="keep_names" type="b" direction="in"/><arg type="s" direction="out"/></method>
+    <method name="SendReport"><arg name="path" type="s" direction="in"/><arg type="s" direction="out"/></method>
     <property name="WebUrl" type="s" access="read"/>
     <property name="Quiet" type="s" access="readwrite"/>
     <signal name="ReceiversChanged"/>
@@ -119,6 +120,12 @@ const T = RU ? {
     reportShow: 'Показать файл',
     reportCopy: 'Скопировать описание',
     reportIssue: 'Открыть issue',
+    reportSend: 'Отправить разработчикам',
+    reportSending: 'Отправляю отчёт разработчикам…',
+    reportSent: n => `Отправлено. Номер отчёта ${n} — назовите его, если будете писать в чат.`,
+    reportSentNoFile: n => `Отправлено. Номер отчёта ${n} — назовите его, если будете писать в чат. Сам файл сервер не принял: пришлите его, если попросим.`,
+    reportNotSent: e => `Не отправлено: ${reason(e)}. Файл остался в «Загрузках»: его можно показать, перетащить в чат или приложить к issue.`,
+    reportCopyNumber: 'Скопировать номер',
     close: 'Закрыть',
 } : {
     title: 'Luch',
@@ -184,6 +191,12 @@ const T = RU ? {
     reportShow: 'Show the file',
     reportCopy: 'Copy description',
     reportIssue: 'Open an issue',
+    reportSend: 'Send to the developers',
+    reportSending: 'Sending the report to the developers…',
+    reportSent: n => `Sent. Report number ${n} — tell it to us if you write in the chat.`,
+    reportSentNoFile: n => `Sent. Report number ${n} — tell it to us if you write in the chat. The server did not take the file itself: send it if we ask.`,
+    reportNotSent: e => `Not sent: ${reason(e)}. The file is still in Downloads: show it, drag it into a chat or attach it to an issue.`,
+    reportCopyNumber: 'Copy the number',
     close: 'Close',
 };
 
@@ -312,7 +325,10 @@ function reportForm() {
     });
 }
 
-/** The report written: where it is, who gave no log, and what to do with it; the buttons leave the dialog open. */
+/**
+ * The report written: where it is, who gave no log, and what to do with it; the buttons leave the dialog open.
+ * Returns {say(text, actions)}: a line under it and new buttons (sending, sent, not sent).
+ */
 function reportDone(r, actions) {
     const dialog = new ModalDialog.ModalDialog({destroyOnClose: true});
     const box = new St.BoxLayout({vertical: true, style: 'spacing: 12px; max-width: 480px;'});
@@ -321,12 +337,23 @@ function reportDone(r, actions) {
     const text = new St.Label({text: [T.reportBody(file), ...(r.notes ?? [])].join('\n')});
     text.clutter_text.line_wrap = true;
     box.add_child(text);
+    const status = new St.Label({text: '', visible: false, style: 'font-weight: bold;'});
+    status.clutter_text.line_wrap = true;
+    box.add_child(status);
     dialog.contentLayout.add_child(box);
-    dialog.setButtons([
-        ...actions.map(([label, fn]) => ({label, action: fn})),
+    const buttons = list => dialog.setButtons([
+        ...list.map(([label, fn]) => ({label, action: fn})),
         {label: T.close, action: () => dialog.close(), key: Clutter.KEY_Escape, default: true},
     ]);
+    buttons(actions);
     dialog.open();
+    return {
+        say(line, list) {
+            status.text = line;
+            status.visible = true;
+            buttons(list);
+        },
+    };
 }
 
 /** The file selected in the file manager (FileManager1, as Files and most others serve it), else its folder. */

@@ -328,7 +328,23 @@ addresses become `192.0.2.N`, IPv6 `2001:db8::N`, MACs `02:00:00:00:00:NN`, this
 `Computer`, the receivers' names and ids `Receiver N`, the login name `user` and the home folder `~`, the same
 stand-in each time within the file. Returns JSON: `path`, `description` (a few lines for a chat: what happened,
 versions, receivers, the file's name), `issue` (luch-linux's new-issue page with title and body filled in, asking for
-the file) and `notes` (who gave no log, and why). Takes up to ~12 s.
+the file), `notes` (who gave no log, and why) and `can_send` (this build has a report address: `SendReport` works).
+Takes up to ~12 s.
+
+### `SendReport(s path) → s`
+
+"Send to the developers", only when the person presses it after seeing the file: the report at `path` (one `Report`
+made since luchd started; no other file) goes to the developers' GlitchTip (Sentry-compatible), no account needed.
+The address is a DSN (`https://<key>@<host>/<project>`) built in with `LUCH_REPORT_DSN=... cargo build`, or the same
+variable in luchd's environment; without one this fails and `can_send` is false. Two Sentry envelopes are POSTed to
+`https://<host>/api/<project>/envelope/` (`X-Sentry-Auth: Sentry sentry_version=7, sentry_key=<key>,
+sentry_client=luch/<version>`): an `event` (level `info`, "Problem report: <first line of what happened>", release
+`luch-linux@<version>`, tags `app`, `os`, `receivers` (models), `codec`, contexts `os` and `device`, and in `extra`
+what happened, `about.txt` and each log of the file by its name, the last 64 KB of each, under 800 KB in all: as
+redacted as the file), then the zip as an `attachment` of the same event (best effort: a server that refuses it does
+not fail the send). Returns JSON: `number` (`LUCH-` and the event id's first 8 hex digits, for the person to tell in
+a chat), `event_id`, `attached` and `attach_error` when the zip did not go. Errors say why (unreachable, refused key,
+too many reports now).
 
 ### `Known() → s`
 

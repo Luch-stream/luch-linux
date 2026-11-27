@@ -923,6 +923,10 @@ pub fn write(s: &Snapshot, dir: &Path) -> io::Result<Value> {
         ));
     }
 
+    // Redacted in this order (the stand-ins are numbered as they are met), kept for SendReport as written.
+    let entries: Vec<(String, String)> =
+        entries.into_iter().map(|(n, t)| (n, r.text(&t))).collect();
+
     // Written aside and renamed: a half-written report is never what is in Downloads.
     let part = path.with_extension("zip.part");
     let w = &s.when;
@@ -937,7 +941,7 @@ pub fn write(s: &Snapshot, dir: &Path) -> io::Result<Value> {
         let mut z = zip::ZipWriter::new(std::fs::File::create(&part)?);
         for (name, text) in &entries {
             z.start_file(name.as_str(), opts)?;
-            z.write_all(r.text(text).as_bytes())?;
+            z.write_all(text.as_bytes())?;
         }
         z.finish()?;
         Ok(())
@@ -960,12 +964,58 @@ pub fn write(s: &Snapshot, dir: &Path) -> io::Result<Value> {
                 .map(|why| r.text(&format!("{l}: no log, {why}")))
         })
         .collect();
+    let what = r.text(&s.text);
+    let sys = |k: &str| {
+        s.system
+            .iter()
+            .find(|(key, _)| *key == k)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default()
+    };
+    let os = sys("OS");
+    let (os, kernel) = os
+        .split_once(", kernel ")
+        .map(|(o, k)| (o.to_string(), k.to_string()))
+        .unwrap_or((os.clone(), String::new()));
+    crate::report_send::keep(
+        &path,
+        crate::report_send::Made {
+            file: file.clone(),
+            what: what.clone(),
+            texts: entries,
+            app: luch_proto::APP.into(),
+            os,
+            kernel,
+            machine: sys("machine"),
+            models: s
+                .devices
+                .iter()
+                .map(|d| d.model.clone())
+                .filter(|m| !m.is_empty())
+                .collect(),
+            codec: codec(&s.devices),
+        },
+    );
     Ok(json!({
         "path": path.to_string_lossy(),
         "description": description,
-        "issue": issue_url(&r.text(&s.text), &description, &file),
+        "issue": issue_url(&what, &description, &file),
         "notes": notes,
+        "can_send": crate::report_send::dsn().is_some(),
     }))
+}
+
+/// The codec of the session now or last (the first receiver with one), from luchd's figures of it.
+fn codec(devices: &[Device]) -> String {
+    devices
+        .iter()
+        .find_map(|d| {
+            d.stats.as_ref()?["sender"]["encoder"]
+                .as_str()
+                .map(String::from)
+        })
+        .map(|e| if e.contains("hevc") { "HEVC" } else { "H.264" }.to_string())
+        .unwrap_or_default()
 }
 
 /// Report (docs/dbus.md): gathers everything, asks the receivers at once, writes the archive into Downloads.
@@ -1484,6 +1534,58 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("Living room TV (Acme Box"));
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn a_sent_report_is_as_hidden_as_its_file() {
+        let dir = std::env::temp_dir().join(format!("luch-problem-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut s = snapshot(true);
+        s.devices[0].stats = Some(json!({"sender": {"encoder": "hevc_vaapi"}}));
+        let out = write(&s, &dir).unwrap();
+        let path = out["path"].as_str().unwrap();
+        let files = unzip(path);
+        let (port, mut got) =
+            crate::report_send::tests::fake_server(vec![(200, "{}"), (200, "{}")]).await;
+        let dsn = crate::report_send::Dsn::parse(&format!("http://k@127.0.0.1:{port}/1")).unwrap();
+        crate::report_send::send(&reqwest::Client::new(), &dsn, Path::new(path))
+            .await
+            .unwrap();
+        let body = got.recv().await.unwrap().body;
+        let (_, items) = crate::report_send::tests::unframe(&body);
+        let e: Value = serde_json::from_slice(&items[0].1).unwrap();
+        let text = String::from_utf8_lossy(&items[0].1);
+        for secret in [
+            "Telly",
+            "anna",
+            "Living room",
+            "Bedroom",
+            "192.168.",
+            "11111111-2222",
+            "aaaaaaaa-0000",
+        ] {
+            assert!(!text.contains(secret), "{secret} leaked");
+        }
+        assert_eq!(e["message"], "Problem report: HEVC stutters on Receiver 1");
+        assert_eq!(
+            e["extra"]["what happened"],
+            "HEVC stutters on Receiver 1\nsecond line"
+        );
+        for (name, text) in &files {
+            assert_eq!(e["extra"][name], text.as_str(), "{name} as in the file");
+        }
+        assert_eq!(
+            e["tags"],
+            json!({"app": luch_proto::APP, "os": "Example OS 1", "receivers": "Acme Box", "codec": "HEVC"})
+        );
+        assert_eq!(
+            e["contexts"]["os"],
+            json!({"name": "Example OS 1", "kernel_version": "6.8"})
+        );
+        let zip = got.recv().await.unwrap().body;
+        let (_, items) = crate::report_send::tests::unframe(&zip);
+        assert_eq!(items[0].1, std::fs::read(path).unwrap());
         let _ = std::fs::remove_dir_all(dir);
     }
 

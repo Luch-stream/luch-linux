@@ -157,6 +157,7 @@ luchctl web                               # browsers allowed to watch through th
 luchctl reports                           # crash and error reports the receivers handed over
 luchctl report 1 open                     # file one as an issue (or: report 1, report 1 dismiss)
 luchctl report "HEVC stutters"            # a problem: one file in Downloads with every log, to hand over
+luchctl report --send "HEVC stutters"     # the same, also sent to the developers (no account): says its number
 luchctl known                             # every receiver luchd has talked to, on or off, and how to wake it
 luchctl wake                              # turn a receiver on from standby and wait for it
 luchctl wake "XGIMI MoGo 4 Laser" learn   # pick up its remote's power signal over Bluetooth (receiver off)
@@ -193,6 +194,11 @@ later `auto` plays the sound as it comes, about 20 ms behind.
 **Crash reports.** A receiver keeps short reports of its crashes and errors (no logs, addresses or names) and hands
 them to luchd, which keeps them in `~/.config/luch/reports` and shows a notification: click it to open a filled-in
 issue for the receiver's project. Nothing is sent anywhere unless you file it.
+
+**Sending a problem report.** After **Report a problem…** has made the file, **Send to the developers** (or
+`luchctl report --send`) sends it, with no account, to the developers' GlitchTip and shows its number (LUCH-…) to
+tell in a chat. Only when you press it; the button is there only in a build given an address: `LUCH_REPORT_DSN=<DSN>`
+when building luchd, or in its environment (docs/dbus.md, `SendReport`).
 
 **Turning a receiver on.** luchd remembers every receiver it has connected to, so it can turn one on that is off
 (Quick Settings: **Turn on …**, or `luchctl wake`). Nothing goes through the internet; there are two ways, and luchd

@@ -28,6 +28,7 @@ trait Luch1 {
     fn report_url(&self, id: &str) -> zbus::Result<String>;
     fn dismiss_report(&self, id: &str) -> zbus::Result<()>;
     fn report(&self, text: &str, keep_names: bool) -> zbus::Result<String>;
+    fn send_report(&self, path: &str) -> zbus::Result<String>;
     fn known(&self) -> zbus::Result<String>;
     fn wake(&self, id: &str) -> zbus::Result<String>;
     fn learn_wake(&self, id: &str, seconds: u32) -> zbus::Result<String>;
@@ -83,7 +84,7 @@ trait Luch1 {
 const USAGE: &str = "usage: luchctl [list | refresh | find [auto|all|mdns,scan,ble,sound,qr,direct] | add <link|host[:port]> | connect [r] | disconnect [r] | mirror [r] [fast|monitor|window|virtual] | stop [r] | stats [r] | watch | id
                 | direct [r] | direct off
                 | info [r] | audio [r] auto|on|off|sync | reports | report <n> [open|dismiss]
-                | report [--keep-names] [what happened]
+                | report [--keep-names] [--send] [what happened]
                 | known | wake [r] | wake <r> learn | wake <r> mac|ble <value>|off | sleep [r]
                 | cast [r] <file|link>... [--title T] [--start m:ss] [--sub file] [--relay] [--paused]
                 | media [r] [play|pause|toggle|seek m:ss|skip s|rate x|audio id|sub id|sub off|watch]
@@ -111,7 +112,8 @@ const USAGE: &str = "usage: luchctl [list | refresh | find [auto|all|mdns,scan,b
        pair: the first connection to a receiver shows a code on the TV, typed here (any command that connects asks
        for it too); both then know each other and later connections need nothing. forget: pair again next time
        report: one file in Downloads with the logs of this computer and of the receivers in use, what they are and
-       what happened, to hand over (a chat, an issue); addresses and names are replaced unless --keep-names
+       what happened, to hand over (a chat, an issue); addresses and names are replaced unless --keep-names;
+       --send also sends it to the developers (no account; when this build has a report address) and says its number
        web: the browsers allowed to watch this screen (luchd's web receiver), and the one waiting to be allowed
        latency: photon-to-photon latency with a phone filming both screens at 240 fps (docs/latency-lab.md)
        group: several receivers in step, the first one shows the picture; role video|audio|both (first: both, others:
@@ -640,13 +642,27 @@ async fn run(args: &[String]) -> Result<(), String> {
             }
         }
         ["report", rest @ ..] if report::is_problem(rest) => {
-            let (keep, mut text) = report::args(rest)?;
+            let (keep, send, mut text) = report::args(rest)?;
             if text.is_empty() {
                 text = report::ask();
             }
             eprintln!("collecting the logs (up to 10 s for each receiver)…");
             let out = p.report(&text, keep).await.map_err(e)?;
             print!("{}", report::lines(&out, keep));
+            if send {
+                let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_default();
+                if v["can_send"] != true {
+                    return Err(
+                        "not sent: this build sends reports nowhere (LUCH_REPORT_DSN)".into(),
+                    );
+                }
+                eprintln!("sending it to the developers…");
+                let sent = p
+                    .send_report(v["path"].as_str().unwrap_or(""))
+                    .await
+                    .map_err(|err| format!("not sent: {}", e(err)))?;
+                print!("{}", report::sent(&sent));
+            }
         }
         ["report", n, action @ ..] if action.len() <= 1 => {
             let all: Vec<serde_json::Value> =

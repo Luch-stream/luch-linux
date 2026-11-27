@@ -18,6 +18,7 @@ mod pair;
 mod present;
 mod problem;
 mod quiet;
+mod report_send;
 mod reports;
 mod sync;
 mod tv;
@@ -751,6 +752,19 @@ impl Luch {
             .await
             .map(|v| v.to_string())
             .map_err(|e| fdo::Error::Failed(format!("cannot write the report: {e}")))
+    }
+
+    /// "Send to the developers": the report at `path` (one `Report` made since luchd started) to the DSN this build
+    /// carries (`LUCH_REPORT_DSN`), as an event and then the zip. Returns JSON: `number` (`LUCH-` and 8 hex digits,
+    /// for the person to tell), `event_id`, `attached` and `attach_error` when the zip did not go.
+    async fn send_report(&self, path: String) -> fdo::Result<String> {
+        let dsn = report_send::dsn().ok_or_else(|| {
+            fdo::Error::NotSupported("this build sends reports nowhere (LUCH_REPORT_DSN)".into())
+        })?;
+        report_send::send(&self.http, &dsn, std::path::Path::new(&path))
+            .await
+            .map(|v| v.to_string())
+            .map_err(fdo::Error::Failed)
     }
 
     /// Every receiver luchd has talked to, as a JSON array: `id`, `name`, `model`, `address`, `mac`, `ble`, `seen`
