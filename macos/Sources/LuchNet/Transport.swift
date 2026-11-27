@@ -118,6 +118,17 @@ public final class UdpSender {
         return ok
     }
 
+    /// A datagram coming back on this flow (the socket is connected: only the receiver's video socket gets in): its
+    /// input (PROTOCOL.md 4i). Waits up to `timeoutMs`; 0 when none came, -1 when the socket is gone.
+    public func receive(into buf: inout [UInt8], timeoutMs: Int32) -> Int {
+        var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+        guard poll(&pfd, 1, timeoutMs) > 0 else { return 0 }
+        let n = buf.withUnsafeMutableBytes { recv(fd, $0.baseAddress, $0.count, 0) }
+        // ECONNREFUSED: an ICMP error on the connected socket, the receiver gone for a moment.
+        if n < 0 { return errno == ECONNREFUSED || errno == EINTR ? 0 : -1 }
+        return n
+    }
+
     public func snapshot() -> Snapshot {
         lock.lock()
         defer { lock.unlock() }
