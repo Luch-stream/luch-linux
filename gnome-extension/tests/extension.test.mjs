@@ -21,3 +21,16 @@ test('a D-Bus error is shown without its prefix', () => {
     assert.equal(reason(new Error('GDBus.Error:org.freedesktop.DBus.Error.Failed: sleep is off on the receiver')),
         'sleep is off on the receiver');
 });
+
+test('the menu says what the discovery ladder tries', () => {
+    const body = ext.match(/function findLine\(json, t\) \{([\s\S]*?)\n\}/)[1];
+    const findLine = new Function('json', 't', body);
+    const t = {rungs: {ble: 'Bluetooth', scan: 'every address'}, trying: w => `Looking: ${w}…`};
+    const status = {running: true, rungs: [{rung: 'mdns', state: 'done'}, {rung: 'scan', state: 'running'},
+        {rung: 'ble', state: 'running'}]};
+    assert.equal(findLine(JSON.stringify(status), t), 'Looking: every address, Bluetooth…');
+    assert.equal(findLine(JSON.stringify({...status, running: false}), t), null);
+    assert.equal(findLine('not json', t), null);
+    assert.ok(/<signal name="FindProgress">/.test(ext));
+    assert.match(luchd, /async fn find_progress\(/);
+});

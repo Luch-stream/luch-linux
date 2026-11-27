@@ -23,6 +23,8 @@ const IFACE = `<node>
     <method name="Sleep"><arg name="id" type="s" direction="in"/></method>
     <method name="Cast"><arg name="id" type="s" direction="in"/><arg name="items" type="as" direction="in"/><arg name="options" type="s" direction="in"/><arg type="s" direction="out"/></method>
     <method name="StopCast"><arg name="id" type="s" direction="in"/></method>
+    <method name="Find"><arg name="mode" type="s" direction="in"/></method>
+    <signal name="FindProgress"><arg name="status" type="s"/></signal>
     <property name="WebUrl" type="s" access="read"/>
     <signal name="ReceiversChanged"/>
   </interface>
@@ -55,6 +57,10 @@ const T = RU ? {
     turnOff: 'Выключить ТВ',
     chooseFiles: 'Что показать на ТВ',
     failed: name => `${name}: не получилось`,
+    findHarder: 'Искать настойчивее (Bluetooth, звук, QR-код)',
+    rungs: {mdns: 'сеть (mDNS)', scan: 'все адреса сети', ble: 'Bluetooth',
+        sound: 'звук ТВ через микрофон — на ТВ выберите «Сказать адрес»', qr: 'QR-код ТВ через камеру'},
+    trying: what => `Ищу: ${what}…`,
 } : {
     title: 'Luch',
     header: 'Screen mirroring',
@@ -77,11 +83,30 @@ const T = RU ? {
     turnOff: 'Turn the TV off',
     chooseFiles: 'What to show on the TV',
     failed: name => `${name}: that did not work`,
+    findHarder: 'Search harder (Bluetooth, sound, QR code)',
+    rungs: {mdns: 'the network (mDNS)', scan: 'every address of the network', ble: 'Bluetooth',
+        sound: 'the TV\u2019s sound through the microphone: on the TV, choose \u201cSay the address\u201d',
+        qr: 'the TV\u2019s QR code through the camera'},
+    trying: what => `Looking: ${what}…`,
 };
 
 /** A D-Bus error's own message, without the "GDBus.Error:...: " prefix. */
 function reason(e) {
     return String(e?.message ?? e).replace(/^GDBus\.Error:[^ ]+ /, '');
+}
+
+/** What the discovery ladder is trying now (FindProgress JSON), for the menu; null when it is not running. */
+function findLine(json, t) {
+    let p;
+    try {
+        p = JSON.parse(json);
+    } catch (e) {
+        return null;
+    }
+    if (!p?.running)
+        return null;
+    const now = (p.rungs ?? []).filter(r => r.state === 'running').map(r => t.rungs[r.rung] ?? r.rung);
+    return now.length > 0 ? t.trying(now.join(', ')) : null;
 }
 
 /** Files picked in a dialog (zenity, or kdialog), or [] when cancelled or there is no dialog to show. */
@@ -123,6 +148,7 @@ class LuchToggle extends QuickMenuToggle {
         this._waking = new Set();
         this._lastId = null;
         this._statsTimer = 0;
+        this._finding = null; // what the discovery ladder is trying, from FindProgress
 
         this.menu.setHeader(ICON, T.title, T.header);
         this._section = new PopupMenu.PopupMenuSection();
@@ -140,6 +166,10 @@ class LuchToggle extends QuickMenuToggle {
                 return;
             }
             this._signalId = proxy.connectSignal('ReceiversChanged', () => this._refresh());
+            this._findId = proxy.connectSignal('FindProgress', (_p, _sender, [status]) => {
+                this._finding = findLine(status, T);
+                this._render(null);
+            });
             this._ownerId = proxy.connect('notify::g-name-owner', () => this._discover());
             this._propId = proxy.connect('g-properties-changed', () => this._refresh());
             this._discover();
@@ -184,9 +214,15 @@ class LuchToggle extends QuickMenuToggle {
         this._onMirroringChanged(this.checked);
 
         this._section.removeAll();
-        if (note || (this._rows.length === 0 && this._asleep.length === 0)) {
-            const item = new PopupMenu.PopupMenuItem(note ?? T.searching, {reactive: false});
+        if (note || this._finding || (this._rows.length === 0 && this._asleep.length === 0)) {
+            const item = new PopupMenu.PopupMenuItem(note ?? this._finding ?? T.searching, {reactive: false});
             this._section.addMenuItem(item);
+        }
+        // Nothing on the list and nothing being tried: the rest of the ladder, which needs the person (the TV's
+        // sound through the microphone, its QR code through the camera).
+        if (!note && !this._finding && this._rows.length === 0 && this._proxy?.g_name_owner) {
+            this._section.addAction(T.findHarder, () => this._proxy.FindAsync('all')
+                .catch(e => logError(e, 'Luch: find')));
         }
         for (const [id, name, model, , , , connected, isMirroring] of this._rows) {
             const sub = new PopupMenu.PopupSubMenuMenuItem(name, true);
@@ -323,6 +359,8 @@ class LuchToggle extends QuickMenuToggle {
             this.menu.disconnect(this._menuId);
         if (this._signalId)
             this._proxy.disconnectSignal(this._signalId);
+        if (this._findId)
+            this._proxy.disconnectSignal(this._findId);
         if (this._propId)
             this._proxy.disconnect(this._propId);
         if (this._ownerId)

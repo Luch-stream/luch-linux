@@ -36,6 +36,12 @@ trait Luch1 {
     fn set_volume(&self, id: &str, what: &str) -> zbus::Result<String>;
     fn get_volume(&self, id: &str) -> zbus::Result<String>;
     fn doc_page(&self, id: &str, what: &str) -> zbus::Result<String>;
+    fn find(&self, mode: &str) -> zbus::Result<()>;
+    fn find_status(&self) -> zbus::Result<String>;
+    fn discovered(&self) -> zbus::Result<String>;
+    fn add_receiver(&self, link: &str) -> zbus::Result<String>;
+    #[zbus(signal)]
+    fn find_progress(&self, status: &str) -> zbus::Result<()>;
     #[zbus(signal)]
     fn receivers_changed(&self) -> zbus::Result<()>;
     #[zbus(signal)]
@@ -44,13 +50,15 @@ trait Luch1 {
     fn sender_id(&self) -> zbus::Result<String>;
 }
 
-const USAGE: &str = "usage: luchctl [list | refresh | connect [r] | disconnect [r] | mirror [r] [fast|monitor|window|virtual] | stop [r] | stats [r] | watch | id
+const USAGE: &str = "usage: luchctl [list | refresh | find [auto|all|mdns,scan,ble,sound,qr] | add <link|host[:port]> | connect [r] | disconnect [r] | mirror [r] [fast|monitor|window|virtual] | stop [r] | stats [r] | watch | id
                 | info [r] | audio [r] auto|on|off|sync | reports | report <n> [open|dismiss]
                 | known | wake [r] | wake <r> learn | wake <r> mac|ble <value>|off | sleep [r]
                 | cast [r] <file|link>... [--title T] [--start m:ss] [--sub file] [--relay] [--paused]
                 | media [r] [play|pause|toggle|seek m:ss|skip s|rate x|audio id|sub id|sub off|watch]
                 | volume [r] [0..100|+|-|mute|unmute] | page [r] next|prev|<n> | browser install]
        r = receiver id or name, optional when there is only one; mirror defaults to fast; no arguments: interactive
+       find: when the list stays empty (hotel Wi-Fi, a VPN): every address of the LAN, Bluetooth, then the TV's sound
+       through the microphone and its QR code through the camera; add: a receiver by its QR link or address
        wake: turns on a receiver luchd has talked to before (Wake-on-LAN, or the remote's Bluetooth signal that
        `wake <r> learn` picks up while you press the remote's power key with the receiver off)
        cast: photos, or a video or sound the receiver plays itself in its own quality; a link is fetched by the
@@ -63,14 +71,32 @@ const AUDIO: [&str; 4] = ["auto", "on", "off", "sync"];
 
 const SOURCES: [&str; 5] = ["fast", "monitor", "window", "virtual", "audio"];
 
-fn print(rows: &[ReceiverRow]) {
+/// How a receiver was found (Discovered): "mdns+ble -48 dBm".
+fn found_by(discovered: &serde_json::Value, id: &str) -> String {
+    let d = &discovered[id];
+    let via: Vec<&str> = d["via"]
+        .as_array()
+        .map(|v| v.iter().filter_map(|x| x.as_str()).collect())
+        .unwrap_or_default();
+    let mut s = via.join("+");
+    if let Some(rssi) = d["rssi"].as_i64() {
+        s += &format!(" {rssi} dBm");
+    }
+    if s.is_empty() {
+        "-".into()
+    } else {
+        s
+    }
+}
+
+fn print(rows: &[ReceiverRow], discovered: &serde_json::Value) {
     if rows.is_empty() {
-        println!("(no receivers)");
+        println!("(no receivers: `luchctl find` tries harder)");
         return;
     }
     println!(
-        "{:<38} {:<20} {:<16} {:<21} {:<10} STATE",
-        "ID", "NAME", "MODEL", "ADDRESS", "IFACE"
+        "{:<38} {:<20} {:<16} {:<21} {:<10} {:<16} STATE",
+        "ID", "NAME", "MODEL", "ADDRESS", "IFACE", "FOUND BY"
     );
     for (id, name, model, addr, ifname, port, connected, mirroring) in rows {
         let state = if *mirroring {
@@ -81,10 +107,48 @@ fn print(rows: &[ReceiverRow]) {
             "-"
         };
         println!(
-            "{id:<38} {name:<20} {model:<16} {:<21} {ifname:<10} {state}",
-            format!("{addr}:{port}")
+            "{id:<38} {name:<20} {model:<16} {:<21} {ifname:<10} {:<16} {state}",
+            format!("{addr}:{port}"),
+            found_by(discovered, id)
         );
     }
+}
+
+/// What changed in a FindProgress since the last one, as lines for a person: each rung that started or ended.
+fn progress_lines(before: &serde_json::Value, now: &serde_json::Value) -> Vec<String> {
+    let rungs = |v: &serde_json::Value| v["rungs"].as_array().cloned().unwrap_or_default();
+    let old = rungs(before);
+    let mut out = Vec::new();
+    for r in rungs(now) {
+        let same = old
+            .iter()
+            .any(|o| o["rung"] == r["rung"] && o["state"] == r["state"] && o["note"] == r["note"]);
+        let state = r["state"].as_str().unwrap_or("");
+        if same || state == "waiting" || state == "skipped" {
+            continue;
+        }
+        let word = match state {
+            "running" => "trying",
+            "done" => "done",
+            "failed" => "could not",
+            other => other,
+        };
+        out.push(format!(
+            "{:>5} {word}: {}",
+            r["rung"].as_str().unwrap_or("?"),
+            r["note"].as_str().unwrap_or("")
+        ));
+    }
+    if before["running"] == true && now["running"] == false {
+        out.push(match now["found"].as_u64() {
+            Some(0) | None => {
+                "nothing found; `luchctl add <address>` takes a receiver by hand".into()
+            }
+            Some(1) => "1 receiver found".into(),
+            Some(n) => format!("{n} receivers found"),
+        });
+    }
+    out
 }
 
 /// Every receiver luchd has talked to (Known), and one of them by id or name; with no key, the only one.
@@ -160,6 +224,15 @@ async fn find_id(p: &Luch1Proxy<'_>, key: Option<&str>) -> Result<String, String
     }
 }
 
+/// How luchd found each receiver; empty from a luchd older than the discovery ladder.
+async fn discovered(p: &Luch1Proxy<'_>) -> serde_json::Value {
+    p.discovered()
+        .await
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
 async fn run(args: &[String]) -> Result<(), String> {
     let conn = zbus::Connection::session()
         .await
@@ -183,7 +256,49 @@ async fn run(args: &[String]) -> Result<(), String> {
     {
         ["list"] => {
             p.refresh().await.map_err(e)?;
-            print(&p.receivers().await.map_err(e)?);
+            print(&p.receivers().await.map_err(e)?, &discovered(&p).await);
+        }
+        ["find", mode @ ..] if mode.len() <= 1 => {
+            let mode = mode.first().copied().unwrap_or("all");
+            let mut progress = p.receive_find_progress().await.map_err(e)?;
+            let mut last = serde_json::json!({"running": true});
+            let status: serde_json::Value =
+                serde_json::from_str(&p.find_status().await.map_err(e)?).unwrap_or_default();
+            // A climb already under way (Refresh starts the automatic one) is followed; ours comes after it when
+            // it found nothing.
+            let mut ours = status["running"] != true;
+            if ours {
+                p.find(mode).await.map_err(e)?;
+            } else {
+                println!(
+                    "already looking ({})",
+                    status["mode"].as_str().unwrap_or("")
+                );
+                last = status;
+            }
+            while let Some(signal) = progress.next().await {
+                let Ok(args) = signal.args() else { continue };
+                let now: serde_json::Value =
+                    serde_json::from_str(args.status()).unwrap_or_default();
+                for line in progress_lines(&last, &now) {
+                    println!("{line}");
+                }
+                let done = now["running"] == false;
+                let nothing = now["found"].as_u64().unwrap_or(0) == 0;
+                last = now;
+                if done && !ours && nothing {
+                    ours = true;
+                    last = serde_json::json!({"running": true});
+                    p.find(mode).await.map_err(e)?;
+                } else if done {
+                    break;
+                }
+            }
+            print(&p.receivers().await.map_err(e)?, &discovered(&p).await);
+        }
+        ["add", link] => {
+            let id = p.add_receiver(link).await.map_err(e)?;
+            println!("added {id}");
         }
         ["refresh"] => p.refresh().await.map_err(e)?,
         ["id"] => println!("{}", p.sender_id().await.map_err(e)?),
@@ -476,10 +591,10 @@ async fn run(args: &[String]) -> Result<(), String> {
         ["watch"] => {
             let mut changes = p.receive_receivers_changed().await.map_err(e)?;
             p.refresh().await.map_err(e)?;
-            print(&p.receivers().await.map_err(e)?);
+            print(&p.receivers().await.map_err(e)?, &discovered(&p).await);
             while changes.next().await.is_some() {
                 println!("--- changed");
-                print(&p.receivers().await.map_err(e)?);
+                print(&p.receivers().await.map_err(e)?, &discovered(&p).await);
             }
         }
         ["browser", "install"] => {
@@ -772,6 +887,48 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn find_progress_says_what_starts_and_ends() {
+        use serde_json::json;
+        let start = json!({"running": true, "found": 0, "rungs": [
+            {"rung": "mdns", "state": "running", "note": "asking the network (mDNS)"},
+            {"rung": "scan", "state": "running", "note": "asking every address of this network"},
+            {"rung": "ble", "state": "waiting", "note": ""}]});
+        assert_eq!(
+            progress_lines(&json!({"running": true}), &start),
+            vec![
+                " mdns trying: asking the network (mDNS)",
+                " scan trying: asking every address of this network"
+            ]
+        );
+        let mut later = start.clone();
+        later["rungs"][1] = json!({"rung": "scan", "state": "done", "note": "asked 253 addresses on wlan0: no receiver"});
+        later["rungs"][2] = json!({"rung": "ble", "state": "running", "note": "listening for receivers over Bluetooth"});
+        assert_eq!(
+            progress_lines(&start, &later),
+            vec![
+                " scan done: asked 253 addresses on wlan0: no receiver",
+                "  ble trying: listening for receivers over Bluetooth"
+            ]
+        );
+        let mut end = later.clone();
+        end["running"] = json!(false);
+        end["found"] = json!(1);
+        end["rungs"][2] = json!({"rung": "ble", "state": "done", "note": "Living room TV"});
+        assert_eq!(
+            progress_lines(&later, &end),
+            vec!["  ble done: Living room TV", "1 receiver found"]
+        );
+    }
+
+    #[test]
+    fn found_by_column() {
+        let d = serde_json::json!({"a": {"via": ["ble", "mdns"], "rssi": -48}, "b": {"via": ["scan"], "rssi": null}});
+        assert_eq!(found_by(&d, "a"), "ble+mdns -48 dBm");
+        assert_eq!(found_by(&d, "b"), "scan");
+        assert_eq!(found_by(&d, "c"), "-");
+    }
 
     #[test]
     fn cast_arguments() {
