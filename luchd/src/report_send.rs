@@ -211,15 +211,15 @@ pub fn answer(status: u16, body: &str, retry_after: Option<&str>) -> Result<(), 
     if (200..300).contains(&status) {
         return Ok(());
     }
-    let detail = serde_json::from_str::<Value>(body)
-        .ok()
-        .and_then(|v| {
-            v["detail"]
-                .as_str()
-                .or(v["error"].as_str())
-                .map(String::from)
-        })
-        .unwrap_or_else(|| tag(body));
+    // GlitchTip says why in `detail`; a proxy in front of it may answer with a page instead.
+    let detail = match serde_json::from_str::<Value>(body) {
+        Ok(v) => v["detail"]
+            .as_str()
+            .or(v["error"].as_str())
+            .unwrap_or("")
+            .to_string(),
+        Err(_) => tag(body),
+    };
     Err(match status {
         429 => format!(
             "the developers' server takes no more reports now, try again {}",
@@ -527,6 +527,10 @@ pub(crate) mod tests {
         assert_eq!(
             answer(502, "", None),
             Err("the developers' server answered HTTP 502".into())
+        );
+        assert_eq!(
+            answer(500, "{}", None),
+            Err("the developers' server answered HTTP 500".into())
         );
     }
 

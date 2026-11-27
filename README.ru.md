@@ -207,7 +207,8 @@ luchd или в его окружении (docs/dbus.md, `SendReport`).
   `luchctl wake <r> ble <hex>`.
 
 **Свой интерфейс:** всё доступно на сессионной шине, см. [docs/dbus.ru.md](docs/dbus.ru.md) (в том числе `Info`,
-`SetAudio`/`GetAudio`, `Reports`, `ReportUrl`, `DismissReport`, `Known`, `Wake`, `LearnWake`, `SetWake`).
+`SetAudio`/`GetAudio`, `Reports`, `ReportUrl`, `DismissReport`, `Report`, `SendReport`, `Known`, `Wake`,
+`LearnWake`, `SetWake`).
 
 ## Если что-то не так
 

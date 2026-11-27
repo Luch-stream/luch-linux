@@ -213,7 +213,8 @@ tries every one it knows for that receiver:
   by hand: `luchctl wake <r> mac <address>`, `luchctl wake <r> ble <hex>`.
 
 **Your own front-end:** everything is on the session bus, see [docs/dbus.md](docs/dbus.md) (also `Info`,
-`SetAudio`/`GetAudio`, `Reports`, `ReportUrl`, `DismissReport`, `Known`, `Wake`, `LearnWake`, `SetWake`).
+`SetAudio`/`GetAudio`, `Reports`, `ReportUrl`, `DismissReport`, `Report`, `SendReport`, `Known`, `Wake`,
+`LearnWake`, `SetWake`).
 
 ## Troubleshooting
 
