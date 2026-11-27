@@ -53,7 +53,13 @@ final class Caster {
     }
 
     func handle(_ request: [String: Any], receivers: [Receiver]) -> [String: Any] {
-        guard let r = find(request, in: receivers) else { return ["error": "receiver not found"] }
+        guard let r = find(request, in: receivers) else {
+            let names = receivers.map { "\"\($0.name)\"" }.joined(separator: ", ")
+            if request["id"] == nil, request["name"] == nil, receivers.count > 1 {
+                return ["error": "several receivers, name one with --to: \(names)"]
+            }
+            return ["error": receivers.isEmpty ? "no receivers found" : "receiver not found; there are \(names)"]
+        }
         do {
             switch request["cmd"] as? String ?? "" {
             case "cast":
