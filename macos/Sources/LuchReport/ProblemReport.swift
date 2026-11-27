@@ -116,6 +116,7 @@ public enum ProblemReport {
         let parts = collect(input)
         let red = Redactor()
         if input.hide {
+            parts.forEach { red.keep(model: $0.receiver.model) }
             input.machine.names.forEach { red.hide($0, as: "Computer") }
             red.hide(input.me.name, as: "Computer")
             red.hide(input.machine.home, as: "~")

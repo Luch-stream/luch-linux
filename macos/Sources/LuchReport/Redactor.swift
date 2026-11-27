@@ -13,13 +13,29 @@ public final class Redactor {
     /// Lowercased name -> what stands for it.
     private var names: [String: String] = [:]
     private var receivers = 0
+    /// Device models, lowercased: not personal, and what a problem is read by.
+    private var models: [String] = []
 
     public init() {}
 
-    /// A name to hide as `placeholder` (e.g. "Computer", "User"); names shorter than 2 letters are left alone.
+    /// A device model to leave as it is, and a name made of it ("Pixel 10 Pro XL", "… (dev)") with it: a device
+    /// nobody renamed is called by its model.
+    public func keep(model: String) {
+        let m = model.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if m.count >= 2 { models.append(m) }
+    }
+
+    private func isModel(_ name: String) -> Bool {
+        var n = name.lowercased()
+        for suffix in [" (dev)", " · luch"] where n.hasSuffix(suffix) { n = String(n.dropLast(suffix.count)) }
+        return models.contains { $0 == n || $0.hasSuffix(" " + n) || n.hasSuffix(" " + $0) }
+    }
+
+    /// A name to hide as `placeholder` (e.g. "Computer", "User"); names shorter than 2 letters, and names that are
+    /// only a device's model, are left alone.
     public func hide(_ name: String, as placeholder: String) {
         let n = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard n.count >= 2, names[n.lowercased()] == nil else { return }
+        guard n.count >= 2, names[n.lowercased()] == nil, !isModel(n) else { return }
         names[n.lowercased()] = placeholder
     }
 

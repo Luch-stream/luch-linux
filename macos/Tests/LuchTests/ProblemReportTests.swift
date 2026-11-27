@@ -28,6 +28,17 @@ func gzip(_ data: Data) -> Data {
 
 /// "Hide addresses and names": every address and name of a report, the same placeholder each time.
 final class RedactorTests: XCTestCase {
+    /// A phone nobody renamed is called by its model: the model stays (a problem is read by it), a given name goes.
+    func testAModelIsNotANameToHide() {
+        let red = Redactor()
+        red.keep(model: "Google Pixel 9")
+        red.keep(model: "XGIMI XR14A")
+        XCTAssertEqual(red.receiver(["Pixel 9 (dev)"]), "Receiver 1")
+        red.receiver(["Living room TV"])
+        XCTAssertEqual(red.redact("Pixel 9 (dev) is a Google Pixel 9; Living room TV is an XGIMI XR14A"),
+                       "Pixel 9 (dev) is a Google Pixel 9; Receiver 2 is an XGIMI XR14A")
+    }
+
     func testIPv4AddressesBecomeExampleOnesStablePerAddress() {
         let r = Redactor()
         XCTAssertEqual(r.redact("from 10.1.2.3 to 172.16.0.9, again 10.1.2.3:47800"),
