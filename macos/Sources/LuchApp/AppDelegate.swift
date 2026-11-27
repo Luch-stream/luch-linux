@@ -234,6 +234,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             mirror.target = self
             mirror.representedObject = index
             submenu.addItem(mirror)
+            let sound = NSMenuItem(title: "Play Sound Only", action: #selector(playSound(_:)), keyEquivalent: "")
+            sound.target = self
+            sound.representedObject = index
+            submenu.addItem(sound)
             let stop = NSMenuItem(title: "Stop", action: #selector(stopMirror), keyEquivalent: "")
             stop.target = self
             stop.isEnabled = engine != nil
@@ -411,12 +415,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         startMirror(receivers[index])
     }
 
+    /// The TV as a speaker for this Mac: its sound, no picture (PROTOCOL.md 4d).
+    @objc private func playSound(_ sender: NSMenuItem) {
+        guard let index = sender.representedObject as? Int, index < receivers.count else { return }
+        startMirror(receivers[index], soundOnly: true)
+    }
+
     @objc private func mirrorIfSingle() {
         guard engine == nil, receivers.count == 1 else { return }
         startMirror(receivers[0])
     }
 
-    private func startMirror(_ receiver: Receiver) {
+    private func startMirror(_ receiver: Receiver, soundOnly: Bool = false) {
         // Switching sessions: let the receiver close the previous one first, otherwise it tears
         // down the new session a few hundred ms after start.
         if let old = engine {
@@ -427,14 +437,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.global(qos: .userInitiated).async {
                 old.stop(reason: "switch")
                 Thread.sleep(forTimeInterval: 0.8)
-                DispatchQueue.main.async { [weak self] in self?.beginMirror(receiver) }
+                DispatchQueue.main.async { [weak self] in self?.beginMirror(receiver, soundOnly: soundOnly) }
             }
             return
         }
-        beginMirror(receiver)
+        beginMirror(receiver, soundOnly: soundOnly)
     }
 
-    private func beginMirror(_ receiver: Receiver) {
+    private func beginMirror(_ receiver: Receiver, soundOnly: Bool) {
         if !CGPreflightScreenCaptureAccess() {
             // The system dialog only comes forward for a regular, active app; a background
             // accessory app gets an immediate "declined" with no window at all.
@@ -469,7 +479,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         options.warmth = Preferences.shared.warmth
         if let frameMs = frameMsOverride { options.audioFrameMs = frameMs }
         options.profile = profileOverride
+        options.soundOnly = soundOnly
         let engine = Engine(options: options)
+        engine.shareArt = { [caster] file, client, me in caster.shareArt(file, client: client, me: me) }
         engine.onStats = { [weak self] stats in
             DispatchQueue.main.async { self?.apply(stats) }
         }
@@ -495,7 +507,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let codec = engine.plan?.codec.label ?? ""
                 let batteryNote = engine.deviceOnBattery ? " · 🔋 on battery" : ""
                 DispatchQueue.main.async {
-                    self?.state = "Mirroring to \(receiver.name) · \(codec)\(batteryNote)"
+                    self?.state = soundOnly ? "Playing sound on \(receiver.name)"
+                        : "Mirroring to \(receiver.name) · \(codec)\(batteryNote)"
                     self?.rebuildMenu()
                 }
             } catch {

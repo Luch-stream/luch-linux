@@ -3,6 +3,7 @@
 //   luch list [--seconds N]
 //   luch mirror [<name>] [--ip A.B.C.D] [--iface en0] [--port N] [--display N]
 //               [--fps N] [--bitrate KBPS] [--size WxH] [--seconds N] [--no-audio] [--synthetic]
+//   luch sound [<name>] [--ip A.B.C.D] [--seconds N] [--synthetic]
 // SPDX-License-Identifier: GPL-3.0-or-later
 import Darwin
 import Foundation
@@ -20,6 +21,7 @@ func usage() -> Never {
       luch mirror [<name>] [--ip A.B.C.D] [--iface en0] [--port N] [--display N]
                   [--fps N] [--bitrate KBPS] [--size WxH] [--seconds N] [--no-audio]
                   [--codec auto|h264|hevc] [--profile baseline|main|high] [--synthetic]
+      luch sound [<name>] [--ip A.B.C.D] [--port N] [--seconds N] [--synthetic]
     """
     FileHandle.standardError.write(Data((text + "\n").utf8))
     exit(2)
@@ -189,9 +191,11 @@ case "hw":
     runHardware()
 case "caps":
     runCaps(args)
-case "mirror":
+case "mirror", "sound":
     var options = args.options
     options.seconds = args.seconds
+    // Sound only: the receiver as a speaker, no picture (PROTOCOL.md 4d).
+    options.soundOnly = args.command == "sound"
     if !options.synthetic && !ensureScreenRecording(wait: true) {
         log("no Screen Recording permission: allow it in the system dialog and run again")
         exit(3)

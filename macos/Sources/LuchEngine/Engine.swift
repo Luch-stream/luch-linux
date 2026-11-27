@@ -94,6 +94,10 @@ public struct MirrorOptions {
     public var warmth: Double = 0
     public var seconds: Double = 0
     public var synthetic = false
+    /// The receiver as a speaker (PROTOCOL.md 4d): the Mac's sound and no picture.
+    public var soundOnly = false
+    /// Tell the receiver what this Mac plays (`now_playing`), whatever the session shows.
+    public var nowPlaying = true
     public init() {}
 }
 
@@ -119,6 +123,7 @@ public enum EngineError: Error, LocalizedError {
     case noReady
     case socket
     case encoder
+    case noSoundOnly
 
     public var errorDescription: String? {
         switch self {
@@ -127,6 +132,7 @@ public enum EngineError: Error, LocalizedError {
         case .noReady: return "receiver did not answer start"
         case .socket: return "cannot open the media socket"
         case .encoder: return "cannot create the video encoder"
+        case .noSoundOnly: return "this receiver cannot play sound only"
         }
     }
 }
@@ -196,6 +202,8 @@ public final class Engine {
     /// The session ended on its own (receiver bye, capture error, socket loss).
     public var onStopped: ((String) -> Void)?
     public private(set) var receiver: Receiver?
+    /// A link on this Mac for the cover in `file` that `receiver` may fetch (the app's file server), or nil.
+    public var shareArt: ((_ file: URL, _ receiver: String, _ me: String) -> String?)?
 
     private var control: ControlChannel?
     private var videoTx: UdpSender?
@@ -224,6 +232,8 @@ public final class Engine {
     private var lastBytes: UInt64 = 0
     private var lastLatency: UInt64 = 0
     private var audioFrames: UInt64 = 0
+    private var watcher: NowPlayingWatcher?
+    private var artLink: (path: String, link: String?)?
 
     public init(options: MirrorOptions) {
         self.options = options
@@ -249,6 +259,10 @@ public final class Engine {
         guard let welcome = ctl.waitFor("welcome", timeout: 5) else { throw EngineError.noWelcome }
         guard let caps = ReceiverCaps(welcome: welcome) else { throw EngineError.noWelcome }
         log(caps.describe())
+        if options.soundOnly {
+            try startSound(ctl, caps: caps, receiver: r)
+            return
+        }
         let plan = CodecPlanner.plan(caps: caps, receiverID: r.id, options: options)
         self.plan = plan
         deviceOnBattery = caps.onBattery
@@ -299,7 +313,34 @@ public final class Engine {
         streaming = true
         try startMedia()
         startTimers()
+        watchNowPlaying()
         log("streaming; Ctrl-C to stop")
+    }
+
+    /// Sound only: an `audio` block and no `video`; the receiver shows what plays instead of a picture.
+    private func startSound(_ ctl: ControlChannel, caps: ReceiverCaps, receiver r: Receiver) throws {
+        guard caps.modes.contains("audio"), caps.hasOpus else { throw EngineError.noSoundOnly }
+        ctl.send(["t": "start", "mode": "audio",
+                  "audio": ["codec": "audio/opus", "rate": 48_000, "channels": 2, "frame_ms": options.audioFrameMs]])
+        guard let ready = ctl.waitFor("ready", timeout: 5),
+              let port = (ready["audio_port"] as? NSNumber)?.uint16Value, port > 0 else {
+            throw EngineError.noReady
+        }
+        log("ready: sound only, audio port \(port)")
+        guard let tx = UdpSender.open(kind: .audio, ip: r.address, port: port,
+                                      interfaceIndex: r.interfaceIndex, dscp: 48),
+              let audio = OpusAudio(frameMs: options.audioFrameMs) else { throw EngineError.socket }
+        audioTx = tx
+        self.audio = audio
+        // No IDR will ask for it, so the decoder's config goes out before the first packet.
+        needHead.set()
+        wireAudio()
+        running = true
+        streaming = true
+        try startMedia()
+        startTimers()
+        watchNowPlaying()
+        log("playing sound on \(caps.name); Ctrl-C to stop")
     }
 
     public func run() {
@@ -327,6 +368,8 @@ public final class Engine {
         control?.send(["t": "stop"])
         control?.bye()
         stopTimers()
+        watcher?.stop()
+        watcher = nil
         let done = DispatchSemaphore(value: 0)
         let capture = self.capture
         Task {
@@ -369,6 +412,23 @@ public final class Engine {
     }
 
     private func startMedia() throws {
+        if options.synthetic && options.soundOnly {
+            // Silence at the real pace: the whole path runs and nothing is heard.
+            let ms = options.audioFrameMs
+            let silence = [Float](repeating: 0, count: 48 * ms * 2)
+            let timer = DispatchSource.makeTimerSource(queue: DispatchQueue(label: "luch.synthetic", qos: .userInteractive))
+            timer.schedule(deadline: .now(), repeating: .milliseconds(ms))
+            timer.setEventHandler { [weak self] in
+                guard let self, let audio = self.audio else { return }
+                let pts = CMClockGetTime(CMClockGetHostTimeClock())
+                if self.basePTS == nil { self.basePTS = pts }
+                audio.emit(silence, pts: pts)
+            }
+            timer.resume()
+            syntheticTimer = timer
+            log("source: synthetic silence")
+            return
+        }
         if options.synthetic {
             var index = 0
             let queue = DispatchQueue(label: "luch.synthetic", qos: .userInteractive)
@@ -399,7 +459,9 @@ public final class Engine {
             encoder.encode(buffer, pts: pts, forceIDR: self.wantIDR.take())
         }
         capture.onAudio = { [weak self] sampleBuffer in
-            self?.audio?.push(sampleBuffer)
+            guard let self else { return }
+            if self.basePTS == nil { self.basePTS = CMSampleBufferGetPresentationTimeStamp(sampleBuffer) }
+            self.audio?.push(sampleBuffer)
         }
         capture.onStop = { [weak self] why in
             self?.stop(reason: "capture: \(why)")
@@ -407,14 +469,14 @@ public final class Engine {
 
         let started = DispatchSemaphore(value: 0)
         var failure: Error?
-        let audio = (plan?.audio ?? options.audio) && audioTx != nil
+        let audio = (options.soundOnly || (plan?.audio ?? options.audio)) && audioTx != nil
+        // ScreenCaptureKit hands out sound only from a screen stream; for sound only it is a tiny one, unused.
+        let size = options.soundOnly ? (w: 64, h: 36, fps: 1)
+            : (w: plan?.width ?? options.width, h: plan?.height ?? options.height, fps: plan?.fps ?? options.fps)
         Task {
             do {
-                let p = self.plan
-                try await capture.start(displayIndex: options.display,
-                                        width: p?.width ?? options.width,
-                                        height: p?.height ?? options.height,
-                                        fps: p?.fps ?? options.fps, audio: audio, fit: options.fit)
+                try await capture.start(displayIndex: options.display, width: size.w, height: size.h,
+                                        fps: size.fps, audio: audio, fit: options.fit)
             } catch {
                 failure = error
             }
@@ -427,6 +489,26 @@ public final class Engine {
             control?.send(["t": "stop"])
             throw failure
         }
+    }
+
+    private func watchNowPlaying() {
+        guard options.nowPlaying else { return }
+        let w = NowPlayingWatcher()
+        w.onChange = { [weak self] info in self?.tell(info) }
+        if w.start() { watcher = w }
+    }
+
+    /// Sends what plays; a new cover is shared once and its link reused while it stays.
+    private func tell(_ info: NowPlayingInfo) {
+        guard running, let control, let receiver else { return }
+        var link: String?
+        if let art = info.art {
+            if artLink?.path != art {
+                artLink = (art, shareArt?(URL(fileURLWithPath: art), receiver.address, control.localAddress))
+            }
+            link = artLink?.link
+        }
+        control.send(info.message(art: link))
     }
 
     // MARK: - events
@@ -478,7 +560,12 @@ public final class Engine {
     }
 
     private func reportStats() {
-        guard let tx = videoTx else { return }
+        guard let tx = videoTx else {
+            if options.soundOnly {
+                log(String(format: "stats: sound only, %llu pkt, rtt %.1f ms", audioFrames, control?.rttMs ?? 0))
+            }
+            return
+        }
         let snap = tx.snapshot()
         let df = snap.frames - lastFrames
         let db = snap.bytes - lastBytes

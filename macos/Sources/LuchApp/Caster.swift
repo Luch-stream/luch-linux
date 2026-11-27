@@ -42,6 +42,16 @@ final class Caster {
         return s
     }
 
+    /// A link for the cover of what plays (now_playing's `art`), served like any cast file to `client` only.
+    func shareArt(_ file: URL, client: String, me: String) -> String? {
+        guard let server = try? files(), let head = try? FileHandle(forReadingFrom: file).read(upToCount: 4) else {
+            return nil
+        }
+        let mime = head.starts(with: [0x89, 0x50, 0x4e, 0x47]) ? "image/png" : "image/jpeg"
+        let token = server.share(.file(file), client: client, mime: mime)
+        return server.url(host: me, token: token, name: mime == "image/png" ? "cover.png" : "cover.jpg")
+    }
+
     func handle(_ request: [String: Any], receivers: [Receiver]) -> [String: Any] {
         guard let r = find(request, in: receivers) else { return ["error": "receiver not found"] }
         do {

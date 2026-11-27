@@ -19,8 +19,10 @@ fi
 export CLANG_MODULE_CACHE_PATH="$PWD/.mc" SWIFT_MODULECACHE_PATH="$PWD/.mc"
 swift build --disable-sandbox -c release --cache-path ./.spm-cache --scratch-path ./.build
 
-mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Frameworks"
 cp "$BIN" "$APP/Contents/MacOS/LuchApp"
+# Loaded by the system perl to read what plays (Sources/LuchEngine/NowPlaying.swift).
+cp ".build/release/libLuchNowPlaying.dylib" "$APP/Contents/Frameworks/"
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -50,12 +52,14 @@ PLIST
 
 SIGN_ID="${SIGN_ID:-}"
 if [ -n "$SIGN_ID" ]; then
+    codesign --force --sign "$SIGN_ID" "$APP/Contents/Frameworks/libLuchNowPlaying.dylib"
     if ! codesign --force --sign "$SIGN_ID" "$APP"; then
         echo "codesign failed with: $SIGN_ID" >&2
         exit 1
     fi
     echo "signed with: $SIGN_ID"
 else
+    codesign --force --sign - "$APP/Contents/Frameworks/libLuchNowPlaying.dylib"
     codesign --force --sign - "$APP"
     echo "signed ad-hoc (Screen Recording is asked again after every rebuild; pass SIGN_ID for a stable identity)"
 fi

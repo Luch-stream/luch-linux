@@ -109,6 +109,7 @@ Without the app:
 .build/debug/luch hw                            # what this Mac's encoders can do
 .build/debug/luch mirror "XGIMI MoGo 4 Laser" --preset 720p --size-mode source --warm 0.3
 .build/debug/luch mirror --synthetic --ip 127.0.0.1   # no capture permission needed
+.build/debug/luch sound "Living room TV"               # the TV as a speaker: this Mac's sound, no picture
 ```
 
 `luchctl` talks to `Luch.app` over `~/Library/Application Support/Luch/control.sock`; if the app is not
@@ -130,6 +131,8 @@ python3 Tools/fakerecv.py --seconds 20 --out .tmp/capture.h264 &
 - display mirroring with the cursor, H.264 and HEVC, a size that follows the client;
 - codec choice by weighted grading, remembering what a real session measured;
 - system audio (Opus, 20 ms frames), `OpusHead` before every IDR;
+- sound only (`luch sound`, "Play Sound Only" in the menu): the TV plays this Mac's sound and shows what plays;
+- what plays (title, artist, album, cover, position) goes to the TV as `now_playing` during any session (below);
 - VPN-safe: the control channel and both media sockets are bound to the interface the receiver was
   found on, never to the default route;
 - keepalive: repeats the last access unit when the screen is still — P-frames at 2 fps, an IDR more
@@ -187,3 +190,8 @@ Luch.app serves cast files on TCP port 47810 to that receiver only (a random tok
 app accept incoming connections the first time. While mirroring, the TV remote's media keys (play/pause, next,
 previous) are passed on as the Mac's own media keys, so Music, Spotify or a browser's video obey them; macOS asks
 for Accessibility access for that once.
+
+What plays comes from MediaRemote, the source of Control Center's player. Since macOS 15.4 it answers only Apple's
+own processes and returns nothing to other apps, so a small library (`libLuchNowPlaying.dylib`, in the app's
+Frameworks) is loaded into the system `/usr/bin/perl`, which is one of them, and reports changes as JSON lines; the
+open mediaremote-adapter does the same. If Apple closes that too, the TV simply shows no title.
