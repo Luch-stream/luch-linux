@@ -13,13 +13,14 @@ final class Caster {
     private var sessions: [String: CastSession] = [:]
     private var server: FileServer?
 
-    private func find(_ request: [String: Any], in receivers: [Receiver]) -> Receiver? {
+    /// `mirroring`: the receiver the app mirrors or plays sound to, which counts as being shown on.
+    private func find(_ request: [String: Any], in receivers: [Receiver], mirroring: String?) -> Receiver? {
         let wanted = (request["id"] as? String) ?? (request["name"] as? String)
         if let wanted { return receivers.first { $0.id == wanted || $0.name == wanted } }
         if receivers.count == 1 { return receivers[0] }
         // Unnamed with several around: the one something is being shown on, when that is only one.
         lock.lock()
-        let showing = receivers.filter { sessions[$0.id]?.isOpen == true }
+        let showing = receivers.filter { sessions[$0.id]?.isOpen == true || $0.id == mirroring }
         lock.unlock()
         return showing.count == 1 ? showing[0] : nil
     }
@@ -58,8 +59,8 @@ final class Caster {
         return server.url(host: me, token: token, name: mime == "image/png" ? "cover.png" : "cover.jpg")
     }
 
-    func handle(_ request: [String: Any], receivers: [Receiver]) -> [String: Any] {
-        guard let r = find(request, in: receivers) else {
+    func handle(_ request: [String: Any], receivers: [Receiver], mirroring: String? = nil) -> [String: Any] {
+        guard let r = find(request, in: receivers, mirroring: mirroring) else {
             let names = receivers.map { "\"\($0.name)\"" }.joined(separator: ", ")
             if request["id"] == nil, request["name"] == nil, receivers.count > 1 {
                 return ["error": "several receivers, name one with --to: \(names)"]

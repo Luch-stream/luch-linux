@@ -134,8 +134,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             // What waits for a receiver's answer runs here, on the socket's thread, not on the main one.
             if Caster.commands.contains(request["cmd"] as? String ?? "") {
                 var known: [Receiver] = []
-                DispatchQueue.main.sync { known = self.receivers }
-                return self.caster.handle(request, receivers: known)
+                var mirroring: String?
+                DispatchQueue.main.sync {
+                    known = self.receivers
+                    mirroring = self.currentReceiverID
+                }
+                return self.caster.handle(request, receivers: known, mirroring: mirroring)
             }
             var response: [String: Any] = [:]
             // The socket thread must not touch AppKit state directly.
