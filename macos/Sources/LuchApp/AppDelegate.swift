@@ -15,6 +15,15 @@ final class Preferences {
     static let shared = Preferences()
     private let defaults = UserDefaults.standard
 
+    /// What ultra-low latency puts first, per receiver id; nil until asked.
+    func ultra(for id: String) -> UltraPriority? {
+        (defaults.string(forKey: "ultra." + id)).flatMap(UltraPriority.init(rawValue:))
+    }
+
+    func setUltra(_ p: UltraPriority, for id: String) {
+        defaults.set(p.rawValue, forKey: "ultra." + id)
+    }
+
     var bitrate: Int {
         get { (defaults.object(forKey: "bitrate") as? NSNumber)?.intValue ?? Proto.videoKbps }
         set { defaults.set(newValue, forKey: "bitrate") }
@@ -415,7 +424,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         startMirror(receivers[0])
     }
 
-    private func startMirror(_ receiver: Receiver, soundOnly: Bool = false, extend: Bool = false) {
+    private func startMirror(_ receiver: Receiver, soundOnly: Bool = false, extend: Bool = false,
+                             ultra: UltraPriority? = nil) {
         // Switching sessions: let the receiver close the previous one first, otherwise it tears
         // down the new session a few hundred ms after start.
         if let old = engine {
@@ -426,14 +436,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.global(qos: .userInitiated).async {
                 old.stop(reason: "switch")
                 Thread.sleep(forTimeInterval: 0.8)
-                DispatchQueue.main.async { [weak self] in self?.beginMirror(receiver, soundOnly: soundOnly, extend: extend) }
+                DispatchQueue.main.async { [weak self] in self?.beginMirror(receiver, soundOnly: soundOnly, extend: extend, ultra: ultra) }
             }
             return
         }
-        beginMirror(receiver, soundOnly: soundOnly, extend: extend)
+        beginMirror(receiver, soundOnly: soundOnly, extend: extend, ultra: ultra)
     }
 
-    private func beginMirror(_ receiver: Receiver, soundOnly: Bool, extend: Bool) {
+    private func beginMirror(_ receiver: Receiver, soundOnly: Bool, extend: Bool, ultra: UltraPriority?) {
         if !CGPreflightScreenCaptureAccess() {
             // The system dialog only comes forward for a regular, active app; a background
             // accessory app gets an immediate "declined" with no window at all.
@@ -475,6 +485,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         options.profile = profileOverride
         options.soundOnly = soundOnly
         options.extend = extend
+        options.ultra = ultra
         let engine = Engine(options: options)
         engine.shareArt = { [caster] file, client, me in caster.shareArt(file, client: client, me: me) }
         engine.onStats = { [weak self] stats in
@@ -505,6 +516,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 DispatchQueue.main.async {
                     self?.state = soundOnly ? "Playing sound on \(receiver.name)"
                         : extend ? "Extended to \(receiver.name) · \(codec)"
+                        : ultra != nil ? "Ultra-low latency to \(receiver.name) · \(engine.ultraMode.map { "\($0)" } ?? "") · \(codec)"
                         : "Mirroring to \(receiver.name) · \(codec)\(batteryNote)"
                     self?.rebuildMenu()
                 }
@@ -646,6 +658,20 @@ extension AppDelegate {
         m.addItem(.run("Extend Screen", symbol: "rectangle.split.2x1") { [weak self] in
             self?.startMirror(r, extend: true)
         })
+        m.addItem(.run("Mirror · Ultra-Low Latency", symbol: "bolt") { [weak self] in
+            guard let self, let p = self.ultraPriority(for: r) else { return }
+            self.startMirror(r, ultra: p)
+        })
+        let ultraItem = NSMenuItem(title: "Ultra-Low Latency Puts First", action: nil, keyEquivalent: "")
+        let ultraMenu = NSMenu()
+        let saved = Preferences.shared.ultra(for: r.id)
+        for p in UltraPriority.allCases {
+            let item = NSMenuItem.run(p.label) { Preferences.shared.setUltra(p, for: r.id) }
+            if p == saved { item.state = .on }
+            ultraMenu.addItem(item)
+        }
+        ultraItem.submenu = ultraMenu
+        m.addItem(ultraItem)
         m.addItem(.run("Play Sound Only", symbol: "hifispeaker") { [weak self] in self?.startMirror(r, soundOnly: true) })
         if mirroringHere {
             m.addItem(.run("Stop Mirroring", symbol: "stop.circle") { [weak self] in self?.stopMirror() })
@@ -828,5 +854,31 @@ extension AppDelegate: NSMenuDelegate {
             pendingMenuRefresh = false
             rebuildMenu()
         }
+    }
+}
+
+// MARK: - ultra-low latency: asked once per TV what it should put first
+
+extension AppDelegate {
+    /// What this TV's ultra-low latency mode puts first: asked the first time, then kept (and changed in the menu).
+    fileprivate func ultraPriority(for r: Receiver) -> UltraPriority? {
+        if let p = Preferences.shared.ultra(for: r.id) { return p }
+        let alert = NSAlert()
+        alert.messageText = "Ultra-low latency on \(r.name)"
+        alert.informativeText = "This Mac will draw its desktop at one of the TV's own modes, so no frame is scaled on "
+            + "either side; its own screen shows a copy. What should it put first? It is asked once for this TV and "
+            + "can be changed in its menu."
+        for p in [UltraPriority.speed, .quality, .likeMac] {
+            alert.addButton(withTitle: p.label)
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        let picked: UltraPriority
+        switch alert.runModal() {
+        case .alertFirstButtonReturn: picked = .speed
+        case .alertSecondButtonReturn: picked = .quality
+        default: picked = .likeMac
+        }
+        Preferences.shared.setUltra(picked, for: r.id)
+        return picked
     }
 }

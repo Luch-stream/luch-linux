@@ -57,7 +57,7 @@ public final class VirtualScreen {
         let until = Date().addingTimeInterval(timeout)
         while Date() < until {
             if let m = CGDisplayCopyDisplayMode(displayID), m.pixelWidth == pixelWidth { return true }
-            RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+            Thread.sleep(forTimeInterval: 0.1) // the session starts off the main thread, which has no run loop to turn
         }
         return false
     }
