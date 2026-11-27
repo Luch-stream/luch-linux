@@ -110,6 +110,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         logFile = Bundle.main.bundleURL.deletingLastPathComponent()
             .appendingPathComponent("luch-app.log").path
         log("app: launched, bundle \(Bundle.main.bundleURL.lastPathComponent)")
+        // A write to a socket the other side has closed (a receiver restarted mid-session, luchctl gone before its
+        // answer) must be an error, not SIGPIPE: that ends the whole app silently, with no crash report.
+        signal(SIGPIPE, SIG_IGN)
 
         NSApp.setActivationPolicy(.accessory)
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
