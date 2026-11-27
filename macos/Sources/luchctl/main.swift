@@ -81,7 +81,7 @@ case "list":
     if receivers.isEmpty {
         print("no receivers found (Luch app on the TV? same LAN?)")
     }
-    for receiver in receivers {
+    let rows = receivers.map { receiver -> [String] in
         let mirroring = (receiver["mirroring"] as? Bool) == true ? " *" : ""
         let name = receiver["name"] as? String ?? "?"
         let address = receiver["address"] as? String ?? "?"
@@ -90,8 +90,9 @@ case "list":
         let model = receiver["model"] as? String ?? ""
         // luch, cast or dlna: how the TV is reached (a TV without the Luch app plays files and links only).
         let kind = receiver["kind"] as? String ?? "luch"
-        print("\(name)\(mirroring)\t\(address):\(port)\t\(iface.isEmpty ? "-" : iface)\t\(kind)\t\(model)")
+        return ["\(name)\(mirroring)", "\(address):\(port)", iface.isEmpty ? "-" : iface, kind, model]
     }
+    if !rows.isEmpty { Table.print(header: ["RECEIVER", "ADDRESS", "NET", "KIND", "MODEL"], rows: rows) }
 
 case "mirror":
     var request: [String: Any] = ["cmd": "mirror"]
