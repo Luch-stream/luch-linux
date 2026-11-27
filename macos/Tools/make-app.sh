@@ -21,6 +21,8 @@ swift build --disable-sandbox -c release --cache-path ./.spm-cache --scratch-pat
 
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Frameworks"
 cp "$BIN" "$APP/Contents/MacOS/LuchApp"
+# The command line and the browser extension's host, at a path that stays when the app is moved into /Applications.
+cp ".build/release/luchctl" "$APP/Contents/MacOS/luchctl"
 # Loaded by the system perl to read what plays (Sources/LuchEngine/NowPlaying.swift).
 cp ".build/release/libLuchNowPlaying.dylib" "$APP/Contents/Frameworks/"
 
@@ -52,14 +54,14 @@ PLIST
 
 SIGN_ID="${SIGN_ID:-}"
 if [ -n "$SIGN_ID" ]; then
-    codesign --force --sign "$SIGN_ID" "$APP/Contents/Frameworks/libLuchNowPlaying.dylib"
+    codesign --force --sign "$SIGN_ID" "$APP/Contents/Frameworks/libLuchNowPlaying.dylib" "$APP/Contents/MacOS/luchctl"
     if ! codesign --force --sign "$SIGN_ID" "$APP"; then
         echo "codesign failed with: $SIGN_ID" >&2
         exit 1
     fi
     echo "signed with: $SIGN_ID"
 else
-    codesign --force --sign - "$APP/Contents/Frameworks/libLuchNowPlaying.dylib"
+    codesign --force --sign - "$APP/Contents/Frameworks/libLuchNowPlaying.dylib" "$APP/Contents/MacOS/luchctl"
     codesign --force --sign - "$APP"
     echo "signed ad-hoc (Screen Recording is asked again after every rebuild; pass SIGN_ID for a stable identity)"
 fi
