@@ -26,6 +26,14 @@ cp ".build/release/luchctl" "$APP/Contents/MacOS/luchctl"
 # Loaded by the system perl to read what plays (Sources/LuchEngine/NowPlaying.swift).
 cp ".build/release/libLuchNowPlaying.dylib" "$APP/Contents/Frameworks/"
 cp ../assets/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
+# libopus goes inside the app: linked from Homebrew, the app would not start on a Mac without `brew install opus`.
+OPUS=$(otool -L "$APP/Contents/MacOS/LuchApp" | awk '/libopus/ {print $1}')
+if [ -n "$OPUS" ]; then
+    cp -L "$OPUS" "$APP/Contents/Frameworks/libopus.0.dylib"
+    chmod u+w "$APP/Contents/Frameworks/libopus.0.dylib"
+    install_name_tool -id @rpath/libopus.0.dylib "$APP/Contents/Frameworks/libopus.0.dylib"
+    install_name_tool -change "$OPUS" @executable_path/../Frameworks/libopus.0.dylib "$APP/Contents/MacOS/LuchApp"
+fi
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -65,15 +73,27 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 PLIST
 
 SIGN_ID="${SIGN_ID:-}"
+LIBS="$APP/Contents/Frameworks/libLuchNowPlaying.dylib"
+[ -f "$APP/Contents/Frameworks/libopus.0.dylib" ] && LIBS="$LIBS $APP/Contents/Frameworks/libopus.0.dylib"
+# A Developer ID build is for others: the hardened runtime and a timestamp, which notarization asks for, and the
+# devices the runtime then needs named (the microphone for calibration and finding by sound, the camera for QR codes).
+OPTS=""
+case "$SIGN_ID" in
+    "Developer ID"*|[0-9A-F]*) if security find-identity -v -p codesigning | grep -F "$SIGN_ID" | grep -q "Developer ID"; then
+        OPTS="--options runtime --timestamp --entitlements Tools/Luch.entitlements"; fi ;;
+esac
 if [ -n "$SIGN_ID" ]; then
-    codesign --force --sign "$SIGN_ID" "$APP/Contents/Frameworks/libLuchNowPlaying.dylib" "$APP/Contents/MacOS/luchctl"
-    if ! codesign --force --sign "$SIGN_ID" "$APP"; then
+    # shellcheck disable=SC2086
+    codesign --force $OPTS --sign "$SIGN_ID" $LIBS "$APP/Contents/MacOS/luchctl"
+    # shellcheck disable=SC2086
+    if ! codesign --force $OPTS --sign "$SIGN_ID" "$APP"; then
         echo "codesign failed with: $SIGN_ID" >&2
         exit 1
     fi
     echo "signed with: $SIGN_ID"
 else
-    codesign --force --sign - "$APP/Contents/Frameworks/libLuchNowPlaying.dylib" "$APP/Contents/MacOS/luchctl"
+    # shellcheck disable=SC2086
+    codesign --force --sign - $LIBS "$APP/Contents/MacOS/luchctl"
     codesign --force --sign - "$APP"
     echo "signed ad-hoc (Screen Recording is asked again after every rebuild; pass SIGN_ID for a stable identity)"
 fi

@@ -3,13 +3,18 @@ name: macOS
 on:
   push:
     branches: [main]
-    paths: ["macos/**"]
+    tags: ["v*"]
+    paths: ["macos/**", "assets/**", "luchd/src/*.html", "luchd/src/*.js", ".github/workflows/macos.yml"]
   pull_request:
     paths: ["macos/**"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
-    runs-on: macos-14
+    runs-on: macos-15
     defaults:
       run:
         working-directory: macos
@@ -21,3 +26,59 @@ jobs:
         run: swift build -c release
       - name: Test
         run: swift test
+
+      # Developer ID signing and notarization when the repository has the secrets (MACOS_CERT_P12: the certificate
+      # and key as base64 of a .p12, MACOS_CERT_PASSWORD, NOTARY_KEY: an App Store Connect API key .p8 as base64,
+      # NOTARY_KEY_ID, NOTARY_ISSUER); without them the app is signed ad hoc and macOS asks to confirm the first open.
+      - name: Signing identity
+        env:
+          P12: ${{ secrets.MACOS_CERT_P12 }}
+          P12_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        run: |
+          if [ -z "$P12" ]; then echo "no certificate: ad hoc"; exit 0; fi
+          kc="$RUNNER_TEMP/luch.keychain-db"
+          security create-keychain -p luch "$kc"
+          security set-keychain-settings -lut 3600 "$kc"
+          security unlock-keychain -p luch "$kc"
+          echo "$P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$kc" -P "$P12_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k luch "$kc" >/dev/null
+          security list-keychains -d user -s "$kc" $(security list-keychains -d user | tr -d '"')
+          id=$(security find-identity -v -p codesigning "$kc" | awk -F'"' '/Developer ID Application/ {print $2; exit}')
+          echo "SIGN_ID=$id" >> "$GITHUB_ENV"
+
+      - name: Luch.app
+        run: ./Tools/make-app.sh
+
+      - name: Notarize
+        env:
+          NOTARY_KEY: ${{ secrets.NOTARY_KEY }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER: ${{ secrets.NOTARY_ISSUER }}
+        run: |
+          if [ -z "$NOTARY_KEY" ] || [ -z "${SIGN_ID:-}" ]; then echo "not notarized"; exit 0; fi
+          echo "$NOTARY_KEY" | base64 --decode > "$RUNNER_TEMP/key.p8"
+          ditto -c -k --keepParent .build/Luch.app "$RUNNER_TEMP/notarize.zip"
+          xcrun notarytool submit "$RUNNER_TEMP/notarize.zip" --key "$RUNNER_TEMP/key.p8" \
+            --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER" --wait
+          xcrun stapler staple .build/Luch.app
+
+      - name: Package
+        run: |
+          name="Luch-macOS-${GITHUB_REF_NAME//\//-}-arm64.zip"
+          ditto -c -k --keepParent .build/Luch.app "$GITHUB_WORKSPACE/$name"
+          echo "PKG=$name" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: luch-macos
+          path: ${{ env.PKG }}
+
+      - name: Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        working-directory: .
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --generate-notes 2>/dev/null || true
+          gh release upload "$GITHUB_REF_NAME" "$PKG" --clobber
