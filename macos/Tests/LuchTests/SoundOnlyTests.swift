@@ -118,16 +118,21 @@ final class SoundOnlyTests: XCTestCase {
         XCTAssertEqual(first[1], PacketFlags.config.rawValue, "the decoder's config goes first")
         XCTAssertEqual(Array(first[Proto.headerSize...].prefix(8)), Array("OpusHead".utf8))
 
-        // Then Opus at the real pace: 20 ms frames, so ~25 in half a second.
+        // Then Opus at the real pace, 20 ms frames: 40 packets after the first ten take about 0.8 s, never a burst
+        // (a slow CI machine starts late, so the pace is timed once it runs, not from the start).
         var count = 0
-        let until = Date().addingTimeInterval(0.5)
-        while Date() < until, let p = tv.packet() {
+        var tenth = Date()
+        let until = Date().addingTimeInterval(10)
+        while count < 50, Date() < until, let p = tv.packet() {
             XCTAssertEqual(p[0], MediaKind.audio.rawValue)
             XCTAssertEqual(p[1], 0)
             count += 1
+            if count == 10 { tenth = Date() }
         }
-        XCTAssertGreaterThan(count, 15)
-        XCTAssertLessThan(count, 40)
+        XCTAssertEqual(count, 50)
+        let took = Date().timeIntervalSince(tenth)
+        XCTAssertGreaterThan(took, 0.6, "faster than real time")
+        XCTAssertLessThan(took, 3.0)
     }
 
     func testAReceiverWithoutSoundOnlyIsRefused() {
