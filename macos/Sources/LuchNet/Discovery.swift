@@ -15,9 +15,11 @@ public struct Receiver {
     public var interfaceIndex: UInt32
     public var port: UInt16
     public var service: String
+    /// The TLS port from the TXT "tls" (protocol v1, pairing), 0 for an older receiver.
+    public var tlsPort: UInt16
 
     public init(id: String, name: String, model: String, address: String, interfaceName: String,
-                interfaceIndex: UInt32, port: UInt16, service: String) {
+                interfaceIndex: UInt32, port: UInt16, service: String, tlsPort: UInt16 = 0) {
         self.id = id
         self.name = name
         self.model = model
@@ -26,6 +28,7 @@ public struct Receiver {
         self.interfaceIndex = interfaceIndex
         self.port = port
         self.service = service
+        self.tlsPort = tlsPort
     }
 }
 
@@ -237,7 +240,7 @@ public final class Discovery {
             let receiver = Receiver(id: txt["id"] ?? serviceName, name: txt["name"] ?? serviceName,
                                     model: txt["model"] ?? "", address: address,
                                     interfaceName: interfaceName(index), interfaceIndex: index,
-                                    port: portHost, service: serviceName)
+                                    port: portHost, service: serviceName, tlsPort: UInt16(txt["tls"] ?? "") ?? 0)
             self.lock.lock()
             self.receivers[receiver.service] = receiver
             self.lock.unlock()

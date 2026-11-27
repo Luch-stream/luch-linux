@@ -7,7 +7,8 @@ import LuchNet
 import LuchProto
 
 final class Caster {
-    static let commands: Set<String> = ["cast", "media_cmd", "media_state", "stop_cast", "sleep", "volume", "page", "receiver_modes"]
+    static let commands: Set<String> = ["cast", "media_cmd", "media_state", "stop_cast", "sleep", "volume", "page", "receiver_modes",
+                                        "connect"]
 
     private let lock = NSLock()
     private var sessions: [String: CastSession] = [:]
@@ -117,6 +118,12 @@ final class Caster {
                 return ["ok": true, "page": try session(r).page(request["what"] as? String ?? "next")]
             case "receiver_modes":
                 return ["ok": true, "modes": try session(r).welcome["modes"] ?? []]
+            case "connect":
+                // luchctl pair: an open channel says the receiver lets this Mac in (paired, or an older one).
+                let already = existing(r.id) != nil
+                let s = try session(r)
+                return ["ok": true, "id": r.id, "name": r.name, "already": already, "encrypted": s.isEncrypted,
+                        "paired": Connector.shared.isPaired(r.id)]
             default:
                 return ["error": "unknown command"]
             }

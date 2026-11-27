@@ -124,7 +124,6 @@ public struct SessionStats {
 }
 
 public enum EngineError: Error, LocalizedError {
-    case cannotConnect(String)
     case noWelcome
     case noReady
     case socket
@@ -135,7 +134,6 @@ public enum EngineError: Error, LocalizedError {
 
     public var errorDescription: String? {
         switch self {
-        case let .cannotConnect(what): return "cannot connect: \(what)"
         case .noWelcome: return "receiver did not answer hello"
         case .noReady: return "receiver did not answer start"
         case .socket: return "cannot open the media socket"
@@ -263,16 +261,14 @@ public final class Engine {
         self.receiver = r
         warmth = options.warmth
         let identity = senderIdentity()
-
-        guard let ctl = ControlChannel.open(ip: r.address, port: r.port, interfaceIndex: r.interfaceIndex) else {
-            throw EngineError.cannotConnect("\(r.address):\(r.port)")
-        }
+        // TLS and pairing when the receiver offers them (Connector); fails with "asks for pairing" while a code waits.
+        let connection = try Connector.shared.open(r, hello: ["t": "hello", "v": Int(Proto.version), "id": identity.id,
+                                                              "name": identity.name, "app": Proto.app,
+                                                              "want": ["mirror", "reports"]])
+        let ctl = connection.channel
         control = ctl
         ctl.onEvent = { [weak self] msg in self?.handle(msg) }
-
-        ctl.send(["t": "hello", "v": Int(Proto.version), "id": identity.id, "name": identity.name,
-                  "app": Proto.app, "want": ["mirror"]])
-        guard let welcome = ctl.waitFor("welcome", timeout: 5) else { throw EngineError.noWelcome }
+        let welcome = connection.welcome
         guard let caps = ReceiverCaps(welcome: welcome) else { throw EngineError.noWelcome }
         log(caps.describe())
         self.caps = caps
@@ -382,14 +378,16 @@ public final class Engine {
         }
         log("ready: video port \(videoPort), audio port \(ready["audio_port"] ?? 0)")
 
+        // Over TLS the receiver gives this session's media key: every frame is sealed with it (PROTOCOL.md 4).
+        let seal = try MediaSeal.key(ready: ready).flatMap { MediaSeal(key: $0) }
         guard let vtx = UdpSender.open(kind: .video, ip: r.address, port: videoPort,
-                                       interfaceIndex: r.interfaceIndex, dscp: 40) else {
+                                       interfaceIndex: r.interfaceIndex, dscp: 40, seal: seal) else {
             throw EngineError.socket
         }
         videoTx = vtx
         if plan.audio, let audioPort = (ready["audio_port"] as? NSNumber)?.uint16Value, audioPort > 0 {
             audioTx = UdpSender.open(kind: .audio, ip: r.address, port: audioPort,
-                                     interfaceIndex: r.interfaceIndex, dscp: 48)
+                                     interfaceIndex: r.interfaceIndex, dscp: 48, seal: seal)
         } else if plan.audio {
             log("audio: receiver gave no audio port, continuing without sound")
         }
@@ -423,8 +421,9 @@ public final class Engine {
             throw EngineError.noReady
         }
         log("ready: sound only, audio port \(port)")
+        let seal = try MediaSeal.key(ready: ready).flatMap { MediaSeal(key: $0) }
         guard let tx = UdpSender.open(kind: .audio, ip: r.address, port: port,
-                                      interfaceIndex: r.interfaceIndex, dscp: 48),
+                                      interfaceIndex: r.interfaceIndex, dscp: 48, seal: seal),
               let audio = OpusAudio(frameMs: options.audioFrameMs) else { throw EngineError.socket }
         audioTx = tx
         self.audio = audio

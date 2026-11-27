@@ -1,5 +1,6 @@
 // UDP media sender: 24-byte header, 1376-byte shards, socket pinned to the discovery interface,
-// DSCP marking, and a short pause every 16 shards so a large IDR does not overflow the Wi-Fi queue.
+// DSCP marking, and a short pause every 16 shards so a large IDR does not overflow the Wi-Fi queue. A paired session's
+// frames are sealed whole before they are cut into shards (PROTOCOL.md 4).
 // SPDX-License-Identifier: GPL-3.0-or-later
 import Darwin
 import Foundation
@@ -8,6 +9,8 @@ import LuchProto
 public final class UdpSender {
     public let kind: MediaKind
     private let fd: Int32
+    /// The session's media key (from `ready` over TLS); nil for an older receiver, whose media is plain.
+    private let seal: MediaSeal?
     private let lock = NSLock()
     private var seq: UInt32 = 0
     private var bytesSent: UInt64 = 0
@@ -21,13 +24,15 @@ public final class UdpSender {
         public var latencySum: UInt64
     }
 
-    private init(kind: MediaKind, fd: Int32) {
+    private init(kind: MediaKind, fd: Int32, seal: MediaSeal?) {
         self.kind = kind
         self.fd = fd
+        self.seal = seal
     }
 
     /// Opens and connects the socket; nil on any failure (details are logged).
-    public static func open(kind: MediaKind, ip: String, port: UInt16, interfaceIndex: UInt32, dscp: Int32) -> UdpSender? {
+    public static func open(kind: MediaKind, ip: String, port: UInt16, interfaceIndex: UInt32, dscp: Int32,
+                            seal: MediaSeal? = nil) -> UdpSender? {
         let label = kind == .video ? "video" : "audio"
         let s = socket(AF_INET, SOCK_DGRAM, 0)
         guard s >= 0 else {
@@ -71,21 +76,28 @@ public final class UdpSender {
         if rc != 0 {
             return fail("connect \(ip):\(port) failed: \(errnoString())")
         }
-        log("udp \(label): \(ip):\(port) ifindex=\(interfaceIndex) dscp=\(dscp)")
-        return UdpSender(kind: kind, fd: s)
+        log("udp \(label): \(ip):\(port) ifindex=\(interfaceIndex) dscp=\(dscp)\(seal != nil ? ", sealed" : "")")
+        return UdpSender(kind: kind, fd: s, seal: seal)
     }
 
     /// Sends one access unit, sharded. Returns the number of datagrams written.
     @discardableResult
     public func send(frame: [UInt8], flags: PacketFlags, ptsUS: UInt32, hostLat: UInt16) -> Int {
         guard !frame.isEmpty else { return 0 }
-        let chunks = Proto.shards(frame)
-        let shards = UInt16(chunks.count)
-
         lock.lock()
         let sq = seq
         seq &+= 1
         lock.unlock()
+
+        // Sealed, the frame on the wire is the ciphertext and its tag, and every header says that length.
+        let length = frame.count + (seal == nil ? 0 : MediaSeal.tag)
+        let shards = UInt16((length + Proto.shardSize - 1) / Proto.shardSize)
+        func header(_ shard: Int) -> [UInt8] {
+            Proto.header(kind: kind, flags: flags, shard: UInt16(shard), shards: shards,
+                         seq: sq, ptsUS: ptsUS, frameLen: UInt32(length), hostLat: hostLat)
+        }
+        let body = seal.map { $0.seal(header: header(0), frame: frame) } ?? frame
+        let chunks = Proto.shards(body)
 
         var packet = [UInt8]()
         packet.reserveCapacity(Proto.headerSize + Proto.shardSize)
@@ -96,8 +108,7 @@ public final class UdpSender {
                 usleep(250)
             }
             packet.removeAll(keepingCapacity: true)
-            packet.append(contentsOf: Proto.header(kind: kind, flags: flags, shard: UInt16(i), shards: shards,
-                                                   seq: sq, ptsUS: ptsUS, frameLen: UInt32(frame.count), hostLat: hostLat))
+            packet.append(contentsOf: header(i))
             packet.append(contentsOf: chunk)
             let n = packet.withUnsafeBytes { Darwin.send(fd, $0.baseAddress, $0.count, 0) }
             if n < 0 {

@@ -122,6 +122,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         discovery.publish(name: identity.name, id: identity.id)
         startLocalServer()
         caster.onChange = { [weak self] in DispatchQueue.main.async { self?.rebuildMenu() } }
+        pairPrompt.start()
+        pairPrompt.onChange = { [weak self] in self?.rebuildMenu() }
+        ReportNotices.shared.start()
 
         rebuildMenu()
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.tick() }
@@ -138,11 +141,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - local API (luchctl)
 
     let caster = Caster()
+    let pairPrompt = PairPrompt()
 
     private func startLocalServer() {
         let server = LocalServer()
         server.handler = { [weak self] request in
             guard let self else { return ["error": "app is shutting down"] }
+            if PairingCommands.commands.contains(request["cmd"] as? String ?? "") {
+                var known: [Receiver] = []
+                DispatchQueue.main.sync { known = self.receivers }
+                return PairingCommands.handle(request, receivers: known)
+            }
             // What waits for a receiver's answer runs here, on the socket's thread, not on the main one.
             if Caster.commands.contains(request["cmd"] as? String ?? "") {
                 var known: [Receiver] = []
@@ -544,7 +553,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             } catch {
                 DispatchQueue.main.async {
-                    self?.state = "Error: \(error.localizedDescription)"
+                    // The TV shows a code: the window for it comes with the pairing, and the mirror starts after.
+                    if case ConnectError.pairingNeeded = error {
+                        self?.pairPrompt.after(receiver.id) {
+                            self?.startMirror(receiver, soundOnly: soundOnly, extend: extend, ultra: ultra)
+                        }
+                        self?.state = "Pairing with \(receiver.name): type the code the TV shows"
+                    } else {
+                        self?.state = "Error: \(error.localizedDescription)"
+                    }
                     self?.engine = nil
                     self?.rebuildMenu()
                 }
@@ -715,6 +732,8 @@ extension AppDelegate {
         m.addItem(.separator())
         m.addItem(volumeItem(r))
         m.addItem(.run("Put to Sleep", symbol: "moon") { [weak self] in self?.send(["cmd": "sleep"], to: r) })
+        m.addItem(.separator())
+        pairPrompt.menuItems(for: r) { [weak self] in self?.send(["cmd": "connect"], to: r) }.forEach(m.addItem)
         return m
     }
 
@@ -815,7 +834,10 @@ extension AppDelegate {
             guard let self else { return }
             let response = self.caster.run(request, on: r)
             DispatchQueue.main.async {
-                if let error = response["error"] as? String {
+                if let error = response["error"] as? String, error.contains("asks for pairing") {
+                    // The window for the code comes with the pairing; this is done again once paired.
+                    self.pairPrompt.after(r.id) { self.send(request, to: r) }
+                } else if let error = response["error"] as? String {
                     let alert = NSAlert()
                     alert.messageText = r.name
                     alert.informativeText = error

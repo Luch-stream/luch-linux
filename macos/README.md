@@ -140,7 +140,27 @@ python3 Tools/fakerecv.py --seconds 20 --out .tmp/capture.h264 &
   delivers ~1 fps on a still desktop);
 - menu bar with receiver list, live latency, warmth, quality, size, codec, bitrate, display and login item;
 - the client's battery, charging, thermal state and headroom, shown but never acted on silently;
-- `luchctl` over a Unix socket.
+- `luchctl` over a Unix socket;
+- pairing and encryption (below): TLS to the receiver, its certificate pinned, every frame sealed.
+
+## Pairing and encryption
+
+As luchd (PROTOCOL.md 3a, 4): a receiver that announces a TLS port (`tls=` in its TXT) is reached over TLS with
+this Mac's own certificate (`sender-cert.pem`, `sender-key.pem` readable only by you, in
+`~/Library/Application Support/Luch`, made once; no keychain). The first time, the TV shows a code; the app asks
+for it in a small window (or `luchctl pair`, or any `luchctl` command that connects asks on the terminal); both
+sides then pin each other's certificate (`paired.json`) and later connections need nothing. A paired receiver is
+never reached without TLS again. Over TLS each session's frames are sealed with AES-128-GCM before they are cut
+into datagrams (a 200 KB IDR takes about 25 µs on an M-series Mac), and the receiver hands over its crash and error
+reports (`luchctl reports`, a notification that opens the issue to file). Older receivers keep the plain port and
+are asked about on the TV each time.
+
+```bash
+luchctl pair [r] [code]      # pair now; the code may be given
+luchctl paired               # receivers this Mac is paired with
+luchctl forget <r>           # pair again next time (a receiver reset or reinstalled)
+luchctl reports              # what receivers reported; report <n> [open|dismiss]
+```
 
 ## Not yet
 

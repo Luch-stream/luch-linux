@@ -43,6 +43,8 @@ public final class CastSession {
     }
 
     public var isOpen: Bool { !ctl.isClosed }
+    /// TLS (v1), not the plain port of an older receiver.
+    public var isEncrypted: Bool { ctl.secure }
 
     private init(receiver: Receiver, ctl: ControlChannel, welcome: [String: Any]) {
         self.receiver = receiver
@@ -51,16 +53,12 @@ public final class CastSession {
     }
 
     public static func open(_ r: Receiver) throws -> CastSession {
-        guard let ctl = ControlChannel.open(ip: r.address, port: r.port, interfaceIndex: r.interfaceIndex) else {
-            throw CastError.bad("cannot reach \(r.name) (\(r.address):\(r.port))")
-        }
         let me = senderIdentity()
-        ctl.send(["t": "hello", "v": Int(Proto.version), "id": me.id, "name": me.name, "app": Proto.app,
-                  "want": ["media", "photo"]])
-        guard let welcome = ctl.waitFor("welcome", timeout: 5) else {
-            ctl.closeChannel("no welcome")
-            throw CastError.bad("\(r.name) did not answer")
-        }
+        // TLS and pairing when the receiver offers them; fails with "asks for pairing" while a code waits.
+        let c = try Connector.shared.open(r, hello: ["t": "hello", "v": Int(Proto.version), "id": me.id, "name": me.name,
+                                                     "app": Proto.app, "want": ["media", "photo", "reports"]])
+        let ctl = c.channel
+        let welcome = c.welcome
         let s = CastSession(receiver: r, ctl: ctl, welcome: welcome)
         s.volumeNow = welcome["volume"] as? [String: Any]
         ctl.onEvent = { [weak s] msg in s?.event(msg) }

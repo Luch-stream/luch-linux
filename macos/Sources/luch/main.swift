@@ -24,6 +24,7 @@ func usage() -> Never {
                   [--extend]   (a screen of its own for the TV, beside this Mac's)
                   [--ultra quality|mac|speed]   (the desktop drawn at one of the TV's own modes)
       luch sound [<name>] [--ip A.B.C.D] [--port N] [--seconds N] [--synthetic]
+    A receiver that asks for pairing shows a code: it is asked for here, then the command goes on.
     """
     FileHandle.standardError.write(Data((text + "\n").utf8))
     exit(2)
@@ -130,8 +131,16 @@ func runList(seconds: Double) {
 func resolveReceiver(_ a: Args) -> Receiver? {
     if let ip = a.ip {
         let index = a.iface.map { if_nametoindex($0) } ?? lanInterfaceIndex()
-        return Receiver(id: "manual", name: ip, model: "", address: ip,
-                        interfaceName: a.iface ?? "", interfaceIndex: index, port: a.port, service: ip)
+        var r = Receiver(id: "manual", name: ip, model: "", address: ip,
+                         interfaceName: a.iface ?? "", interfaceIndex: index, port: a.port, service: ip)
+        // No TXT record to say it: the receiver's id and TLS port from a probe, which shows nothing on the TV.
+        let me = senderIdentity()
+        if let w = Connector.probe(r, id: me.id, name: me.name) {
+            r.id = w["id"] as? String ?? r.id
+            r.name = w["name"] as? String ?? r.name
+            r.tlsPort = (w["tls_port"] as? NSNumber)?.uint16Value ?? 0
+        }
+        return r
     }
     let discovery = Discovery()
     discovery.start()
@@ -163,15 +172,13 @@ func runHardware() {
 /// Ask a receiver what it can do and show the selection without starting a session.
 func runCaps(_ a: Args) {
     guard let receiver = resolveReceiver(a) else { exit(1) }
-    guard let control = ControlChannel.open(ip: receiver.address, port: receiver.port,
-                                            interfaceIndex: receiver.interfaceIndex) else {
-        log("cannot connect to \(receiver.address):\(receiver.port)")
-        exit(1)
-    }
     let identity = senderIdentity()
-    control.send(["t": "hello", "v": Int(Proto.version), "id": identity.id, "name": identity.name,
-                  "app": Proto.app, "want": ["mirror"]])
-    guard let welcome = control.waitFor("welcome", timeout: 5), let caps = ReceiverCaps(welcome: welcome) else {
+    let connection = pairingIfAsked {
+        try Connector.shared.open(receiver, hello: ["t": "hello", "v": Int(Proto.version), "id": identity.id,
+                                                    "name": identity.name, "app": Proto.app, "want": ["mirror"]])
+    }
+    let control = connection.channel
+    guard let caps = ReceiverCaps(welcome: connection.welcome) else {
         log("no welcome from receiver")
         exit(1)
     }
@@ -210,12 +217,7 @@ case "mirror", "sound":
     log("receiver: \(receiver.name) \(receiver.address):\(receiver.port) via \(receiver.interfaceName.isEmpty ? "-" : receiver.interfaceName)")
     let engine = Engine(options: options)
     engine.terminateOnStop = true
-    do {
-        try engine.start(receiver: receiver)
-    } catch {
-        log("start failed: \(error.localizedDescription)")
-        exit(1)
-    }
+    pairingIfAsked { try engine.start(receiver: receiver) }
     engine.run()
     exit(0)
 case "":
