@@ -36,6 +36,12 @@ trait Luch1 {
     fn set_volume(&self, id: &str, what: &str) -> zbus::Result<String>;
     fn get_volume(&self, id: &str) -> zbus::Result<String>;
     fn doc_page(&self, id: &str, what: &str) -> zbus::Result<String>;
+    fn present(&self, id: &str, file: &str) -> zbus::Result<String>;
+    fn annotate(&self, id: &str, msg: &str) -> zbus::Result<()>;
+    #[zbus(property)]
+    fn quiet(&self) -> zbus::Result<String>;
+    #[zbus(property)]
+    fn set_quiet(&self, mode: &str) -> zbus::Result<()>;
     #[zbus(signal)]
     fn receivers_changed(&self) -> zbus::Result<()>;
     #[zbus(signal)]
@@ -49,7 +55,8 @@ const USAGE: &str = "usage: luchctl [list | refresh | connect [r] | disconnect [
                 | known | wake [r] | wake <r> learn | wake <r> mac|ble <value>|off | sleep [r]
                 | cast [r] <file|link>... [--title T] [--start m:ss] [--sub file] [--relay] [--paused]
                 | media [r] [play|pause|toggle|seek m:ss|skip s|rate x|audio id|sub id|sub off|watch]
-                | volume [r] [0..100|+|-|mute|unmute] | page [r] next|prev|<n> | browser install]
+                | volume [r] [0..100|+|-|mute|unmute] | page [r] next|prev|<n> | blank [r] on|off
+                | present [r] <file> | quiet [ask|on|off] | browser install]
        r = receiver id or name, optional when there is only one; mirror defaults to fast; no arguments: interactive
        wake: turns on a receiver luchd has talked to before (Wake-on-LAN, or the remote's Bluetooth signal that
        `wake <r> learn` picks up while you press the remote's power key with the receiver off)
@@ -57,6 +64,9 @@ const USAGE: &str = "usage: luchctl [list | refresh | connect [r] | disconnect [
        receiver, or with --relay through this computer (a VPN, a login); media: control it, no word: its state
        mirror audio: this computer's sound only, the TV as a speaker showing what plays (its remote's keys control
        the player here); cast also takes PDF, office files, text and code (others through LibreOffice)
+       present: shows a PDF or a presentation on the receiver and opens the presenter view here (current and
+       next slide, notes, timer; the mouse is a laser pointer, dragging draws, a clicker turns the slides)
+       quiet: hide notification banners while presenting or mirroring (ask: the GNOME extension asks once)
        browser install: lets the Luch browser extension reach luchd (Chrome, Chromium, Brave, Edge, Yandex, Firefox)";
 
 const AUDIO: [&str; 4] = ["auto", "on", "off", "sync"];
@@ -264,6 +274,43 @@ async fn run(args: &[String]) -> Result<(), String> {
                     .await
                     .map_err(e)?
             );
+        }
+        ["present", rest @ ..] if !rest.is_empty() && rest.len() <= 2 => {
+            let (key, file) = match rest {
+                [k, f] => (Some(*k), *f),
+                [f] => (None, *f),
+                _ => unreachable!(),
+            };
+            let id = find_id(&p, key).await?;
+            let url = p.present(&id, &absolute(file)).await.map_err(e)?;
+            println!("presenter view: {url}");
+            if std::process::Command::new("xdg-open")
+                .arg(&url)
+                .spawn()
+                .is_err()
+            {
+                println!("(open it in a browser)");
+            }
+        }
+        ["quiet"] => println!("{}", p.quiet().await.map_err(e)?),
+        ["quiet", mode] if ["ask", "on", "off"].contains(mode) => {
+            p.set_quiet(mode).await.map_err(e)?
+        }
+        ["blank", rest @ ..] if !rest.is_empty() && rest.len() <= 2 => {
+            let (key, on) = match rest {
+                [k, w] => (Some(*k), *w),
+                [w] => (None, *w),
+                _ => unreachable!(),
+            };
+            let on = match on {
+                "on" => true,
+                "off" => false,
+                w => return Err(format!("blank on|off, not {w}")),
+            };
+            let msg = serde_json::json!({"t": "blank", "on": on}).to_string();
+            p.annotate(&find_id(&p, key).await?, &msg)
+                .await
+                .map_err(e)?;
         }
         ["sleep", key @ ..] if key.len() <= 1 => {
             p.sleep(&find_id(&p, key.first().copied()).await?)
