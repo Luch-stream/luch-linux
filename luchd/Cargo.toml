@@ -24,6 +24,15 @@ rcgen = "0.13.2"
 # Relaying a link for a receiver (cast.rs): HTTPS to sites, streamed through.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 
+# The receiver's QR code through the camera (find/qr.rs): pure Rust, no system library.
+rqrr = "0.10"
+
+[dev-dependencies]
+# Pictures of QR codes for the tests of the reader.
+qrcode = { version = "0.14", default-features = false }
+# A paused clock for the tests of the discovery ladder.
+tokio = { workspace = true, features = ["test-util"] }
+
 [build-dependencies]
 cc = "1.11.3"
 pkg-config = "0.3.34"

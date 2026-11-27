@@ -703,6 +703,7 @@ mod tests {
             eprintln!("no session bus: skipped");
             return;
         };
+        let _one_bluez = crate::FAKE_BLUEZ.lock().await;
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Seen::default()));
         let bluez = zbus::connection::Builder::session()
             .unwrap()

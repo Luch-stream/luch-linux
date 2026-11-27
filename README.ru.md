@@ -130,6 +130,8 @@ gnome-extensions enable luch@toxblh.github.io           # на Wayland — по�
 luchctl                                   # интерактивно: список, f<N> fast, m<N> экран, w<N> окно, e<N> расширить, s<N> стоп
 luchctl list
 luchctl refresh                           # немедленная сверка; результаты приходят в TUI/watch
+luchctl find                              # mDNS не доходит: все адреса сети, Bluetooth, звук ТВ, его QR-код
+luchctl add 192.168.1.20                  # приёмник по адресу или QR-ссылке
 luchctl mirror                            # режим fast; имя приёмника можно не указывать, если он один
 luchctl mirror "XGIMI MoGo 4 Laser" window # или monitor | window | virtual
 luchctl stats                             # задержка, fps, битрейт в реальном времени

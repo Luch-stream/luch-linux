@@ -5,6 +5,7 @@ mod cast;
 mod discovery;
 mod display;
 mod enc;
+mod find;
 mod limits;
 mod mirror;
 mod mpris;
@@ -77,8 +78,55 @@ struct State {
     docs: HashMap<String, (u64, u64)>, // id -> (page, pages) of the document it shows for us (4g)
     /// Receivers we stopped: a report still on its way is no longer news, until the next media_ready.
     stopped: std::collections::HashSet<String>,
+    /// id -> how it was found: "mdns", "scan", "ble", "sound", "qr", "manual" (PROTOCOL.md 1).
+    via: HashMap<String, std::collections::BTreeSet<&'static str>>,
+    /// id -> its Bluetooth signal strength in dBm, when it was heard: the nearest is listed first.
+    rssi: HashMap<String, i16>,
+    /// id -> the one-time pairing token its QR code or sound gave, for the next hello.
+    tokens: HashMap<String, String>,
 }
 type Shared = Arc<Mutex<State>>;
+
+/// One fake BlueZ on the test bus at a time: the tests that make one share its well-known name.
+#[cfg(test)]
+pub(crate) static FAKE_BLUEZ: Mutex<()> = Mutex::const_new(());
+
+/// Lists a receiver found another way than mDNS (find.rs). One already listed keeps its entry; what is new is
+/// how it was found and how strong its signal is.
+async fn found(
+    st: &Shared,
+    conn: &Connection,
+    r: Receiver,
+    via: &'static str,
+    rssi: Option<i16>,
+    token: Option<String>,
+) {
+    let mut s = st.lock().await;
+    let fresh = !s.found.contains_key(&r.id);
+    let id = r.id.clone();
+    if fresh {
+        eprintln!(
+            "[luchd] found ({via}): {} id={} {}:{} via {}",
+            r.name, r.id, r.address, r.port, r.ifname
+        );
+        s.found.insert(id.clone(), r);
+    }
+    let new_way = s.via.entry(id.clone()).or_default().insert(via);
+    let stronger = rssi.is_some_and(|x| s.rssi.insert(id.clone(), x) != Some(x));
+    if let Some(t) = token {
+        s.tokens.insert(id, t);
+    }
+    drop(s);
+    if fresh || new_way || stronger {
+        changed(conn).await;
+    }
+}
+
+async fn find_progress(conn: &Connection, json: &str) {
+    if let Ok(e) = SignalEmitter::new(conn, p::DBUS_PATH) {
+        let _ = Luch::find_progress(&e, json).await;
+    }
+}
 
 /// Whether something accepts TCP at `address:port` within a second: tells a receiver that is on from one Avahi
 /// still lists after it went to standby.
@@ -96,6 +144,7 @@ struct Luch {
     sender_id: String,
     host: String,
     discovery: discovery::Discovery,
+    finder: find::Finder,
 }
 
 #[interface(name = "dev.luch.Luch1")]
@@ -119,13 +168,88 @@ impl Luch {
                 )
             })
             .collect();
-        rows.sort();
+        // Heard over Bluetooth: the strongest signal, the nearest TV, first; then by name.
+        rows.sort_by_cached_key(|r| {
+            let rssi = st.rssi.get(&r.0).copied().unwrap_or(i16::MIN);
+            (std::cmp::Reverse(rssi), r.1.to_lowercase(), r.0.clone())
+        });
         rows
     }
 
-    /// Starts an immediate Avahi rescan; results arrive via ReceiversChanged.
-    async fn refresh(&self) {
+    /// Starts an immediate Avahi rescan and, at most every 30 s, the automatic ladder (a sweep of the LAN, then
+    /// Bluetooth); results arrive via ReceiversChanged, what is tried via FindProgress.
+    async fn refresh(&self, #[zbus(connection)] conn: &Connection) {
         self.discovery.refresh();
+        let _ = self.finder.start(conn, "auto").await;
+    }
+
+    /// Climbs the discovery ladder (PROTOCOL.md 1): "auto" (mDNS and a sweep of the LAN, then Bluetooth), "all"
+    /// (then also the TV's sound through the microphone and its QR code through the camera: only when the person
+    /// asked), or some of "mdns,scan,ble,sound,qr" at once. Progress comes as FindProgress.
+    async fn find(&self, mode: String, #[zbus(connection)] conn: &Connection) -> fdo::Result<()> {
+        self.finder
+            .start(conn, &mode)
+            .await
+            .map_err(fdo::Error::InvalidArgs)
+    }
+
+    /// The last FindProgress (JSON).
+    async fn find_status(&self) -> String {
+        self.finder.status().await
+    }
+
+    /// How each listed receiver was found, and its Bluetooth signal: {"<id>":{"via":["mdns","ble"],"rssi":-48}}.
+    async fn discovered(&self) -> String {
+        let st = self.st.lock().await;
+        let all: serde_json::Map<String, Value> = st
+            .found
+            .keys()
+            .map(|id| {
+                let via: Vec<&str> = st
+                    .via
+                    .get(id)
+                    .map(|v| v.iter().copied().collect())
+                    .unwrap_or_default();
+                (id.clone(), json!({"via": via, "rssi": st.rssi.get(id)}))
+            })
+            .collect();
+        Value::Object(all).to_string()
+    }
+
+    /// Lists a receiver from what a person has: its QR link (luch://connect?...) or its address (host[:port]),
+    /// checked with a hello. Returns its id.
+    async fn add_receiver(
+        &self,
+        link: String,
+        #[zbus(connection)] conn: &Connection,
+    ) -> fdo::Result<String> {
+        let card = find::card::parse_link(&link).ok_or_else(|| {
+            fdo::Error::InvalidArgs(format!("not a receiver's link or address: {link}"))
+        })?;
+        let via = if link.trim().starts_with("luch://") {
+            "qr"
+        } else {
+            "manual"
+        };
+        let ctx = find::Ctx {
+            st: self.st.clone(),
+            sender_id: self.sender_id.clone(),
+            host: self.host.clone(),
+            discovery: self.discovery.clone(),
+        };
+        find::reach(&ctx, conn, &card, via, None)
+            .await
+            .map_err(fdo::Error::Failed)?;
+        let (ip, _) = card.addr.unwrap_or((std::net::Ipv4Addr::UNSPECIFIED, 0));
+        let st = self.st.lock().await;
+        st.found
+            .values()
+            .find(|r| {
+                r.address == ip.to_string()
+                    && (card.id.is_empty() || r.id.replace('-', "").starts_with(&card.id))
+            })
+            .map(|r| r.id.clone())
+            .ok_or_else(|| fdo::Error::Failed("receiver went away".into()))
     }
 
     /// Opens and keeps a control channel; returns the receiver's welcome as JSON.
@@ -148,12 +272,12 @@ impl Luch {
             .receiver(id.clone())
             .await
             .map_err(fdo::Error::Failed)?;
-        let (welcome, rd, wr, addrs) =
-            handshake(&r, &self.sender_id, &self.host)
-                .await
-                .map_err(|e| {
-                    fdo::Error::Failed(format!("{} ({}%{}): {e}", r.name, r.address, r.ifname))
-                })?;
+        let token = self.st.lock().await.tokens.remove(&id);
+        let (welcome, rd, wr, addrs) = handshake(&r, &self.sender_id, &self.host, token.as_deref())
+            .await
+            .map_err(|e| {
+                fdo::Error::Failed(format!("{} ({}%{}): {e}", r.name, r.address, r.ifname))
+            })?;
         let (tx, rx) = mpsc::channel(8);
         let (events, _) = broadcast::channel(16);
         {
@@ -736,6 +860,10 @@ impl Luch {
     #[zbus(signal)]
     async fn receivers_changed(e: &SignalEmitter<'_>) -> zbus::Result<()>;
 
+    /// What the discovery ladder is trying (JSON, as FindStatus).
+    #[zbus(signal)]
+    async fn find_progress(e: &SignalEmitter<'_>, status: &str) -> zbus::Result<()>;
+
     /// A receiver's `media_state` changed (JSON); {"state":"stopped"} when it ended.
     #[zbus(signal)]
     async fn media_state_changed(e: &SignalEmitter<'_>, id: &str, state: &str) -> zbus::Result<()>;
@@ -789,32 +917,45 @@ async fn send(wr: &mut OwnedWriteHalf, v: &Value) -> io::Result<()> {
     wr.write_all(line.as_bytes()).await
 }
 
-/// Socket pinned to the interface the receiver was discovered on: the default
-/// route may be a full-tunnel VPN, so it must never decide where this goes.
-async fn handshake(
-    r: &Receiver,
-    id: &str,
-    host: &str,
+/// What a sender says first (section 3). `token`: the one-time pairing token from the receiver's QR code or sound
+/// (section 1e). `probe`: discovery only asks who is there, and says bye after the welcome.
+fn hello(id: &str, host: &str, token: Option<&str>, probe: bool) -> Value {
+    let mut h = json!({"t": "hello", "v": p::VERSION, "id": id, "name": host, "app": p::APP,
+                       "want": ["mirror", "media", "photo", "reports"]});
+    if let Some(t) = token {
+        h["token"] = json!(t);
+    }
+    if probe {
+        h["probe"] = json!(true);
+        h["want"] = json!([]);
+    }
+    h
+}
+
+/// Connects to `addr` from `ifname` (section 2: the default route may be a full-tunnel VPN, so it must never decide
+/// where this goes; None only for loopback), says `hello` and reads the welcome.
+async fn open_channel(
+    addr: SocketAddr,
+    ifname: Option<&str>,
+    hello: &Value,
+    connect_in: Duration,
 ) -> io::Result<(
     Value,
     Reader,
     OwnedWriteHalf,
     (std::net::IpAddr, std::net::IpAddr),
 )> {
-    let addr: SocketAddr = format!("{}:{}", r.address, r.port)
-        .parse()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     let sock = TcpSocket::new_v4()?;
-    sock.bind_device(Some(r.ifname.as_bytes()))?;
-    let stream = timeout(HANDSHAKE_TIMEOUT, sock.connect(addr))
+    if let Some(i) = ifname {
+        sock.bind_device(Some(i.as_bytes()))?;
+    }
+    let stream = timeout(connect_in, sock.connect(addr))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timed out"))??;
     let addrs = (stream.local_addr()?.ip(), stream.peer_addr()?.ip());
     let (rd, mut wr) = stream.into_split();
     let mut rd = BufReader::new(rd);
-    let hello = json!({"t": "hello", "v": p::VERSION, "id": id, "name": host, "app": p::APP,
-                       "want": ["mirror", "media", "photo", "reports"]});
-    send(&mut wr, &hello).await?;
+    send(&mut wr, hello).await?;
     let welcome = timeout(HANDSHAKE_TIMEOUT, read_msg(&mut rd))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "no welcome"))??
@@ -826,6 +967,51 @@ async fn handshake(
         ));
     }
     Ok((welcome, rd, wr, addrs))
+}
+
+/// Socket pinned to the interface the receiver was discovered on.
+async fn handshake(
+    r: &Receiver,
+    id: &str,
+    host: &str,
+    token: Option<&str>,
+) -> io::Result<(
+    Value,
+    Reader,
+    OwnedWriteHalf,
+    (std::net::IpAddr, std::net::IpAddr),
+)> {
+    let addr: SocketAddr = format!("{}:{}", r.address, r.port)
+        .parse()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    open_channel(
+        addr,
+        Some(&r.ifname),
+        &hello(id, host, token, false),
+        HANDSHAKE_TIMEOUT,
+    )
+    .await
+}
+
+/// Who answers at `addr`: the welcome of a probe hello, then bye (discovery, find.rs). The welcome must come within
+/// the 2 s a receiver has (section 3).
+async fn probe(
+    addr: SocketAddr,
+    ifname: Option<&str>,
+    id: &str,
+    host: &str,
+    token: Option<&str>,
+    connect_in: Duration,
+) -> io::Result<Value> {
+    let h = hello(id, host, token, true);
+    let (welcome, _rd, mut wr, _) = timeout(
+        connect_in + find::scan::WELCOME_TIMEOUT,
+        open_channel(addr, ifname, &h, connect_in),
+    )
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "no welcome"))??;
+    let _ = send(&mut wr, &json!({"t": "bye"})).await;
+    Ok(welcome)
 }
 
 async fn run_channel(
@@ -1807,6 +1993,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     };
     let (discovery, worker) = discovery::Discovery::new();
+    let finder = find::Finder::new(find::Ctx {
+        st: st.clone(),
+        sender_id: id.clone(),
+        host: host.clone(),
+        discovery: discovery.clone(),
+    });
     let conn = zbus::connection::Builder::session()?
         .name(p::DBUS_NAME)?
         .serve_at(
@@ -1816,10 +2008,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 sender_id: id.clone(),
                 host: host.clone(),
                 discovery,
+                finder: finder.clone(),
             },
         )?
         .build()
         .await?;
+    {
+        // The first climb right away: a network without mDNS shows its receivers without anyone asking.
+        let conn = conn.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let _ = finder.start(&conn, "auto").await;
+        });
+    }
     eprintln!(
         "[luchd] {} id={id} name={host}; browsing {}",
         p::APP,
