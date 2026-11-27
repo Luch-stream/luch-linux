@@ -156,6 +156,15 @@ The sound for the next show to a receiver, remembered in `~/.config/luch/audio`:
 | `off` | not sent: the picture only, the lowest latency |
 | `sync` | the receiver holds each picture back by its audio delay, so both come out together |
 
+### `LatencyLab(s id, b on) → s`
+
+The latency lab ([latency-lab.md](latency-lab.md)). `on`: serves a page on `127.0.0.1` (a free port) and returns its
+address; opened full screen, it counts this screen's refreshes in Gray code under a QR code of the stream's setup
+(version, capture mode, codec, bitrate, size, ping, luchd's own figures). The receiver is told
+`{"t":"latency","on":true}` (PROTOCOL.md 4h, now or when mirroring to it starts) and draws its own pattern in the TV's
+bottom right corner. Off: the page's server stops, the receiver takes its pattern away, `""` is returned. `id` may be
+empty while exactly one receiver is mirroring.
+
 ### `Reports() → s`, `ReportUrl(s id) → s`, `DismissReport(s id)`
 
 Crash and error reports the receivers handed over (luchd asks for them with `"want": ["reports"]`), as a JSON array,

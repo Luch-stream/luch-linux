@@ -36,6 +36,7 @@ trait Luch1 {
     fn set_volume(&self, id: &str, what: &str) -> zbus::Result<String>;
     fn get_volume(&self, id: &str) -> zbus::Result<String>;
     fn doc_page(&self, id: &str, what: &str) -> zbus::Result<String>;
+    fn latency_lab(&self, id: &str, on: bool) -> zbus::Result<String>;
     #[zbus(signal)]
     fn receivers_changed(&self) -> zbus::Result<()>;
     #[zbus(signal)]
@@ -49,7 +50,8 @@ const USAGE: &str = "usage: luchctl [list | refresh | connect [r] | disconnect [
                 | known | wake [r] | wake <r> learn | wake <r> mac|ble <value>|off | sleep [r]
                 | cast [r] <file|link>... [--title T] [--start m:ss] [--sub file] [--relay] [--paused]
                 | media [r] [play|pause|toggle|seek m:ss|skip s|rate x|audio id|sub id|sub off|watch]
-                | volume [r] [0..100|+|-|mute|unmute] | page [r] next|prev|<n> | browser install]
+                | volume [r] [0..100|+|-|mute|unmute] | page [r] next|prev|<n> | browser install
+                | latency [on|off] [r] | latency analyze <video> [--out prefix] [--fps n] [--readout-ms ms]]
        r = receiver id or name, optional when there is only one; mirror defaults to fast; no arguments: interactive
        wake: turns on a receiver luchd has talked to before (Wake-on-LAN, or the remote's Bluetooth signal that
        `wake <r> learn` picks up while you press the remote's power key with the receiver off)
@@ -57,7 +59,15 @@ const USAGE: &str = "usage: luchctl [list | refresh | connect [r] | disconnect [
        receiver, or with --relay through this computer (a VPN, a login); media: control it, no word: its state
        mirror audio: this computer's sound only, the TV as a speaker showing what plays (its remote's keys control
        the player here); cast also takes PDF, office files, text and code (others through LibreOffice)
-       browser install: lets the Luch browser extension reach luchd (Chrome, Chromium, Brave, Edge, Yandex, Firefox)";
+       browser install: lets the Luch browser extension reach luchd (Chrome, Chromium, Brave, Edge, Yandex, Firefox)
+       latency: photon-to-photon latency with a phone filming both screens at 240 fps (docs/latency-lab.md)";
+
+const LAB_STEPS: &str =
+    "latency lab on: the page opens in the browser, the TV draws its own pattern in a corner.
+  1. click the page for full screen, mirror in the mode to test (`luchctl mirror fast`)
+  2. film both screens in one shot, 240 fps, 10 s, the phone still (docs/latency-lab.md)
+  3. luchctl latency analyze VIDEO   writes a report to attach to an issue
+  luchctl latency off   when done";
 
 const AUDIO: [&str; 4] = ["auto", "on", "off", "sync"];
 
@@ -496,6 +506,27 @@ async fn run(args: &[String]) -> Result<(), String> {
                 "now add the Luch extension to the browser (browser-extension/ in this repository)"
             );
         }
+        ["latency", rest @ ..] => {
+            let (on, key) = match rest {
+                [] => (true, None),
+                ["on" | "off", key @ ..] if key.len() <= 1 => {
+                    (rest[0] == "on", key.first().copied())
+                }
+                [key] => (true, Some(*key)),
+                _ => return Err(USAGE.into()),
+            };
+            let id = match key {
+                Some(k) => find_id(&p, Some(k)).await?,
+                None => String::new(), // luchd takes the receiver that is mirroring
+            };
+            let url = p.latency_lab(&id, on).await.map_err(e)?;
+            if on {
+                println!("{LAB_STEPS}\n\npage: {url}");
+                let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+            } else {
+                println!("latency lab off");
+            }
+        }
         [] => tui(&p).await.map_err(e)?,
         _ => return Err(USAGE.into()),
     }
@@ -759,6 +790,14 @@ async fn main() {
         };
         if let Err(msg) = r.await {
             eprintln!("luchctl native host: {msg}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    // Analysing a video needs no luchd: it may run on any computer the video was copied to.
+    if args.len() >= 2 && args[0] == "latency" && args[1] == "analyze" {
+        if let Err(msg) = luch_latency::cli::analyze(&args[2..]) {
+            eprintln!("luchctl: {msg}");
             std::process::exit(1);
         }
         return;

@@ -5,6 +5,7 @@ mod cast;
 mod discovery;
 mod display;
 mod enc;
+mod latency;
 mod limits;
 mod mirror;
 mod mpris;
@@ -77,6 +78,10 @@ struct State {
     docs: HashMap<String, (u64, u64)>, // id -> (page, pages) of the document it shows for us (4g)
     /// Receivers we stopped: a report still on its way is no longer news, until the next media_ready.
     stopped: std::collections::HashSet<String>,
+    /// id -> how its running session captures ("fast", "monitor", ...), for the latency lab's QR code.
+    sources: HashMap<String, String>,
+    /// The latency lab, while it is on (docs/latency-lab.md).
+    lab: Option<latency::Lab>,
 }
 type Shared = Arc<Mutex<State>>;
 
@@ -422,6 +427,42 @@ impl Luch {
     /// manufacturer data, hex); an empty `value` forgets it.
     async fn set_wake(&self, id: String, kind: String, value: String) -> fdo::Result<()> {
         wake::set(&id, &kind, &value).map_err(fdo::Error::InvalidArgs)
+    }
+
+    /// The latency lab (docs/latency-lab.md). On: returns the address of a page to open full screen on this computer,
+    /// and the receiver draws its own pattern over the mirrored picture. Off: both go, and "" is returned. `id` may be
+    /// "" while exactly one receiver is mirroring.
+    async fn latency_lab(&self, id: String, on: bool) -> fdo::Result<String> {
+        let id = if id.is_empty() {
+            let s = self.st.lock().await;
+            match (s.mirrors.keys().next(), s.mirrors.len()) {
+                (Some(one), 1) => one.clone(),
+                _ => s.lab.as_ref().map(|l| l.id.clone()).ok_or_else(|| {
+                    fdo::Error::InvalidArgs(
+                        "name the receiver: none or several are mirroring".into(),
+                    )
+                })?,
+            }
+        } else {
+            id
+        };
+        if on && !self.st.lock().await.found.contains_key(&id) {
+            return Err(fdo::Error::InvalidArgs(format!("unknown receiver {id}")));
+        }
+        let url = if on {
+            let lab = latency::open(self.st.clone(), id.clone())
+                .await
+                .map_err(|e| fdo::Error::Failed(format!("latency lab: {e}")))?;
+            let url = lab.url.clone();
+            self.st.lock().await.lab = Some(lab);
+            url
+        } else {
+            self.st.lock().await.lab = None;
+            String::new()
+        };
+        // Until a control channel is open, `start_mirror` tells the receiver.
+        let _ = self.send_to(&id, json!({"t": "latency", "on": on})).await;
+        Ok(url)
     }
 
     async fn stop_mirror(&self, id: String) -> fdo::Result<()> {
@@ -1088,6 +1129,7 @@ async fn start_mirror(
     source: &str,
     requested: (u32, u32),
 ) -> fdo::Result<()> {
+    let source_name = source;
     let mirror169 = source == "fast169";
     let audio_only = source == "audio";
     let kms = source == "fast" || mirror169;
@@ -1202,6 +1244,12 @@ async fn start_mirror(
         let mut s = st.lock().await;
         s.mirrors.insert(id.to_string(), stop_tx);
         s.stats.insert(id.to_string(), stats.clone());
+        s.sources.insert(id.to_string(), source_name.to_string());
+        if s.lab.as_ref().is_some_and(|l| l.id == id) {
+            let _ = c
+                .cmd
+                .try_send(Cmd::Send(json!({"t": "latency", "on": true})));
+        }
     }
     changed(conn).await;
     let (st, conn, id) = (st.clone(), conn.clone(), id.to_string());
@@ -1239,6 +1287,7 @@ async fn start_mirror(
             let mut s = st.lock().await;
             s.mirrors.remove(&id);
             s.stats.remove(&id);
+            s.sources.remove(&id);
         }
         changed(&conn).await;
     });

@@ -22,6 +22,7 @@ Measured on an Intel Arrow Lake laptop → XGIMI MoGo 4 Laser over Wi‑Fi, full
 | `luchd` | User daemon. Finds receivers (`_luch._tcp` via Avahi), announces this machine (`_luchsrc._tcp`), keeps control channels, captures and streams, serves the D-Bus API `dev.luch.Luch1`. |
 | `luch-kms` | Small helper for the lowest-latency mode: reads the scanout framebuffer straight from KMS, converts it to NV12 with EGL shaders, encodes with VA-API. The only part that needs a capability (`CAP_SYS_ADMIN`). |
 | `luchctl` | CLI and interactive terminal screen. |
+| `luch-latency` | The latency lab: the test pattern, and the analyser of a phone's 240 fps video of both screens ([docs/latency-lab.md](docs/latency-lab.md)). |
 | `gnome-extension/` | GNOME Shell Quick Settings toggle «Luch». |
 | `docs/dbus.md` | D-Bus API reference. |
 
@@ -145,6 +146,8 @@ luchctl cast https://example.com/v.m3u8   # the receiver fetches the link; add -
 luchctl media                             # what plays: position, speed, sound tracks, subtitles
 luchctl media pause                       # play | pause | toggle | seek 1:30 | skip -10 | rate 1.5 | audio a2 | sub s0 | sub off
 luchctl media watch                       # follow it, also changes made with the TV's remote
+luchctl latency on                        # latency lab: a page to film with the TV at 240 fps (docs/latency-lab.md)
+luchctl latency analyze clip.mov          # photon-to-photon latency from that video, as a report for an issue
 ```
 
 **Casting.** A cast file is not mirrored: the receiver plays the original, picking the best version its screen can

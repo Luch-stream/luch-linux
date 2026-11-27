@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Luch latency lab</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; cursor: none; }
+  canvas { display: block; width: 100vw; height: 100vh; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<script>
+// Luch latency lab, the computer's side (docs/latency-lab.md). Counts this screen's vsyncs and draws the count as Gray
+// code under a QR code of how the stream is set up. luchd hands over the layout and the QR code; this page only draws.
+'use strict';
+const canvas = document.getElementById('c');
+const g = canvas.getContext('2d', { alpha: false });
+let data = null;        // {layout, qr: ["0101..", ...], text}
+let n = 0;              // the vsync count: one per refresh, also for refreshes this page missed
+let missed = 0;
+let last = null;        // the previous frame's timestamp
+const deltas = [];      // recent frame intervals, for the refresh period
+const log = [];         // [count, timestamp] of the last frames, for "S"
+let period = 1000 / 60;
+
+function gray(v) { v %= 1 << data.layout.bits; return v ^ (v >> 1); }
+
+function dark(cell, count) {
+  if (cell === 0) return false;
+  if (cell === 1) return true;
+  return ((gray(count) >> (data.layout.bits - 1 - (cell - 2))) & 1) === 1;
+}
+
+function resize() {
+  const k = window.devicePixelRatio || 1;
+  canvas.width = Math.round(innerWidth * k);
+  canvas.height = Math.round(innerHeight * k);
+  redraw = true;
+}
+
+let redraw = true;
+
+// Pattern units to canvas pixels: the QR code's side is layout.side screen heights, its corner at layout.origin.
+function px(x, y) {
+  const H = canvas.height, L = data.layout, u = L.side * H;
+  return [Math.round(L.origin[0] * H + x * u), Math.round(L.origin[1] * H + y * u)];
+}
+
+function fill(x0, y0, x1, y1, colour) {
+  const [a, b] = px(x0, y0), [c, d] = px(x1, y1);
+  g.fillStyle = colour;
+  g.fillRect(a, b, c - a, d - b);
+}
+
+function drawStill() {
+  const L = data.layout, H = canvas.height;
+  g.fillStyle = '#000';
+  g.fillRect(0, 0, canvas.width, canvas.height);
+  fill(L.box[0], L.box[1], L.box[2], L.box[3], '#fff');
+  const size = data.qr.length;
+  for (let y = 0; y < size; y++) {
+    for (let x = 0; x < size; x++) {
+      if (data.qr[y][x] === '1') fill(x / size, y / size, (x + 1) / size, (y + 1) / size, '#000');
+    }
+  }
+}
+
+function drawCount(now) {
+  const L = data.layout, H = canvas.height;
+  for (let i = 0; i < 2 + L.bits; i++) {
+    const row = Math.floor(i / L.per_row), col = i % L.per_row;
+    fill(col * L.cell_w, L.rows[row][0], (col + 1) * L.cell_w, L.rows[row][1], dark(i, n) ? '#000' : '#fff');
+  }
+  // The big number for people, right of the pattern and clear of the corner where the TV draws its own.
+  const [right] = px(L.box[2], 0);
+  const x = right + 0.04 * H;
+  g.fillStyle = '#000';
+  g.fillRect(x, 0.05 * H, 0.5 * H, 0.42 * H);
+  g.fillStyle = '#fff';
+  g.textBaseline = 'top';
+  g.font = `bold ${Math.round(0.15 * H)}px monospace`;
+  g.fillText(String(n % 100000).padStart(5, '0'), x, 0.06 * H);
+  g.font = `${Math.round(0.028 * H)}px sans-serif`;
+  g.fillStyle = '#aaa';
+  const lines = ['Luch latency lab', `${(1000 / period).toFixed(2)} Hz · missed ${missed}`,
+                 'click: full screen · S: save vsync times'];
+  lines.forEach((t, k) => g.fillText(t, x, 0.25 * H + k * 0.045 * H));
+}
+
+function frame(now) {
+  requestAnimationFrame(frame);
+  if (last !== null) {
+    const d = now - last;
+    deltas.push(d);
+    if (deltas.length > 120) deltas.shift();
+    const sorted = deltas.slice().sort((a, b) => a - b);
+    period = sorted[sorted.length >> 1];
+    // A late frame still counts every refresh that went by: the counter is a clock, not a frame number.
+    const steps = Math.max(1, Math.round(d / period));
+    missed += steps - 1;
+    n += steps;
+  }
+  last = now;
+  log.push([n, now]);
+  if (log.length > 6000) log.shift();
+  if (!data) return;
+  if (redraw) { drawStill(); redraw = false; }
+  drawCount(now);
+}
+
+async function refresh() {
+  try {
+    const r = await fetch(`/meta?hz=${(1000 / period).toFixed(2)}&miss=${missed}`, { cache: 'no-store' });
+    const d = await r.json();
+    if (!data || d.text !== data.text) redraw = true;
+    data = d;
+  } catch (e) { /* luchd went away: keep counting with what we have */ }
+}
+
+addEventListener('resize', resize);
+addEventListener('click', () => document.documentElement.requestFullscreen?.());
+addEventListener('keydown', e => {
+  if (e.key === 's' || e.key === 'S') {
+    const blob = new Blob([JSON.stringify({ period_ms: period, missed, frames: log })], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'luch-vsync.json';
+    a.click();
+  }
+});
+resize();
+refresh();
+setInterval(refresh, 2000);
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
