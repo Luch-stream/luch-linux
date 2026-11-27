@@ -2,6 +2,7 @@
 
 use futures_util::StreamExt;
 use luch_proto::ReceiverRow;
+use std::io::IsTerminal;
 
 mod choice;
 mod native;
@@ -37,6 +38,13 @@ trait Luch1 {
     fn set_volume(&self, id: &str, what: &str) -> zbus::Result<String>;
     fn get_volume(&self, id: &str) -> zbus::Result<String>;
     fn doc_page(&self, id: &str, what: &str) -> zbus::Result<String>;
+    fn pair(&self, id: &str, code: &str) -> zbus::Result<String>;
+    fn pairing(&self, id: &str) -> zbus::Result<String>;
+    fn paired(&self) -> zbus::Result<String>;
+    fn forget(&self, id: &str) -> zbus::Result<()>;
+    fn web_clients(&self) -> zbus::Result<String>;
+    fn forget_web(&self, id: &str) -> zbus::Result<()>;
+    fn approve_web(&self, request: &str, allow: bool) -> zbus::Result<()>;
     #[zbus(signal)]
     fn receivers_changed(&self) -> zbus::Result<()>;
     #[zbus(signal)]
@@ -50,7 +58,8 @@ const USAGE: &str = "usage: luchctl [list | refresh | connect [r] | disconnect [
                 | known | wake [r] | wake <r> learn | wake <r> mac|ble <value>|off | sleep [r]
                 | cast [r] <file|link>... [--title T] [--start m:ss] [--sub file] [--relay] [--paused]
                 | media [r] [play|pause|toggle|seek m:ss|skip s|rate x|audio id|sub id|sub off|watch]
-                | volume [r] [0..100|+|-|mute|unmute] | page [r] next|prev|<n> | browser install]
+                | volume [r] [0..100|+|-|mute|unmute] | page [r] next|prev|<n> | browser install
+                | pair [r] [code] | paired | forget <r> | web [allow|deny <code> | forget <n>]]
        r = receiver id or name, optional when there is only one; mirror defaults to fast; no arguments: interactive
        wake: turns on a receiver luchd has talked to before (Wake-on-LAN, or the remote's Bluetooth signal that
        `wake <r> learn` picks up while you press the remote's power key with the receiver off)
@@ -58,7 +67,10 @@ const USAGE: &str = "usage: luchctl [list | refresh | connect [r] | disconnect [
        receiver, or with --relay through this computer (a VPN, a login); media: control it, no word: its state
        mirror audio: this computer's sound only, the TV as a speaker showing what plays (its remote's keys control
        the player here); cast also takes PDF, office files, text and code (others through LibreOffice)
-       browser install: lets the Luch browser extension reach luchd (Chrome, Chromium, Brave, Edge, Yandex, Firefox)";
+       browser install: lets the Luch browser extension reach luchd (Chrome, Chromium, Brave, Edge, Yandex, Firefox)
+       pair: the first connection to a receiver shows a code on the TV, typed here (any command that connects asks
+       for it too); both then know each other and later connections need nothing. forget: pair again next time
+       web: the browsers allowed to watch this screen (luchd's web receiver), and the one waiting to be allowed";
 
 const AUDIO: [&str; 4] = ["auto", "on", "off", "sync"];
 
@@ -398,6 +410,81 @@ async fn run(args: &[String]) -> Result<(), String> {
                 Some("dismiss") => p.dismiss_report(id).await.map_err(e)?,
                 Some(other) => return Err(format!("report {n} open|dismiss, not {other}")),
             }
+        }
+        ["pair", rest @ ..] if rest.len() <= 2 => {
+            let (key, code) = match rest {
+                [c] if pair_code(c) => (None, Some(*c)),
+                [k] => (Some(*k), None),
+                [k, c] => (Some(*k), Some(*c)),
+                _ => (None, None),
+            };
+            pair_with(&p, &find_id(&p, key).await?, code).await?;
+        }
+        ["paired"] => {
+            let all: Vec<serde_json::Value> =
+                serde_json::from_str(&p.paired().await.map_err(e)?).unwrap_or_default();
+            if all.is_empty() {
+                println!("(not paired with any receiver yet: `luchctl pair`)");
+            }
+            for r in &all {
+                println!(
+                    "{:<38} {:<20} {}",
+                    r["id"].as_str().unwrap_or(""),
+                    r["name"].as_str().unwrap_or(""),
+                    &r["fp"].as_str().unwrap_or("")[..16.min(r["fp"].as_str().unwrap_or("").len())]
+                );
+            }
+        }
+        ["forget", key] => {
+            let id = match find_id(&p, Some(key)).await {
+                Ok(id) => id,
+                Err(_) => key.to_string(), // a receiver that is off: by its id
+            };
+            p.forget(&id).await.map_err(e)?;
+            println!("forgotten: the next connection pairs again with a new code");
+        }
+        ["web"] => {
+            let all: Vec<serde_json::Value> =
+                serde_json::from_str(&p.web_clients().await.map_err(e)?).unwrap_or_default();
+            if all.is_empty() {
+                println!("(no browser allowed yet: open luchd's web receiver page and confirm the code here)");
+            }
+            for (n, b) in all.iter().enumerate() {
+                println!(
+                    "{}. {} {}{}",
+                    n + 1,
+                    b["name"].as_str().unwrap_or("?"),
+                    b["address"].as_str().unwrap_or(""),
+                    if b["waiting"] == true {
+                        format!(" waiting, code {}", b["code"].as_str().unwrap_or("?"))
+                    } else {
+                        String::new()
+                    }
+                );
+            }
+        }
+        ["web", answer @ ("allow" | "deny"), code] => {
+            let all: Vec<serde_json::Value> =
+                serde_json::from_str(&p.web_clients().await.map_err(e)?).unwrap_or_default();
+            let b = all
+                .iter()
+                .find(|b| b["waiting"] == true && b["code"] == *code)
+                .ok_or(format!("no browser waiting with the code {code}"))?;
+            p.approve_web(b["id"].as_str().unwrap_or(""), *answer == "allow")
+                .await
+                .map_err(e)?;
+        }
+        ["web", "forget", n] => {
+            let all: Vec<serde_json::Value> =
+                serde_json::from_str(&p.web_clients().await.map_err(e)?).unwrap_or_default();
+            let b = n
+                .parse::<usize>()
+                .ok()
+                .and_then(|n| all.get(n.wrapping_sub(1)))
+                .ok_or(format!("no browser {n} (see `luchctl web`)"))?;
+            p.forget_web(b["id"].as_str().unwrap_or(""))
+                .await
+                .map_err(e)?;
         }
         ["known"] => {
             let (all, _) = known(&p, None).await?;
@@ -769,15 +856,129 @@ async fn main() {
         }
         return;
     }
-    if let Err(msg) = run(&args).await {
+    let mut result = run(&args).await;
+    // A receiver that asks for pairing: the code is typed here, then the command goes on.
+    if let Err(msg) = &result {
+        if let (Some(id), true) = (pairing_id(msg), std::io::stdin().is_terminal()) {
+            if args.first().map(String::as_str) != Some("pair") {
+                let id = id.to_string();
+                result = async {
+                    let conn = zbus::Connection::session()
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    let p = Luch1Proxy::new(&conn).await.map_err(|e| e.to_string())?;
+                    pair_with(&p, &id, None).await
+                }
+                .await;
+                if result.is_ok() {
+                    result = run(&args).await;
+                }
+            }
+        }
+    }
+    if let Err(msg) = result {
         eprintln!("luchctl: {msg}");
         std::process::exit(1);
     }
 }
 
+/// The receiver in luchd's "asks for pairing ... `luchctl pair <id>`" refusal.
+fn pairing_id(msg: &str) -> Option<&str> {
+    if !msg.contains("asks for pairing") {
+        return None;
+    }
+    let rest = &msg[msg.find("`luchctl pair ")? + "`luchctl pair ".len()..];
+    Some(&rest[..rest.find('`')?])
+}
+
+/// Whether a word is a pairing code (six digits) rather than a receiver's name.
+fn pair_code(w: &str) -> bool {
+    w.len() == 6 && w.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Pairs with a receiver: connects (the TV shows a code, maybe after its person allows it), asks for the code
+/// unless given, and hands it to luchd. Already paired: says so.
+async fn pair_with(p: &Luch1Proxy<'_>, id: &str, code: Option<&str>) -> Result<(), String> {
+    let reason = |e: zbus::Error| match e {
+        zbus::Error::MethodError(_, Some(d), _) => d,
+        e => e.to_string(),
+    };
+    match p.connect(id).await {
+        Ok(_) => {
+            println!("already paired: the receiver lets this computer in");
+            return Ok(());
+        }
+        Err(e) => {
+            let msg = reason(e);
+            if msg.starts_with("already connected") {
+                let info: serde_json::Value =
+                    serde_json::from_str(&p.info(id).await.map_err(reason)?).unwrap_or_default();
+                println!(
+                    "{}",
+                    if info["paired"] == true {
+                        "already paired and connected"
+                    } else {
+                        "connected to an older receiver: it has no pairing and no encryption"
+                    }
+                );
+                return Ok(());
+            }
+            if pairing_id(&msg).is_none() {
+                return Err(msg);
+            }
+        }
+    }
+    let mut told = false;
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(70);
+    let name = loop {
+        let st: serde_json::Value =
+            serde_json::from_str(&p.pairing(id).await.map_err(reason)?).unwrap_or_default();
+        let name = st["name"].as_str().unwrap_or("the receiver").to_string();
+        match st["step"].as_str() {
+            Some("code") => break name,
+            Some("allow") if !told => {
+                println!("{name} is asking its viewers first: allow the connection on the TV");
+                told = true;
+            }
+            Some("failed") => return Err(st["reason"].as_str().unwrap_or("pairing failed").into()),
+            Some("paired") => return Ok(()),
+            _ => {}
+        }
+        if std::time::Instant::now() > until {
+            return Err("nobody answered on the TV".into());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    };
+    let typed = match code {
+        Some(c) => c.to_string(),
+        None => {
+            use std::io::Write;
+            print!("Code shown on {name}: ");
+            let _ = std::io::stdout().flush();
+            let mut line = String::new();
+            std::io::stdin()
+                .read_line(&mut line)
+                .map_err(|e| e.to_string())?;
+            line.trim().to_string()
+        }
+    };
+    p.pair(id, &typed).await.map_err(reason)?;
+    println!("paired with {name}: from now on it lets this computer in");
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refusal_that_asks_for_pairing_names_the_receiver() {
+        let msg =
+            "Living room TV asks for pairing: enter the code it shows (`luchctl pair 0b6f-tv`)";
+        assert_eq!(pairing_id(msg), Some("0b6f-tv"));
+        assert_eq!(pairing_id("Living room TV refused the connection"), None);
+        assert!(pair_code("123456") && !pair_code("Living") && !pair_code("12345"));
+    }
 
     #[test]
     fn cast_arguments() {

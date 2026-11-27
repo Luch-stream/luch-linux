@@ -49,6 +49,7 @@ pub const KIND_VIDEO: u8 = 1;
 pub const KIND_AUDIO: u8 = 2;
 pub const F_IDR: u8 = 1;
 pub const F_CONFIG: u8 = 2;
+pub const F_PARITY: u8 = 4;
 
 /// Latest numbers for one mirroring session, shared with D-Bus `Stats`.
 pub type Stats = Arc<Mutex<Value>>;
@@ -577,9 +578,49 @@ pub fn header(
     h
 }
 
+/// The media of a paired session (PROTOCOL.md 4): AES-128-GCM over each whole frame, the key from `ready` over TLS.
+/// One seal per frame, not per datagram: tens of microseconds for a 1080p frame, and nothing waits on it.
+pub struct Seal(ring::aead::LessSafeKey);
+
+impl Seal {
+    pub fn new(key: &[u8]) -> Option<Self> {
+        ring::aead::UnboundKey::new(&ring::aead::AES_128_GCM, key)
+            .ok()
+            .map(|k| Seal(ring::aead::LessSafeKey::new(k)))
+    }
+
+    /// The frame as it goes on the wire, ciphertext and tag; `header` is the frame's header (any shard index), whose
+    /// fields but the index and the parity bit are authenticated, with `len` already counting the tag.
+    pub fn seal(&self, header: &[u8; HEADER], data: &[u8]) -> Vec<u8> {
+        let mut aad = *header;
+        aad[1] &= !F_PARITY;
+        aad[2] = 0;
+        aad[3] = 0;
+        // kind | 0 0 0 | seq | 0 0 0 0: never the same twice under one session's key.
+        let mut nonce = [0u8; 12];
+        nonce[0] = header[0];
+        nonce[4..8].copy_from_slice(&header[8..12]);
+        let mut buf = Vec::with_capacity(data.len() + TAG);
+        buf.extend_from_slice(data);
+        self.0
+            .seal_in_place_append_tag(
+                ring::aead::Nonce::assume_unique_for_key(nonce),
+                ring::aead::Aad::from(aad),
+                &mut buf,
+            )
+            .expect("a frame is far below GCM's limit");
+        buf
+    }
+}
+
+/// The GCM tag after each sealed frame.
+pub const TAG: usize = 16;
+
 /// One UDP socket per media kind, pinned to the LAN interface — or a websocket for the web receiver.
 struct Tx {
     out: Out,
+    /// Sealed when the receiver gave a key (TLS); the web receiver's websocket is TLS already.
+    seal: Option<Seal>,
     kind: u8,
     seq: AtomicU32,
     warned: AtomicBool,
@@ -599,7 +640,13 @@ const BURST: usize = 16;
 const BURST_GAP: Duration = Duration::from_micros(250);
 
 impl Tx {
-    fn open(kind: u8, ifname: &str, to: SocketAddrV4, dscp: u32) -> std::io::Result<Self> {
+    fn open(
+        kind: u8,
+        ifname: &str,
+        to: SocketAddrV4,
+        dscp: u32,
+        seal: Option<Seal>,
+    ) -> std::io::Result<Self> {
         use socket2::{Domain, Protocol, Socket, Type};
         let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
         s.bind_device(Some(ifname.as_bytes()))?;
@@ -608,6 +655,7 @@ impl Tx {
         s.connect(&to.into())?;
         Ok(Tx {
             out: Out::Udp(s.into()),
+            seal,
             kind,
             seq: AtomicU32::new(0),
             warned: AtomicBool::new(false),
@@ -619,6 +667,7 @@ impl Tx {
     fn ws(kind: u8, tx: mpsc::Sender<Vec<u8>>, want_idr: Arc<AtomicBool>) -> Self {
         Tx {
             out: Out::Ws(tx, want_idr),
+            seal: None,
             kind,
             seq: AtomicU32::new(0),
             warned: AtomicBool::new(false),
@@ -643,6 +692,27 @@ impl Tx {
                 data.len()
             );
         }
+        let sealed;
+        let data = match &self.seal {
+            Some(seal) => {
+                // The header as every shard will carry it (bar the index): the shard count is authenticated too.
+                let len = data.len() + TAG;
+                let shards = len.div_ceil(SHARD).max(1) as u16;
+                let h = header(
+                    self.kind,
+                    flags,
+                    0,
+                    shards,
+                    seq,
+                    pts_us as u32,
+                    len as u32,
+                    host_lat,
+                );
+                sealed = seal.seal(&h, data);
+                &sealed[..]
+            }
+            None => data,
+        };
         let shards = data.len().div_ceil(SHARD).max(1);
         match &self.out {
             Out::Udp(sock) => {
@@ -689,6 +759,23 @@ impl Tx {
                 }
             }
         }
+    }
+}
+
+/// The media key a receiver gives in `ready` over TLS (PROTOCOL.md 4); none from an older receiver.
+pub(crate) fn media_key(ready: &Value) -> Result<Option<Vec<u8>>, String> {
+    use base64::Engine;
+    match (ready["crypt"].as_str(), ready["key"].as_str()) {
+        (None, _) => Ok(None),
+        (Some("aes-128-gcm"), Some(k)) => base64::engine::general_purpose::STANDARD
+            .decode(k)
+            .ok()
+            .filter(|k| k.len() == 16)
+            .map(Some)
+            .ok_or_else(|| format!("bad media key in {ready}")),
+        (Some(other), _) => Err(format!(
+            "the receiver wants media sealed with {other}, unknown here"
+        )),
     }
 }
 
@@ -1276,14 +1363,28 @@ pub async fn run(
             .zip(port("audio_port"))
             .ok_or(format!("bad ready: {ready}"))?;
         let io = |e: std::io::Error| format!("udp: {e}");
+        let key = media_key(&ready)?;
+        let seal = || key.as_deref().and_then(Seal::new);
         (
             Arc::new(
-                Tx::open(KIND_VIDEO, &t.ifname, SocketAddrV4::new(t.address, vp), 40)
-                    .map_err(io)?,
+                Tx::open(
+                    KIND_VIDEO,
+                    &t.ifname,
+                    SocketAddrV4::new(t.address, vp),
+                    40,
+                    seal(),
+                )
+                .map_err(io)?,
             ),
             Arc::new(
-                Tx::open(KIND_AUDIO, &t.ifname, SocketAddrV4::new(t.address, ap), 48)
-                    .map_err(io)?,
+                Tx::open(
+                    KIND_AUDIO,
+                    &t.ifname,
+                    SocketAddrV4::new(t.address, ap),
+                    48,
+                    seal(),
+                )
+                .map_err(io)?,
             ),
         )
     };
@@ -1484,6 +1585,7 @@ mod tests {
         };
         let tx = Tx {
             out: Out::Udp(UdpSocket::bind("127.0.0.1:0").unwrap()),
+            seal: None,
             kind: KIND_VIDEO,
             seq: AtomicU32::new(7),
             warned: AtomicBool::new(false),
@@ -1507,6 +1609,98 @@ mod tests {
             got.extend_from_slice(&buf[HEADER..n]);
         }
         assert_eq!(got, frame);
+    }
+
+    /// The same bytes as the receiver's MediaCryptTest.sealedTheSameOnEveryImplementation (luch-android).
+    #[test]
+    fn a_frame_is_sealed_as_the_receiver_opens_it() {
+        let key: Vec<u8> = (0..16).collect();
+        let plain = b"luch frame";
+        // Video, IDR, shard 3 of 1 (the index is not authenticated), seq 7, pts 1000, host latency 0.5 ms.
+        let h = header(
+            KIND_VIDEO,
+            F_IDR,
+            3,
+            1,
+            7,
+            1000,
+            (plain.len() + TAG) as u32,
+            5,
+        );
+        let sealed = Seal::new(&key).unwrap().seal(&h, plain);
+        assert_eq!(
+            sealed
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
+            "c88e092ce36d77f6a5954720c3a59966db75e601486ef8e09989"
+        );
+    }
+
+    #[test]
+    fn the_media_key_comes_from_ready() {
+        assert_eq!(media_key(&json!({"t": "ready"})).unwrap(), None);
+        let k =
+            media_key(&json!({"crypt": "aes-128-gcm", "key": "AAECAwQFBgcICQoLDA0ODw=="})).unwrap();
+        assert_eq!(k.unwrap(), (0..16).collect::<Vec<u8>>());
+        assert!(media_key(&json!({"crypt": "aes-128-gcm", "key": "AAEC"})).is_err());
+        assert!(media_key(&json!({"crypt": "chacha", "key": "AAEC"})).is_err());
+    }
+
+    /// Sealed frames go out sharded like plain ones, the length counting the tag; opened, they are the frame.
+    #[test]
+    fn a_sealed_frame_is_sharded_and_opens() {
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let key = [9u8; 16];
+        let tx = Tx {
+            out: Out::Udp(UdpSocket::bind("127.0.0.1:0").unwrap()),
+            seal: Seal::new(&key),
+            kind: KIND_VIDEO,
+            seq: AtomicU32::new(3),
+            warned: AtomicBool::new(false),
+            bytes: AtomicU64::new(0),
+            lat_sum: AtomicU64::new(0),
+        };
+        let Out::Udp(sock) = &tx.out else {
+            unreachable!()
+        };
+        sock.connect(rx.local_addr().unwrap()).unwrap();
+        let frame: Vec<u8> = (0..SHARD + 10).map(|i| i as u8).collect();
+        tx.send_frame(&frame, F_IDR, 1234, 5);
+        let (mut got, mut buf, mut first) = (Vec::new(), [0u8; 2000], [0u8; HEADER]);
+        for i in 0..2 {
+            let n = rx.recv(&mut buf).unwrap();
+            if i == 0 {
+                first.copy_from_slice(&buf[..HEADER]);
+            }
+            got.extend_from_slice(&buf[HEADER..n]);
+        }
+        assert_eq!(
+            u32::from_be_bytes(first[16..20].try_into().unwrap()) as usize,
+            frame.len() + TAG
+        );
+        assert_ne!(
+            &got[..frame.len()],
+            &frame[..],
+            "on the wire it is not the frame"
+        );
+        let mut aad = first;
+        aad[2] = 0;
+        aad[3] = 0;
+        let mut nonce = [0u8; 12];
+        nonce[0] = KIND_VIDEO;
+        nonce[4..8].copy_from_slice(&first[8..12]);
+        let open = ring::aead::LessSafeKey::new(
+            ring::aead::UnboundKey::new(&ring::aead::AES_128_GCM, &key).unwrap(),
+        );
+        let plain = open
+            .open_in_place(
+                ring::aead::Nonce::assume_unique_for_key(nonce),
+                ring::aead::Aad::from(aad),
+                &mut got,
+            )
+            .unwrap();
+        assert_eq!(plain, &frame[..]);
     }
 
     #[tokio::test]

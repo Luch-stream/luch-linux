@@ -21,6 +21,9 @@ gstreamer-allocators = "0.25.4"
 tokio-tungstenite = "0.27"
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 rcgen = "0.13.2"
+# Pairing (pair.rs) and sealed media (mirror.rs): the crypto rustls already uses.
+ring = "0.17"
+base64 = "0.22"
 # Relaying a link for a receiver (cast.rs): HTTPS to sites, streamed through.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 

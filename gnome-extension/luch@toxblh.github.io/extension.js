@@ -2,9 +2,12 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
+import Clutter from 'gi://Clutter';
 import GObject from 'gi://GObject';
+import St from 'gi://St';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import * as ModalDialog from 'resource:///org/gnome/shell/ui/modalDialog.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import {QuickMenuToggle, SystemIndicator} from 'resource:///org/gnome/shell/ui/quickSettings.js';
@@ -24,7 +27,10 @@ const IFACE = `<node>
     <method name="Cast"><arg name="id" type="s" direction="in"/><arg name="items" type="as" direction="in"/><arg name="options" type="s" direction="in"/><arg type="s" direction="out"/></method>
     <method name="StopCast"><arg name="id" type="s" direction="in"/></method>
     <property name="WebUrl" type="s" access="read"/>
+    <method name="Pair"><arg name="id" type="s" direction="in"/><arg name="code" type="s" direction="in"/><arg type="s" direction="out"/></method>
+    <method name="Pairing"><arg name="id" type="s" direction="in"/><arg type="s" direction="out"/></method>
     <signal name="ReceiversChanged"/>
+    <signal name="PairChanged"><arg name="id" type="s"/><arg name="state" type="s"/></signal>
   </interface>
 </node>`;
 const LuchProxy = Gio.DBusProxy.makeProxyWrapper(IFACE);
@@ -55,6 +61,12 @@ const T = RU ? {
     turnOff: 'Выключить ТВ',
     chooseFiles: 'Что показать на ТВ',
     failed: name => `${name}: не получилось`,
+    allowOnTv: name => `${name}: разрешите подключение на ТВ`,
+    codeTitle: name => `Сопряжение с ${name}`,
+    codeHint: 'Введите код, который показан на ТВ',
+    pair: 'Сопрячь',
+    cancel: 'Отмена',
+    paired: name => `${name}: сопряжено`,
 } : {
     title: 'Luch',
     header: 'Screen mirroring',
@@ -77,6 +89,12 @@ const T = RU ? {
     turnOff: 'Turn the TV off',
     chooseFiles: 'What to show on the TV',
     failed: name => `${name}: that did not work`,
+    allowOnTv: name => `${name}: allow the connection on the TV`,
+    codeTitle: name => `Pair with ${name}`,
+    codeHint: 'Type the code the TV shows',
+    pair: 'Pair',
+    cancel: 'Cancel',
+    paired: name => `${name}: paired`,
 };
 
 /** A D-Bus error's own message, without the "GDBus.Error:...: " prefix. */
@@ -85,6 +103,40 @@ function reason(e) {
 }
 
 /** Files picked in a dialog (zenity, or kdialog), or [] when cancelled or there is no dialog to show. */
+// luchd's refusal while a receiver waits for the code on its screen (Connect, Mirror, Cast...).
+function asksForPairing(text) {
+    return /asks for pairing/.test(text);
+}
+
+// The code from the TV, typed in a small dialog; null when cancelled.
+function askCode(name) {
+    const dialog = new ModalDialog.ModalDialog({destroyOnClose: true});
+    const box = new St.BoxLayout({vertical: true, style: 'spacing: 12px; min-width: 320px;'});
+    box.add_child(new St.Label({text: T.codeTitle(name), style: 'font-weight: bold; font-size: 1.2em;'}));
+    box.add_child(new St.Label({text: T.codeHint}));
+    const entry = new St.Entry({can_focus: true, hint_text: '123 456', style: 'font-size: 1.6em;'});
+    box.add_child(entry);
+    dialog.contentLayout.add_child(box);
+    return new Promise(resolve => {
+        let answered = false;
+        const done = value => {
+            if (answered)
+                return;
+            answered = true;
+            dialog.close();
+            resolve(value);
+        };
+        entry.clutter_text.connect('activate', () => done(entry.get_text()));
+        dialog.connect('closed', () => done(null));
+        dialog.setButtons([
+            {label: T.cancel, action: () => done(null), key: Clutter.KEY_Escape},
+            {label: T.pair, action: () => done(entry.get_text()), default: true},
+        ]);
+        dialog.open();
+        global.stage.set_key_focus(entry);
+    });
+}
+
 function chooseFiles(title) {
     return new Promise(resolve => {
         let argv = null;
@@ -120,6 +172,8 @@ class LuchToggle extends QuickMenuToggle {
         this._onMirroringChanged = onMirroringChanged;
         this._rows = [];
         this._asleep = []; // known receivers that are off and can be woken: [id, name]
+        this._afterPairing = new Map(); // id -> the action that found the receiver asking for pairing
+        this._typing = new Set(); // ids whose code was just typed: their failure is told by Pair itself
         this._waking = new Set();
         this._lastId = null;
         this._statsTimer = 0;
@@ -140,10 +194,40 @@ class LuchToggle extends QuickMenuToggle {
                 return;
             }
             this._signalId = proxy.connectSignal('ReceiversChanged', () => this._refresh());
+            this._pairId = proxy.connectSignal('PairChanged', (_p, _s, [id, state]) => this._onPair(id, state));
             this._ownerId = proxy.connect('notify::g-name-owner', () => this._discover());
             this._propId = proxy.connect('g-properties-changed', () => this._refresh());
             this._discover();
         }, null, Gio.DBusProxyFlags.DO_NOT_AUTO_START);
+    }
+
+    // A receiver asking for pairing: "allow" waits for the TV, "code" asks for the code here.
+    async _onPair(id, json) {
+        const state = JSON.parse(json);
+        const name = state.name ?? id;
+        if (state.step === 'allow') {
+            Main.notify(T.allowOnTv(name), '');
+        } else if (state.step === 'code') {
+            const code = await askCode(name);
+            if (code === null)
+                return;
+            this._typing.add(id);
+            try {
+                await this._proxy.PairAsync(id, code);
+                Main.notify(T.paired(name), '');
+                const again = this._afterPairing.get(id);
+                this._afterPairing.delete(id);
+                await again?.();
+            } catch (e) {
+                Main.notify(T.failed(name), reason(e));
+            } finally {
+                this._typing.delete(id);
+            }
+        } else if (state.step === 'failed') {
+            this._afterPairing.delete(id);
+            if (!this._typing.has(id))
+                Main.notify(T.failed(name), state.reason ?? '');
+        }
     }
 
     get _mirroring() {
@@ -198,6 +282,11 @@ class LuchToggle extends QuickMenuToggle {
                 sub.label.text = `${name} · ${model}`;
             // A refusal from luchd (an older receiver, the accessibility switch off...) is shown, not only logged.
             const add = (label, fn) => sub.menu.addAction(label, () => fn().catch(e => {
+                // The TV shows a code: the dialog for it comes with PairChanged, and the action is done after.
+                if (asksForPairing(reason(e))) {
+                    this._afterPairing.set(id, fn);
+                    return;
+                }
                 logError(e, 'Luch');
                 Main.notify(T.failed(name), reason(e));
             }));
@@ -323,6 +412,8 @@ class LuchToggle extends QuickMenuToggle {
             this.menu.disconnect(this._menuId);
         if (this._signalId)
             this._proxy.disconnectSignal(this._signalId);
+        if (this._pairId)
+            this._proxy.disconnectSignal(this._pairId);
         if (this._propId)
             this._proxy.disconnect(this._propId);
         if (this._ownerId)
