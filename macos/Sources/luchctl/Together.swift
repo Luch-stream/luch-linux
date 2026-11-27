@@ -114,7 +114,9 @@ private func analyze(_ args: [String]) -> Never {
 
 /// The group's lines under `luchctl stats`: D, then each member's need, route and correction.
 func printGroup() {
-    guard let g = (try? LocalClient.request(["cmd": "group_stats"]))?["group"] as? [String: Any], !g.isEmpty else {
+    // The answer is the first member's stats line, whose "group" holds D and the members.
+    guard let stats = (try? LocalClient.request(["cmd": "group_stats"]))?["group"] as? [String: Any],
+          let g = stats["group"] as? [String: Any], !g.isEmpty else {
         return
     }
     let n = { (v: Any?) in (v as? NSNumber).map { String(format: "%.1f", $0.doubleValue) } ?? "–" }
