@@ -15,7 +15,13 @@ final class Caster {
 
     private func find(_ request: [String: Any], in receivers: [Receiver]) -> Receiver? {
         let wanted = (request["id"] as? String) ?? (request["name"] as? String)
-        return receivers.first { $0.id == wanted || $0.name == wanted } ?? (wanted == nil && receivers.count == 1 ? receivers[0] : nil)
+        if let wanted { return receivers.first { $0.id == wanted || $0.name == wanted } }
+        if receivers.count == 1 { return receivers[0] }
+        // Unnamed with several around: the one something is being shown on, when that is only one.
+        lock.lock()
+        let showing = receivers.filter { sessions[$0.id]?.isOpen == true }
+        lock.unlock()
+        return showing.count == 1 ? showing[0] : nil
     }
 
     private func session(_ r: Receiver) throws -> CastSession {

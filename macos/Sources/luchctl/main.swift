@@ -32,8 +32,33 @@ func receiverAnd(_ words: [String], isWord: (String) -> Bool) -> (String?, [Stri
 
 func withReceiver(_ request: [String: Any], _ name: String?) -> [String: Any] {
     var r = request
-    if let name { r["name"] = name; r["id"] = name }
+    if let name {
+        r["name"] = name
+        r["id"] = name
+    }
     return r
+}
+
+/// Sends a request; when it named no receiver and the app cannot tell which one is meant, asks on the terminal and
+/// sends it again to the one picked. A script without a terminal gets the app's error, which names them.
+func callPicking(_ request: [String: Any], timeout: TimeInterval = 10) -> [String: Any] {
+    var response = (try? LocalClient.request(request, timeout: timeout)) ?? ["error": "Luch.app is not running"]
+    if request["id"] == nil, (response["error"] as? String)?.hasPrefix("several receivers") == true,
+       let picked = chooseReceiver() {
+        var again = request
+        again["id"] = picked
+        response = (try? LocalClient.request(again, timeout: timeout)) ?? ["error": "Luch.app is not running"]
+    }
+    return response
+}
+
+func chooseReceiver() -> String? {
+    let all = (call(["cmd": "receivers"])["receivers"] as? [[String: Any]] ?? []).compactMap { r -> ReceiverEntry? in
+        guard let id = r["id"] as? String, let name = r["name"] as? String else { return nil }
+        return ReceiverEntry(id: id, name: name)
+    }
+    guard all.count > 1 else { return nil }
+    return ReceiverChoice.ask(all)?.id
 }
 
 switch command {
@@ -155,8 +180,7 @@ case "cast":
     }
     if !subs.isEmpty { options["subs"] = subs }
     guard !items.isEmpty else { print("usage: luchctl cast <file|link>... [--to receiver] [--title T] [--start m:ss] [--sub file] [--relay]"); exit(2) }
-    let response = (try? LocalClient.request(withReceiver(["cmd": "cast", "items": items, "options": options], name), timeout: 60))
-        ?? ["error": "Luch.app is not running"]
+    let response = callPicking(withReceiver(["cmd": "cast", "items": items, "options": options], name), timeout: 60)
     fail(response)
     switch response["kind"] as? String ?? "" {
     case "media": print("playing on the receiver; `luchctl media` follows it")
@@ -170,7 +194,7 @@ case "media":
     let verbs: Set<String> = ["play", "pause", "toggle", "seek", "skip", "rate", "audio", "sub", "state"]
     let (name, rest) = receiverAnd(words) { verbs.contains($0) }
     if rest.isEmpty {
-        let r = call(withReceiver(["cmd": "media_state"], name))
+        let r = callPicking(withReceiver(["cmd": "media_state"], name))
         fail(r)
         let s = r["state"] as? [String: Any] ?? [:]
         print(s.isEmpty ? "(nothing playing)" : "\(s["state"] ?? "?") \(s["pos"] ?? 0) / \(s["dur"] ?? "-")")
@@ -186,15 +210,15 @@ case "media":
     case "sub": cmd["id"] = arg == "off" ? NSNull() : arg as Any
     default: break
     }
-    fail(call(withReceiver(["cmd": "media_cmd", "media": cmd], name)))
+    fail(callPicking(withReceiver(["cmd": "media_cmd", "media": cmd], name)))
 
 case "sleep":
-    fail(call(withReceiver(["cmd": "sleep"], args.count > 1 ? args[1] : nil)))
+    fail(callPicking(withReceiver(["cmd": "sleep"], args.count > 1 ? args[1] : nil)))
 
 case "volume":
     let words = Array(args.dropFirst())
     let (name, rest) = receiverAnd(words) { ["+", "-", "up", "down", "mute", "unmute"].contains($0) || Int($0) != nil }
-    let r = call(withReceiver(["cmd": "volume", "what": rest.first ?? "+0"], name))
+    let r = callPicking(withReceiver(["cmd": "volume", "what": rest.first ?? "+0"], name))
     fail(r)
     let v = r["volume"] as? [String: Any] ?? [:]
     print("\(v["level"] ?? "?")%\((v["muted"] as? Bool) == true ? " (muted)" : "")")
@@ -202,12 +226,12 @@ case "volume":
 case "page":
     let words = Array(args.dropFirst())
     let (name, rest) = receiverAnd(words) { ["next", "prev", "+", "-"].contains($0) || Int($0) != nil }
-    let r = call(withReceiver(["cmd": "page", "what": rest.first ?? "next"], name))
+    let r = callPicking(withReceiver(["cmd": "page", "what": rest.first ?? "next"], name))
     fail(r)
     print(r["page"] as? String ?? "")
 
 case "stop-cast":
-    fail(call(withReceiver(["cmd": "stop_cast"], args.count > 1 ? args[1] : nil)))
+    fail(callPicking(withReceiver(["cmd": "stop_cast"], args.count > 1 ? args[1] : nil)))
 
 case "browser":
     guard args.count > 1, args[1] == "install" else { print("usage: luchctl browser install"); exit(2) }
