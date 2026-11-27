@@ -21,6 +21,7 @@ Measured on an Intel Arrow Lake laptop → XGIMI MoGo 4 Laser over Wi‑Fi, full
 |------|--------------|
 | `luchd` | User daemon. Finds receivers (`_luch._tcp` via Avahi), announces this machine (`_luchsrc._tcp`), keeps control channels, captures and streams, serves the D-Bus API `dev.luch.Luch1`. |
 | `luch-kms` | Small helper for the lowest-latency mode: reads the scanout framebuffer straight from KMS, converts it to NV12 with EGL shaders, encodes with VA-API. The only part that needs a capability (`CAP_SYS_ADMIN`). |
+| `luch-win` | The Windows sender, early: Desktop Duplication, D3D11 NV12, hardware encoder through Media Foundation. Builds and tests its shared parts on Linux. See [docs/windows.md](docs/windows.md). |
 | `luchctl` | CLI and interactive terminal screen. |
 | `gnome-extension/` | GNOME Shell Quick Settings toggle «Luch». |
 | `docs/dbus.md` | D-Bus API reference. |

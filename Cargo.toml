@@ -1,5 +1,5 @@
 [workspace]
-members = ["luch-proto", "luchd", "luchctl", "luch-kms", "luch-recv"]
+members = ["luch-proto", "luchd", "luchctl", "luch-kms", "luch-recv", "luch-win"]
 resolver = "2"
 
 [workspace.dependencies]
