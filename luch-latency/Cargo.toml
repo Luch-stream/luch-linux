@@ -1,0 +1,13 @@
+[package]
+name = "luch-latency"
+version = "0.4.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+description = "Photon-to-photon latency lab: the test pattern, and the analyser of a camera's video of both screens"
+
+[dependencies]
+serde_json = "1"
+qrcode = { version = "0.14", default-features = false }
+# zxing-cpp's QR detector, ported: finds small, blurred codes in perspective and gives their corners to a fraction of a pixel.
+rxing = { version = "0.9", default-features = false, features = ["qrcode", "decoders", "multi_barcode_readers", "encoding_rs"] }
+
