@@ -138,7 +138,7 @@ pub fn issue_url(r: &Value) -> String {
 }
 
 /// Percent-encoding for a URL query value.
-fn encode(s: &str) -> String {
+pub(crate) fn encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len() * 3);
     for b in s.bytes() {
         if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) {

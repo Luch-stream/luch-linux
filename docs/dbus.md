@@ -314,6 +314,22 @@ oldest first; each as the receiver sent it plus `receiver_model`. Kept in `~/.co
 with a desktop notification that opens the issue. `ReportUrl` is that link (the receiver project's new-issue page
 with title and body filled in); `DismissReport` forgets one.
 
+### `Report(s text, b keep_names) → s`
+
+"Report a problem": one file for a person to hand over (a chat, an issue), `Luch-report-YYYY-MM-DD-HHMM.zip` in the
+XDG Downloads folder. Nothing is sent anywhere. Inside: `about.txt` (`text`, the versions of Luch, the OS, the desktop,
+the machine; each receiver's model, Android, Luch version, decoders and caps from its welcome, the numbers of its
+session now or of the last one), `computer/luchd.log` (the last ~1 MB of `journalctl --user -u luchd`),
+`computer/gnome-shell.log` (the GNOME extension's lines), `receivers/<name>.log` and `crash-reports/` (the reports
+of `Reports`). Each receiver connected now, and each known one on the network that is paired (a short TLS channel of
+its own, so the TV shows nothing), is asked for its log (`{"t":"logs"}`, luch-android PROTOCOL.md) at once, 10 s at
+most each; one that does not answer, an older one and an unpaired one are noted instead. Unless `keep_names`, IPv4
+addresses become `192.0.2.N`, IPv6 `2001:db8::N`, MACs `02:00:00:00:00:NN`, this computer's name and id
+`Computer`, the receivers' names and ids `Receiver N`, the login name `user` and the home folder `~`, the same
+stand-in each time within the file. Returns JSON: `path`, `description` (a few lines for a chat: what happened,
+versions, receivers, the file's name), `issue` (luch-linux's new-issue page with title and body filled in, asking for
+the file) and `notes` (who gave no log, and why). Takes up to ~12 s.
+
 ### `Known() → s`
 
 Every receiver luchd has connected to (kept in `~/.config/luch/known.json`), as a JSON array: `id`, `name`, `model`,

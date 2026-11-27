@@ -16,6 +16,7 @@ mod mpris;
 mod notes;
 mod pair;
 mod present;
+mod problem;
 mod quiet;
 mod reports;
 mod sync;
@@ -86,7 +87,8 @@ struct State {
     conns: HashMap<String, Conn>,
     mirrors: HashMap<String, mpsc::Sender<()>>, // id -> stop signal
     stats: HashMap<String, mirror::Stats>,      // id -> live mirroring stats
-    welcomes: HashMap<String, Value>,           // id -> last welcome (hw passport, decoder bench)
+    last_stats: HashMap<String, Value>, // id -> the numbers its last session ended with, for Report
+    welcomes: HashMap<String, Value>,   // id -> last welcome (hw passport, decoder bench)
     codec: HashMap<String, String>, // id -> "auto" | "avc" | "hevc": a person's choice of the video codec
     audio: HashMap<String, String>, // id -> "auto" | "on" | "off" | "sync": a person's choice of the sound
     playing: HashMap<String, Value>, // id -> last media_state of what it plays for us (PROTOCOL.md 4b)
@@ -738,6 +740,17 @@ impl Luch {
         } else {
             Err(fdo::Error::InvalidArgs(format!("no report {id}")))
         }
+    }
+
+    /// "Report a problem": one archive in Downloads with this computer's log, the logs of the receivers in use now or
+    /// lately (each asked, 10 s at most), what they are, their crash reports and `text`; addresses and names replaced
+    /// unless `keep_names`. Nothing is sent anywhere. Returns JSON: `path`, `description` (a few lines for a chat),
+    /// `issue` (a new-issue link, filled in) and `notes` (receivers that gave no log, and why).
+    async fn report(&self, text: String, keep_names: bool) -> fdo::Result<String> {
+        problem::report(self, &text, !keep_names)
+            .await
+            .map(|v| v.to_string())
+            .map_err(|e| fdo::Error::Failed(format!("cannot write the report: {e}")))
     }
 
     /// Every receiver luchd has talked to, as a JSON array: `id`, `name`, `model`, `address`, `mac`, `ble`, `seen`
@@ -1705,7 +1718,8 @@ async fn install(
     secure: bool,
 ) {
     let (tx, rx) = mpsc::channel(8);
-    let (events, _) = broadcast::channel(16);
+    // Room for a receiver's whole log (problem.rs: some 30 slices) besides the session's own messages.
+    let (events, _) = broadcast::channel(64);
     {
         let mut st = st.lock().await;
         st.conns.insert(
@@ -1995,7 +2009,7 @@ async fn run_channel(
                         let _ = events.send(v);
                     }
                     "ready" | "keyframe" | "stats" | "photo_ready" | "sleeping" | "app_opened" | "blank"
-                    | "input_request" => {
+                    | "input_request" | "logs" => {
                         let _ = events.send(v);
                     }
                     "stop" => {
@@ -2375,7 +2389,10 @@ async fn start_mirror(
         {
             let mut s = st.lock().await;
             s.mirrors.remove(&id);
-            s.stats.remove(&id);
+            if let Some(last) = s.stats.remove(&id) {
+                let last = last.lock().unwrap().clone();
+                s.last_stats.insert(id.clone(), last);
+            }
             s.sources.remove(&id);
             for m in &member_ids {
                 s.mirrors.remove(m);
