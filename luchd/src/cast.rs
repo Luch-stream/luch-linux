@@ -167,12 +167,12 @@ impl Server {
             .retain(|_, e| e.client != client);
     }
 
-    #[cfg(test)]
     /// Whether `token` is still served (a stop forgets a receiver's links).
     pub fn has(&self, token: &str) -> bool {
         self.shared.lock().unwrap().contains_key(token)
     }
 
+    #[cfg(test)]
     pub fn shared_count(&self) -> usize {
         self.shared.lock().unwrap().len()
     }
