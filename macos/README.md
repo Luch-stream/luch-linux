@@ -81,13 +81,10 @@ polling.
 
 ## Use
 
-Tab completion for `luchctl` (commands, each one's words, receivers' names from the app, files where a file goes):
-
-```sh
-luchctl completion zsh > "$(brew --prefix)/share/zsh/site-functions/_luchctl"   # then: rm ~/.zcompdump; exec zsh
-luchctl completion bash > ~/.local/share/bash-completion/completions/luchctl
-luchctl completion fish > ~/.config/fish/completions/luchctl.fish
-```
+`luchctl` in a terminal: the app links it into Homebrew's `bin` and registers its Tab completion for zsh, bash and
+fish at every launch (commands, each one's words, receivers' names from the app, files where a file goes; the
+shells ask `luchctl __complete`). A new terminal picks it up; `luchctl completion zsh|bash|fish` prints the shell's
+side by hand.
 
 Menu bar: pick a receiver → **Mirror Screen**. While streaming the menu shows the estimated latency
 (capture + encode + one-way network + the receiver's decode), host time, RTT, the decoder's own number,

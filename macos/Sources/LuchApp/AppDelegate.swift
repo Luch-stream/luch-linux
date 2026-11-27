@@ -113,6 +113,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // A write to a socket the other side has closed (a receiver restarted mid-session, luchctl gone before its
         // answer) must be an error, not SIGPIPE: that ends the whole app silently, with no crash report.
         signal(SIGPIPE, SIG_IGN)
+        DispatchQueue.global(qos: .utility).async { ShellSetup.run() }
 
         NSApp.setActivationPolicy(.accessory)
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
