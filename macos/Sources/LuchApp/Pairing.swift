@@ -51,7 +51,9 @@ enum PairingCommands {
 /// the action that found the TV asking, done again once paired (as GNOME does with luchd's PairChanged).
 final class PairPrompt: NSObject {
     private var panel: NSPanel?
+    /// The receiver the window is about, and its name.
     private var pairing: String?
+    private var pairingName = ""
     private let title = NSTextField(labelWithString: "")
     private let message = NSTextField(wrappingLabelWithString: "")
     private let field = NSTextField(string: "")
@@ -104,6 +106,7 @@ final class PairPrompt: NSObject {
     private func show(_ id: String, name: String, text: String, code: Bool) {
         let panel = self.panel ?? makePanel()
         pairing = id
+        pairingName = name
         title.stringValue = "Pair with \(name)"
         message.stringValue = text
         field.isHidden = !code
@@ -146,9 +149,9 @@ final class PairPrompt: NSObject {
     }
 
     @objc private func typed() {
-        guard let id = pairing, !field.isHidden else { return }
+        guard let id = pairing, !field.isHidden, !typing.contains(id) else { return }
         let code = field.stringValue
-        let name = title.stringValue.replacingOccurrences(of: "Pair with ", with: "")
+        let name = pairingName
         typing.insert(id)
         pairButton.isEnabled = false
         message.stringValue = "Checking the code…"
@@ -163,7 +166,11 @@ final class PairPrompt: NSObject {
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.typing.remove(id)
-                if let failure {
+                if let failure, Connector.shared.pairing(id)["step"] as? String == "code" {
+                    // Not six digits: the TV still waits for its code.
+                    self.message.stringValue = failure
+                    self.pairButton.isEnabled = true
+                } else if let failure {
                     // A wrong code ends this pairing: the action again asks the TV for a new one.
                     self.field.isHidden = true
                     self.message.stringValue = failure
