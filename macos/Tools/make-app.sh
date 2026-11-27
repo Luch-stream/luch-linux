@@ -25,6 +25,7 @@ cp "$BIN" "$APP/Contents/MacOS/LuchApp"
 cp ".build/release/luchctl" "$APP/Contents/MacOS/luchctl"
 # Loaded by the system perl to read what plays (Sources/LuchEngine/NowPlaying.swift).
 cp ".build/release/libLuchNowPlaying.dylib" "$APP/Contents/Frameworks/"
+cp ../assets/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -32,6 +33,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <plist version="1.0">
 <dict>
     <key>CFBundleExecutable</key><string>LuchApp</string>
+    <key>CFBundleIconFile</key><string>AppIcon</string>
     <key>CFBundleIdentifier</key><string>dev.luch.mac</string>
     <key>CFBundleName</key><string>Luch</string>
     <key>CFBundleDisplayName</key><string>Luch</string>
