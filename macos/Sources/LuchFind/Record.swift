@@ -65,6 +65,10 @@ public final class MicRecorder {
         return (samples, rate, anchors)
     }
 
+    /// What the system says the microphone's path adds before a sample reaches the tap (s): the device's latency and
+    /// safety offset; a buffer's host time is when its first sample was captured, this much before it was heard here.
+    public var inputLatency: Double { engine.inputNode.presentationLatency }
+
     public func stop() {
         guard running else { return }
         running = false

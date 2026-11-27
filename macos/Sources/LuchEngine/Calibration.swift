@@ -315,8 +315,55 @@ public final class Calibrator {
                 return Int64(((t - zero) * 1e6).rounded())
             }
             out[id] = Detected(result: r, heard: heard)
+            notes.append(Self.note(id: id, played: played, positions: positions, result: r, rec: rec, probe: probe))
         }
+        lastRecording = rec
         return (rec, out)
+    }
+
+    // MARK: - what was heard, kept for a look afterwards
+
+    private var notes: [[String: Any]] = []
+    private var lastRecording: MicRecording?
+
+    /// One member in one pass: where its sweeps were expected and found, and a wider look (100 ms before to 450 ms
+    /// after) that shows where a sweep the window missed really was.
+    private static func note(id: String, played: [Int64], positions: [Double], result r: AcousticProbe.Result,
+                             rec: MicRecording, probe: AcousticProbe) -> [String: Any] {
+        let ms = { (samples: Double) in (samples * 1000 / rec.rate * 100).rounded() / 100 }
+        let wide = positions.map { p -> [String: Any] in
+            let a = probe.find(rec.samples, from: Int(p) - Int(rec.rate * 0.1), to: Int(p) + Int(rec.rate * 0.45))
+            return ["delay_ms": a.at.isNaN ? NSNull() : ms(a.at - p), "psr_db": (a.psrDb * 10).rounded() / 10,
+                    "trusted": a.trusted, "why": a.why]
+        }
+        let found = zip(r.arrivals, positions).map { a, p -> [String: Any] in
+            ["delay_ms": a.at.isNaN ? NSNull() : ms(a.at - p), "psr_db": (a.psrDb * 10).rounded() / 10,
+             "trusted": a.trusted, "why": a.why]
+        }
+        return ["id": id, "played_us": played, "position": positions, "found": found, "wide": wide, "why": r.why]
+    }
+
+    /// Writes the last recording (16-bit WAV) and what each pass expected and found (JSON) into `directory`.
+    public func save(to directory: URL) throws {
+        guard let rec = lastRecording else { return }
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try Self.wav(rec.samples, rate: Int(rec.rate.rounded())).write(to: directory.appendingPathComponent("mic.wav"))
+        let meta: [String: Any] = ["rate": rec.rate, "clock_zero": group.clockZero, "passes": notes]
+        try JSONSerialization.data(withJSONObject: meta, options: [.prettyPrinted, .sortedKeys])
+            .write(to: directory.appendingPathComponent("heard.json"))
+    }
+
+    static func wav(_ samples: [Float], rate: Int) -> Data {
+        var d = Data()
+        func u32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
+        func u16(_ v: UInt16) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
+        let bytes = UInt32(samples.count * 2)
+        d.append(contentsOf: Array("RIFF".utf8)); u32(36 + bytes); d.append(contentsOf: Array("WAVE".utf8))
+        d.append(contentsOf: Array("fmt ".utf8)); u32(16); u16(1); u16(1); u32(UInt32(rate)); u32(UInt32(rate * 2))
+        u16(2); u16(16)
+        d.append(contentsOf: Array("data".utf8)); u32(bytes)
+        for s in samples { u16(UInt16(bitPattern: Int16(max(-1, min(1, s)) * 32767))) }
+        return d
     }
 
     // MARK: - the corrections

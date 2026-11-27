@@ -15,7 +15,13 @@ extension Together {
         defer { calibrating.done() }
         show("Calibrating: keep the room quiet…")
         do {
-            let results = try Calibrator(group: g, mic: Mic(), store: store).run()
+            let calibrator = Calibrator(group: g, mic: Mic(), store: store)
+            let results = try calibrator.run()
+            // Kept for a look afterwards: the recording, and where each sweep was expected and found.
+            let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
+            let dir = FileManager.default.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library/Application Support/Luch/calibration/\(stamp)")
+            try? calibrator.save(to: dir)
             show("Playing")
             onMain(hooks.changed)
             return ["results": results.map(\.json)]

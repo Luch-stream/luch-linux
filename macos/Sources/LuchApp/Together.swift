@@ -69,7 +69,7 @@ final class Together {
             case "offset": return try setOffset(request)
             case "audio": return try setAudio(request)
             case "latency": return try latency(request)
-            case "calibrate": return try calibrate()
+            case "calibrate": return request["self"] as? Bool == true ? try SelfLoop.run() : try calibrate()
             default: return ["error": "unknown command"]
             }
         } catch {
