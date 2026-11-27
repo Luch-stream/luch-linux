@@ -73,7 +73,29 @@ fn merge(
     address: &str,
     mac: Option<String>,
 ) {
+    // A receiver app that was reinstalled comes back under a new id: the same device (MAC) with the same
+    // name. Its old entry goes, and what was learned for waking it moves over.
+    let mut carried = Map::new();
+    if let Some(mac) = &mac {
+        let old: Vec<String> = all
+            .iter()
+            .filter(|(k, r)| *k != id && r["mac"] == json!(mac) && r["name"] == json!(name))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in old {
+            if let Some(Value::Object(o)) = all.remove(&k) {
+                if let Some(ble) = o.get("ble") {
+                    carried.insert("ble".into(), ble.clone());
+                }
+            }
+        }
+    }
     let r = all.entry(id.to_string()).or_insert_with(|| json!({}));
+    for (k, v) in carried {
+        if r.get(&k).is_none() {
+            r[k.as_str()] = v;
+        }
+    }
     r["name"] = json!(name);
     r["model"] = json!(model);
     r["address"] = json!(address);
@@ -567,6 +589,49 @@ mod tests {
         assert_eq!(methods(&all[id]), vec!["wol", "ble"]);
         set_in(&mut all, id, "mac", "").unwrap();
         assert_eq!(methods(&all[id]), vec!["ble"]);
+    }
+
+    #[test]
+    fn a_reinstalled_receiver_replaces_its_old_entry() {
+        let mut all = Map::new();
+        let mac = || Some("aa:bb:cc:dd:ee:ff".to_string());
+        merge(&mut all, "old", "Living room TV", "X", "192.168.1.5", mac());
+        set_in(&mut all, "old", "ble", "008a433321129cffffff3043524b544d").unwrap();
+        merge(
+            &mut all,
+            "dev",
+            "Living room TV (dev)",
+            "X",
+            "192.168.1.5",
+            mac(),
+        );
+        merge(
+            &mut all,
+            "other",
+            "Bedroom TV",
+            "X",
+            "192.168.1.6",
+            Some("11:22:33:44:55:66".into()),
+        );
+        merge(&mut all, "new", "Living room TV", "X", "192.168.1.5", mac());
+        let mut ids: Vec<_> = all.keys().cloned().collect();
+        ids.sort();
+        assert_eq!(
+            ids,
+            ["dev", "new", "other"],
+            "the dev build is another app and stays"
+        );
+        assert_eq!(all["new"]["ble"], "008a433321129cffffff3043524b544d");
+        // Without a MAC nothing can be told apart, so nothing is dropped.
+        merge(
+            &mut all,
+            "newer",
+            "Living room TV",
+            "X",
+            "192.168.1.5",
+            None,
+        );
+        assert!(all.contains_key("new"));
     }
 
     #[test]
