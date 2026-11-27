@@ -3,7 +3,8 @@
 //! 1. mDNS (discovery.rs) and, at the same time, a sweep of the LAN for the control port (scan.rs);
 //! 2. after a few seconds with nothing: Bluetooth LE, the receivers' cards over the air (ble.rs);
 //! 3. only when the person asked for it (`Find("all")`), as it needs them and opens the microphone and the camera:
-//!    the TV saying its card by sound (modem.rs) and its QR code held up to the camera (qr.rs).
+//!    the TV saying its card by sound (modem.rs) and its QR code held up to the camera (qr.rs); and which TVs nearby
+//!    offer a direct connection over their own Wi-Fi network (direct/mod.rs), never made without the person.
 //!
 //! Every receiver found any way is checked with the real hello before it is listed, and joins the same list
 //! (Receivers, ReceiversChanged). `FindProgress` says what is being tried.
@@ -41,10 +42,18 @@ pub enum Rung {
     Ble,
     Sound,
     Qr,
+    Direct,
 }
 
 impl Rung {
-    pub const ALL: [Rung; 5] = [Rung::Mdns, Rung::Scan, Rung::Ble, Rung::Sound, Rung::Qr];
+    pub const ALL: [Rung; 6] = [
+        Rung::Mdns,
+        Rung::Scan,
+        Rung::Ble,
+        Rung::Sound,
+        Rung::Qr,
+        Rung::Direct,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
@@ -53,6 +62,7 @@ impl Rung {
             Rung::Ble => "ble",
             Rung::Sound => "sound",
             Rung::Qr => "qr",
+            Rung::Direct => "direct",
         }
     }
 
@@ -70,6 +80,9 @@ impl Rung {
                 "listening on the microphone: on the TV, open Luch and choose \"Say the address\""
             }
             Rung::Qr => "looking through the camera: hold it up to the QR code on the TV",
+            Rung::Direct => {
+                "asking the TVs nearby over Bluetooth whether they connect directly (Wi-Fi Direct)"
+            }
         }
     }
 }
@@ -108,7 +121,7 @@ impl Ladder {
             patience: BLE_LISTEN,
         };
         let person = Tier {
-            rungs: vec![Rung::Sound, Rung::Qr],
+            rungs: vec![Rung::Sound, Rung::Qr, Rung::Direct],
             patience: PERSON_LISTEN,
         };
         let tiers = match mode {
@@ -118,7 +131,7 @@ impl Ladder {
                 let rungs: Option<Vec<Rung>> =
                     list.split(',').map(|r| Rung::parse(r.trim())).collect();
                 let rungs = rungs.ok_or_else(|| {
-                    format!("unknown way to look: {list} (auto, all, or some of mdns,scan,ble,sound,qr)")
+                    format!("unknown way to look: {list} (auto, all, or some of mdns,scan,ble,sound,qr,direct)")
                 })?;
                 vec![Tier {
                     rungs,
@@ -502,6 +515,10 @@ async fn run_rung(rung: Rung, ctx: Ctx, conn: Connection) -> Result<String, Stri
                     let h: ble::Heard = h;
                     notes.push(match reach(&ctx2, &c2, &h.card, "ble", h.rssi).await {
                         Ok(name) => name,
+                        Err(_) if h.card.addr.is_none() => format!(
+                            "heard {0} with no address on this network: it can connect directly (`luchctl direct {0}`)",
+                            h.card.id
+                        ),
                         Err(e) => format!("heard {} but {e}", h.card.id),
                     });
                 }
@@ -509,6 +526,7 @@ async fn run_rung(rung: Rung, ctx: Ctx, conn: Connection) -> Result<String, Stri
             });
             let heard = ble::search(&sys, &looking, BLE_LISTEN, tx).await?;
             let notes = tries.await.unwrap_or_default();
+            crate::direct::note_offers(&ctx.st, &heard).await;
             // The signal strength of the whole scan, for the order of the list.
             for h in &heard {
                 let mut s = ctx.st.lock().await;
@@ -559,6 +577,18 @@ async fn run_rung(rung: Rung, ctx: Ctx, conn: Connection) -> Result<String, Stri
             } else {
                 notes.join("; ")
             })
+        }
+        Rung::Direct => {
+            // Only which TVs offer it: joining one takes this computer off its Wi-Fi, so the person chooses.
+            let mut offers = crate::direct::offers::fresh();
+            if offers.is_empty() {
+                let sys = Connection::system().await.map_err(|e| e.to_string())?;
+                let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+                let heard =
+                    ble::search(&sys, &Card::looking(&ctx.sender_id), BLE_LISTEN, tx).await?;
+                offers = crate::direct::note_offers(&ctx.st, &heard).await;
+            }
+            Ok(crate::direct::say_offers(&offers))
         }
     }
 }
@@ -615,8 +645,13 @@ pub(crate) mod tests {
         assert_eq!(l.due(s(2), false, 0), vec![Rung::Ble]);
         assert_eq!(
             l.due(Duration::from_millis(2100), false, 0),
-            vec![Rung::Sound, Rung::Qr]
+            vec![Rung::Sound, Rung::Qr, Rung::Direct]
         );
+        // Never in the automatic climb: a direct connection takes the computer off its network.
+        assert!(!Ladder::new("auto")
+            .unwrap()
+            .rungs()
+            .any(|r| r == Rung::Direct));
 
         assert_eq!(
             Ladder::new("qr, ble").unwrap().due(s(0), false, 0),
@@ -679,6 +714,7 @@ pub(crate) mod tests {
         );
         assert_eq!(j["rungs"][3]["state"], "skipped");
         assert_eq!(j["rungs"][4]["state"], "skipped");
+        assert_eq!(j["rungs"][5]["state"], "skipped");
         // Found at 7 s; the climb ends when mDNS, still running, has finished.
         assert!(
             (10.0..10.6).contains(&j["elapsed"].as_f64().unwrap()),
@@ -711,7 +747,7 @@ pub(crate) mod tests {
             Box::pin(async move {
                 match r {
                     Rung::Ble => Err("Bluetooth is off".into()),
-                    Rung::Sound | Rung::Qr => {
+                    Rung::Sound | Rung::Qr | Rung::Direct => {
                         tokio::time::sleep(Duration::from_secs(30)).await;
                         Ok("heard nothing".into())
                     }

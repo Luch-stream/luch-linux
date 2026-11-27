@@ -8,7 +8,11 @@
 //! 7..11  IPv4            receiver only
 //! 11..13 port            receiver only, big-endian
 //! 13..17 token           a one-time pairing token: sound only, never over Bluetooth
+//! 13..15 PSM             Bluetooth only: the L2CAP channel for a direct connection (PROTOCOL.md, "direct"), 0 = none
 //! ```
+//!
+//! The same bytes 13.. mean the token in a card heard by sound and the PSM in one heard over Bluetooth: each way
+//! decodes its own (`decode`, `decode_ble`).
 
 use std::net::Ipv4Addr;
 
@@ -25,6 +29,8 @@ pub struct Card {
     pub addr: Option<(Ipv4Addr, u16)>,
     /// 8 lowercase hex digits.
     pub token: Option<String>,
+    /// The L2CAP PSM a receiver takes a direct connection on (Bluetooth cards only).
+    pub psm: Option<u16>,
 }
 
 fn hex4(s: &str) -> Option<[u8; 4]> {
@@ -52,6 +58,7 @@ impl Card {
             id: sender_id.chars().filter(|c| *c != '-').take(8).collect(),
             addr: None,
             token: None,
+            psm: None,
         }
     }
 
@@ -59,18 +66,39 @@ impl Card {
         let mut b = MAGIC.to_vec();
         b.push(self.version << 4 | self.kind);
         b.extend(hex4(&self.id).unwrap_or_default());
-        if let Some((ip, port)) = self.addr {
+        if self.addr.is_some() || self.psm.is_some() {
+            let (ip, port) = self.addr.unwrap_or((Ipv4Addr::UNSPECIFIED, 0));
             b.extend(ip.octets());
             b.extend(port.to_be_bytes());
-            if let Some(t) = self.token.as_deref().and_then(hex4) {
+            if let Some(psm) = self.psm {
+                b.extend(psm.to_be_bytes());
+            } else if let Some(t) = self.token.as_deref().and_then(hex4) {
                 b.extend(t);
             }
         }
         b
     }
 
-    /// None for anything that is not a card of a version this sender speaks.
+    /// A card heard by sound or read from a QR code; None for anything that is not a card of a version this sender
+    /// speaks.
     pub fn decode(b: &[u8]) -> Option<Card> {
+        let mut c = Card::head(b)?;
+        c.token = (b.len() >= 17).then(|| hex(&b[13..17]));
+        c.checked()
+    }
+
+    /// A card heard over Bluetooth: never a token; bytes 13..15 the PSM of a receiver that offers a direct
+    /// connection. Such a receiver may have no usable address (0.0.0.0, port 0): it is still a card, without `addr`.
+    pub fn decode_ble(b: &[u8]) -> Option<Card> {
+        let mut c = Card::head(b)?;
+        c.psm = (b.len() >= 15)
+            .then(|| u16::from_be_bytes([b[13], b[14]]))
+            .filter(|p| *p != 0);
+        c.checked()
+    }
+
+    /// Magic, version, kind, id and address; what follows them is each way's own.
+    fn head(b: &[u8]) -> Option<Card> {
         if b.len() < 7 || b[..2] != MAGIC {
             return None;
         }
@@ -78,24 +106,27 @@ impl Card {
         if version as u32 != luch_proto::VERSION || !(kind == RECEIVER || kind == SENDER) {
             return None;
         }
-        let id = hex(&b[3..7]);
-        let addr = (b.len() >= 13).then(|| {
-            (
-                Ipv4Addr::new(b[7], b[8], b[9], b[10]),
-                u16::from_be_bytes([b[11], b[12]]),
-            )
-        });
-        if kind == RECEIVER && addr.is_none_or(|(ip, port)| ip.is_unspecified() || port == 0) {
-            return None;
-        }
-        let token = (b.len() >= 17).then(|| hex(&b[13..17]));
+        let addr = (b.len() >= 13)
+            .then(|| {
+                (
+                    Ipv4Addr::new(b[7], b[8], b[9], b[10]),
+                    u16::from_be_bytes([b[11], b[12]]),
+                )
+            })
+            .filter(|(ip, port)| !ip.is_unspecified() && *port != 0);
         Some(Card {
             kind,
             version,
-            id,
+            id: hex(&b[3..7]),
             addr,
-            token,
+            token: None,
+            psm: None,
         })
+    }
+
+    /// A receiver's card must say how to reach it: an address, or a channel for a direct connection.
+    fn checked(self) -> Option<Card> {
+        (self.kind != RECEIVER || self.addr.is_some() || self.psm.is_some()).then_some(self)
     }
 }
 
@@ -131,6 +162,7 @@ pub fn parse_link(s: &str) -> Option<Card> {
         id,
         addr: Some((host, port)),
         token,
+        psm: None,
     })
 }
 
@@ -145,6 +177,7 @@ mod tests {
             id: "3f0c2a8e".into(),
             addr: Some((Ipv4Addr::new(192, 168, 1, 20), 47800)),
             token: Some("0badf00d".into()),
+            psm: None,
         }
     }
 
@@ -164,6 +197,42 @@ mod tests {
         let me = Card::looking("9a1b2c3d-0000-4000-8000-000000000000");
         assert_eq!(me.encode(), vec![0x4c, 0x75, 0x02, 0x9a, 0x1b, 0x2c, 0x3d]);
         assert_eq!(Card::decode(&me.encode()), Some(me));
+    }
+
+    /// The vector every implementation tests (the direct brief): a receiver with no LAN address that offers a
+    /// direct connection on PSM 0x0080.
+    #[test]
+    fn a_bluetooth_card_carries_the_psm() {
+        let b = [
+            0x4c, 0x75, 0x01, 0x0b, 0x6f, 0x1c, 0x2a, 0, 0, 0, 0, 0, 0, 0x00, 0x80,
+        ];
+        let c = Card::decode_ble(&b).unwrap();
+        assert_eq!(
+            (c.id.as_str(), c.addr, c.psm, c.token.as_deref()),
+            ("0b6f1c2a", None, Some(0x80), None)
+        );
+        assert_eq!(c.encode(), b);
+        // The same bytes by sound are not a card: no address, and 13..15 is not a whole token.
+        assert_eq!(Card::decode(&b), None);
+        // A card with an address and a PSM: 15 bytes, flags 3 + manufacturer data 4 + 15 = 22 of 31.
+        let both = Card {
+            token: None,
+            psm: Some(0x0081),
+            ..tv()
+        };
+        assert_eq!(both.encode().len(), 15);
+        assert_eq!(Card::decode_ble(&both.encode()), Some(both));
+        // Receivers that predate it send 13 bytes, and PSM 0 means none: read as before.
+        let old = Card {
+            token: None,
+            ..tv()
+        };
+        assert_eq!(Card::decode_ble(&old.encode()), Some(old.clone()));
+        assert_eq!(
+            Card::decode_ble(&[old.encode(), vec![0, 0]].concat()),
+            Some(old)
+        );
+        assert_eq!(Card::decode_ble(&b[..13]), None);
     }
 
     #[test]

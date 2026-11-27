@@ -34,6 +34,10 @@ flate2 = "1"
 
 # The receiver's QR code through the camera (find/qr.rs): pure Rust, no system library.
 rqrr = "0.10"
+# A direct connection (direct/): the TV's Bluetooth LE channel (L2CAP sockets only, no D-Bus of its own), and the
+# NetworkManager calls' arguments.
+bluer = { version = "0.17", default-features = false, features = ["l2cap"] }
+serde = "1"
 
 [dev-dependencies]
 # Pictures of QR codes for the tests of the reader.
