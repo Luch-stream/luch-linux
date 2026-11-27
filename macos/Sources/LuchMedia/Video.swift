@@ -48,11 +48,40 @@ public enum VideoProfile: String {
     case baseline, main, high
 }
 
+/// Which encoder VideoToolbox is asked for; a session tries its list in order until one opens.
+public enum EncoderMode: String, CaseIterable {
+    /// The real-time encoder Apple made for video calls: low-latency rate control, hardware only. Measured on an M5
+    /// Pro it takes longer per frame than the plain hardware encoder (HEVC 1080p 5.5 ms against 2.9, 4K 15.3 against
+    /// 8.6: EncoderLatencyTests), so it is not the default; it may still give steadier frame sizes.
+    case lowLatency = "low-latency"
+    /// The hardware encoder with the usual rate control.
+    case hardware
+    /// Whatever VideoToolbox picks, software included.
+    case any
+
+    /// The default order: the hardware encoder, else anything.
+    public static let standard: [EncoderMode] = [.hardware, .any]
+
+    var specification: CFDictionary? {
+        switch self {
+        case .lowLatency:
+            return [kVTVideoEncoderSpecification_EnableLowLatencyRateControl: true,
+                    kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: true] as CFDictionary
+        case .hardware:
+            return [kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: true] as CFDictionary
+        case .any:
+            return nil
+        }
+    }
+}
+
 public final class VideoEncoder {
     /// Called with one Annex-B access unit: (data, isIRAP, pts).
     public var onPacket: ((Data, Bool, CMTime) -> Void)?
 
     public let codec: VideoCodec
+    /// The encoder that opened (the first of the modes asked for that did).
+    public private(set) var mode: EncoderMode = .any
     private let width: Int
     private let height: Int
     private var session: VTCompressionSession?
@@ -75,7 +104,8 @@ public final class VideoEncoder {
         VTIsHardwareDecodeSupported(codec.cmType)
     }
 
-    public init?(codec: VideoCodec, width: Int, height: Int, fps: Int, kbps: Int, profile: VideoProfile? = nil) {
+    public init?(codec: VideoCodec, width: Int, height: Int, fps: Int, kbps: Int, profile: VideoProfile? = nil,
+                 modes: [EncoderMode] = EncoderMode.standard) {
         self.codec = codec
         self.width = width
         self.height = height
@@ -87,23 +117,54 @@ public final class VideoEncoder {
             kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
         ]
 
+        for m in modes {
+            guard let made = Self.open(codec: codec, width: width, height: height, attrs: attrs as CFDictionary,
+                                       spec: m.specification) else {
+                log("encoder: \(codec.label) \(m.rawValue) did not open, trying the next")
+                continue
+            }
+            session = made
+            mode = m
+            if configure(fps: fps, kbps: kbps, profile: profile) { break }
+            VTCompressionSessionInvalidate(made)
+            session = nil
+            log("encoder: \(codec.label) \(m.rawValue) would not prepare, trying the next")
+        }
+        guard session != nil else { return nil }
+        log("encoder: \(codec.label) \(mode.rawValue) encoder \(encoderID ?? "?")")
+    }
+
+    private static func open(codec: VideoCodec, width: Int, height: Int, attrs: CFDictionary,
+                             spec: CFDictionary?) -> VTCompressionSession? {
         var created: VTCompressionSession?
         let status = VTCompressionSessionCreate(
             allocator: kCFAllocatorDefault,
             width: Int32(width), height: Int32(height),
             codecType: codec.cmType,
-            encoderSpecification: nil,
-            imageBufferAttributes: attrs as CFDictionary,
+            encoderSpecification: spec,
+            imageBufferAttributes: attrs,
             compressedDataAllocator: nil,
             outputCallback: nil,
             refcon: nil,
             compressionSessionOut: &created)
-        guard status == noErr, let session = created else {
-            log("encoder: VTCompressionSessionCreate(\(codec.label)) failed: \(status)")
-            return nil
-        }
-        self.session = session
+        if status != noErr { log("encoder: VTCompressionSessionCreate(\(codec.label)) failed: \(status)") }
+        return status == noErr ? created : nil
+    }
 
+    /// The name VideoToolbox gives the encoder in use (com.apple.videotoolbox.videoencoder....).
+    public var encoderID: String? {
+        guard let session else { return nil }
+        var value: CFTypeRef?
+        let status = withUnsafeMutablePointer(to: &value) {
+            VTSessionCopyProperty(session, key: kVTCompressionPropertyKey_EncoderID,
+                                  allocator: kCFAllocatorDefault, valueOut: UnsafeMutableRawPointer($0))
+        }
+        return status == noErr ? value as? String : nil
+    }
+
+    /// The low-latency settings; false when the session will not prepare with them.
+    private func configure(fps: Int, kbps: Int, profile: VideoProfile?) -> Bool {
+        guard let session else { return false }
         // Sunshine-style low-latency settings, as close as VideoToolbox exposes them.
         set(kVTCompressionPropertyKey_RealTime, kCFBooleanTrue)
         set(kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse)
@@ -134,9 +195,11 @@ public final class VideoEncoder {
         let prepared = VTCompressionSessionPrepareToEncodeFrames(session)
         if prepared != noErr {
             log("encoder: prepare failed: \(prepared)")
-            return nil
+            return false
         }
+        return true
     }
+
 
     deinit {
         if let session { VTCompressionSessionInvalidate(session) }
