@@ -117,7 +117,8 @@ final class Together {
             guard let role = GroupRole(rawValue: roleText) else { throw Failure("role video|audio|both, not \(roleText)") }
             members.append(GroupMember(try find(m["r"] as? String), role: role))
         }
-        try play(members, mode: mode, soundOnly: source == "audio")
+        // Every member given role audio: music on all of them, as with --source audio.
+        try play(members, mode: mode, soundOnly: source == "audio" || !members.contains { $0.role.video })
         return ["ok": true]
     }
 
@@ -368,7 +369,7 @@ final class Together {
     private func choose(from receivers: [Receiver]) {
         let alert = NSAlert()
         alert.messageText = "Play Together"
-        alert.informativeText = "The receivers play in step. The first one with the picture shows it."
+        alert.informativeText = "The receivers play in step. The first one with the picture shows it; with every one on Sound, this Mac's sound plays on all of them."
         alert.addButton(withTitle: "Play")
         alert.addButton(withTitle: "Cancel")
         let roles: [(String, GroupRole)] = [("Picture and Sound", .both), ("Picture", .video), ("Sound", .audio)]
@@ -398,14 +399,14 @@ final class Together {
         NSApp.activate(ignoringOtherApps: true)
         guard alert.runModal() == .alertFirstButtonReturn else { return }
 
-        let soundOnly = what.indexOfSelectedItem == 1
         var members = zip(receivers, rows).filter { $0.1.0.state == .on }
             .map { GroupMember($0.0, role: roles[$0.1.1.indexOfSelectedItem].1) }
+        guard members.count >= 2 else { return show("Tick two or more receivers") }
+        // Nobody shows the picture: music on every receiver, this Mac's sound only, all at one delay.
+        let soundOnly = what.indexOfSelectedItem == 1 || !members.contains { $0.role.video }
         // The picture's receiver leads (luchd: the first one shows it).
         if let lead = members.firstIndex(where: { $0.role.video }) { members.insert(members.remove(at: lead), at: 0) }
-        let mode: SyncMode = timing.indexOfSelectedItem == 0 ? .interactive : .watching
-        guard members.count >= 2 else { return show("Tick two or more receivers") }
-        if !soundOnly && !members[0].role.video { return show("One receiver must show the picture") }
+        let mode: SyncMode = soundOnly || timing.indexOfSelectedItem == 1 ? .watching : .interactive
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             try? self?.play(members, mode: mode, soundOnly: soundOnly)
         }
