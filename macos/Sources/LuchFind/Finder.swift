@@ -19,6 +19,8 @@ public final class Finder {
     public var onProgress: ((FindProgress) -> Void)?
     /// Whether a session with the receiver is open (it is then on, whatever a probe says).
     public var isConnected: (String) -> Bool = { _ in false }
+    /// The ladder's last rung, connecting directly (Direct.swift sets it).
+    var directRung: (() throws -> String)?
 
     private let lock = NSLock()
     /// Receivers found other ways than mDNS, by id.
@@ -27,6 +29,8 @@ public final class Finder {
     private var rssi: [String: Int] = [:]
     private var welcomes: [String: [String: Any]] = [:]
     private var tokens: [String: String] = [:]
+    /// Receivers heard over Bluetooth that offer a direct connection, by card id.
+    private var nearby: [String: Heard] = [:]
     private var last = FindProgress()
     private var lastEnd: TimeInterval?
 
@@ -88,7 +92,7 @@ public final class Finder {
         return tokens.removeValue(forKey: id)
     }
 
-    private func add(_ r: Receiver, via how: String, rssi strength: Int?, token: String?, welcome: [String: Any]) {
+    func add(_ r: Receiver, via how: String, rssi strength: Int?, token: String?, welcome: [String: Any]) {
         lock.lock()
         let fresh = found[r.id] == nil
         found[r.id] = r
@@ -181,6 +185,9 @@ public final class Finder {
                 return (r, w)
             }, found: { [self] hit in add(hit.0, via: "scan", rssi: nil, token: nil, welcome: hit.1) }).map(\.0.name)
             return "asked \(nets.joined(separator: ", ")): " + (names.isEmpty ? "no receiver" : "found \(names.joined(separator: ", "))")
+        case .direct:
+            guard let directRung else { throw FindError("connecting directly is not available here") }
+            return try directRung()
         case .ble:
             if !asked, CBCentralManager.authorization == .notDetermined {
                 throw FindError("Bluetooth is not allowed yet: Find Receivers, Listen over Bluetooth (or `luchctl find ble`) asks for it")
@@ -190,10 +197,17 @@ public final class Finder {
             let noteLock = NSLock()
             // Each receiver is tried as soon as it is heard, while the scan goes on.
             let heard = try BLE.search(seconds: Ladder.bleListen) { [self] h in
+                noteNearby(h)
                 tries.enter()
                 Thread.detachNewThread { [self] in
-                    let note: String
-                    do { note = try reach(h.card, via: "ble", rssi: h.rssi) } catch { note = "heard \(h.card.id) but \(error.localizedDescription)" }
+                    var note: String
+                    do {
+                        note = try reach(h.card, via: "ble", rssi: h.rssi)
+                    } catch {
+                        note = h.card.addr == nil ? "heard \(h.card.id), not on this network"
+                                                  : "heard \(h.card.id) but \(error.localizedDescription)"
+                        if h.card.psm != 0 { note += "; direct possible (`luchctl direct \(h.card.id)`)" }
+                    }
                     noteLock.lock()
                     notes.append(note)
                     noteLock.unlock()
@@ -258,6 +272,38 @@ public final class Finder {
             $0.address == ip && (card.id.isEmpty || $0.id.replacingOccurrences(of: "-", with: "").lowercased().hasPrefix(card.id))
         }) else { throw FindError("receiver went away") }
         return r.id
+    }
+
+    // MARK: - heard over Bluetooth, for a direct connection
+
+    /// Keeps a receiver heard over the air that offers a direct connection.
+    func noteNearby(_ h: Heard) {
+        guard h.card.psm != 0 else { return }
+        lock.lock()
+        nearby[h.card.id] = h
+        lock.unlock()
+    }
+
+    /// The receivers heard offering a direct connection, nearest first.
+    public func directNearby() -> [Heard] {
+        lock.lock()
+        defer { lock.unlock() }
+        return nearestFirst(Array(nearby.values))
+    }
+
+    /// The listed receiver whose id the card's 8 hex digits start, if any.
+    public func listed(card id: String) -> Receiver? {
+        list().first { $0.id.replacingOccurrences(of: "-", with: "").lowercased().hasPrefix(id) }
+    }
+
+    /// Drops a receiver found other ways than mDNS (a direct one, once its network is left).
+    func drop(_ id: String) {
+        lock.lock()
+        let was = found.removeValue(forKey: id) != nil
+        via.removeValue(forKey: id)
+        rssi.removeValue(forKey: id)
+        lock.unlock()
+        if was { onChange?() }
     }
 
     // MARK: - what a receiver is

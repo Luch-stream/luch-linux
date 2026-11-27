@@ -39,6 +39,11 @@ final class LadderTests: XCTestCase {
         _ = l.due(now: 0, foundAny: false, running: 0)
         XCTAssertEqual(l.due(now: 2, foundAny: false, running: 0), [.ble])
         XCTAssertEqual(l.due(now: 2.1, foundAny: false, running: 0), [.sound, .qr])
+        XCTAssertEqual(l.due(now: 2.2, foundAny: false, running: 2), [], "the TV's sound and its code have their time")
+        XCTAssertEqual(l.due(now: 33, foundAny: false, running: 0), [.direct], "last, and only when asked: all")
+        XCTAssertTrue(l.exhausted)
+        XCTAssertFalse(try Ladder(mode: "auto").rungs.contains(.direct), "never by itself")
+        XCTAssertEqual(try Ladder(mode: "direct").rungs, [.direct])
 
         var some = try Ladder(mode: "qr, ble")
         XCTAssertEqual(some.due(now: 0, foundAny: false, running: 0), [.qr, .ble])
@@ -98,12 +103,14 @@ final class LadderTests: XCTestCase {
             switch r {
             case .ble: done(.failure(FindError("Bluetooth is off")))
             case .sound, .qr: clock.after(30) { done(.success("heard nothing")) }
+            case .direct: done(.failure(FindError("no receiver nearby offers a direct connection")))
             default: done(.success("nothing"))
             }
         }, report: { _ in })
         XCTAssertEqual(starts.map(\.0), Rung.allCases)
-        // Within a tick or two of each other, not 4 and 16 s apart.
-        XCTAssertTrue(starts.allSatisfy { $0.1 <= 0.5 }, "\(starts)")
+        // Within a tick or two of each other, not 4 and 16 s apart; connecting directly once sound and camera are done.
+        XCTAssertTrue(starts.dropLast().allSatisfy { $0.1 <= 0.5 }, "\(starts)")
+        XCTAssertEqual(starts.last?.1 ?? 0, 30, accuracy: 0.5)
         let rungs = p.json["rungs"] as! [[String: Any]]
         XCTAssertEqual(rungs[2]["state"] as? String, "failed")
         XCTAssertEqual(rungs[2]["note"] as? String, "Bluetooth is off")

@@ -125,6 +125,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         discovery.start()
         finding.onChange = { [weak self] in DispatchQueue.main.async { self?.refreshReceivers() } }
         finding.finder.isConnected = { [caster] id in caster.existing(id) != nil }
+        finding.direct.direct.isBusy = { [weak self] id in DispatchQueue.main.sync { self?.currentReceiverID == id } }
         caster.onOpen = { [finding] r in finding.finder.remember(r) }
         try? finding.finder.start("auto")
         let identity = senderIdentity()
@@ -150,6 +151,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         engine?.stop(reason: "quit")
+        _ = try? finding.direct.direct.off() // back to the Wi-Fi network a direct connection left
     }
 
     // MARK: - local API (luchctl)
@@ -773,6 +775,7 @@ extension AppDelegate {
         }
         inputItems(for: r).forEach(m.addItem)
         together.addReceiverItems(to: m, receiver: r)
+        finding.direct.items(for: r).forEach(m.addItem)
 
         m.addItem(.separator())
         m.addItem(.run("Show File…", symbol: "doc") { [weak self] in self?.chooseFiles(for: r) })

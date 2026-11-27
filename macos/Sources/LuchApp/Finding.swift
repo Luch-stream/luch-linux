@@ -8,21 +8,25 @@ import LuchNet
 
 final class Finding {
     /// Answered on the local socket's thread: several wait for the network, Bluetooth or the person.
-    static let commands: Set<String> = ["find", "find_status", "discovered", "add", "refresh", "sender_id", "known",
-                                        "wake", "learn_wake", "set_wake", "info"]
+    static let commands = Set(["find", "find_status", "discovered", "add", "refresh", "sender_id", "known",
+                                        "wake", "learn_wake", "set_wake", "info"]).union(DirectUI.commands)
 
     let finder: Finder
+    /// Connecting directly over Bluetooth and Wi-Fi Direct (DirectMenu.swift).
+    let direct: DirectUI
     /// The list changed, or what is being tried did; called on any thread.
     var onChange: (() -> Void)? {
         didSet {
             finder.onChange = onChange
             finder.onProgress = { [weak self] _ in self?.onChange?() }
+            direct.onChange = onChange
         }
     }
 
     init(discovery: Discovery) {
         let me = senderIdentity()
         finder = Finder(me: ProbeIdentity(id: me.id, name: me.name)) { discovery.all() }
+        direct = DirectUI(finder: finder, me: ProbeIdentity(id: me.id, name: me.name))
         // A QR code's or the TV's sound's token goes into the next hello to that receiver (PROTOCOL.md 1e).
         Connector.shared.takeToken = { [finder] id in finder.takeToken(for: id) }
     }
@@ -31,6 +35,7 @@ final class Finding {
 
     func handle(_ request: [String: Any], receivers: [Receiver]) -> [String: Any] {
         let id = request["id"] as? String ?? ""
+        if DirectUI.commands.contains(request["cmd"] as? String ?? "") { return direct.handle(request) }
         do {
             switch request["cmd"] as? String ?? "" {
             case "find":
@@ -88,6 +93,7 @@ final class Finding {
             item.submenu = asleepMenu(id: id, name: name, r)
             menu.addItem(item)
         }
+        direct.addNearby(to: menu, online: online)
         menu.addItem(.separator())
         menu.addItem(findItem())
         menu.addItem(.run("Add Receiver by Link or Address…", symbol: "plus") { [weak self] in self?.askForLink() })
@@ -141,6 +147,7 @@ final class Finding {
                 self?.onChange?()
             })
         }
+        direct.addFindItems(to: m)
         parent.submenu = m
         return parent
     }

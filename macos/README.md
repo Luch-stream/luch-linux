@@ -279,6 +279,24 @@ macOS lets no app advertise manufacturer data (CoreBluetooth sends only a name a
 HCI calls do nothing since the stack moved into bluetoothd), so the Mac can learn the remote's signal but not send
 it: a Luch receiver or phone that is on and lists `ble_wake` in its welcome sends it for the Mac.
 
+### Connecting directly
+
+When the Mac and the TV share no network that lets them talk (a hotel's Wi-Fi that keeps devices apart), a receiver
+heard over Bluetooth with a PSM in its card is asked for its Wi-Fi Direct network: the Mac opens an L2CAP channel to
+it, runs the receiver's TLS control protocol over it (pin, pairing code, the person's Allow on the TV), and joins
+the network it answers with as an ordinary Wi-Fi network; the receiver is then listed at its address there, and
+mirror, cast and the rest work as on any LAN. It is the last way of `find all` and `find direct`, never automatic:
+the Mac asks first, as it leaves its Wi-Fi ("Connect directly to <TV>? This Mac leaves '<network>' while showing,
+and comes back after."), and goes back when showing ends, after 2.5 minutes of nothing shown, or on `direct off`.
+Ethernet keeps its internet meanwhile. Wi-Fi names are Location data on macOS 14+: Location is asked for the first
+time it is used; without it the Mac cannot tell which network it left, and macOS's auto-join picks where to go back.
+
+```sh
+luchctl direct                              # the nearest receiver heard offering it; asks on the terminal first
+luchctl direct 'Living room TV'             # or by name or card id; `luchctl find` lists them ("direct possible")
+luchctl direct off                          # leave its network now and go back
+```
+
 ## TVs without Luch and the web receiver
 
 Chromecasts and Google TVs (mDNS `_googlecast._tcp`, Google Cast on port 8009) and DLNA/UPnP renderers (SSDP, on

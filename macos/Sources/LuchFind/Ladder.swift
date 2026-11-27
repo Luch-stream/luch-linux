@@ -4,12 +4,14 @@
 // 1. mDNS and, at the same time, a sweep of the LAN for the control port;
 // 2. after a few seconds with nothing: Bluetooth LE, the receivers' cards over the air;
 // 3. only when the person asked for it ("all"), as it needs them and opens the microphone and the camera: the TV
-//    saying its card by sound, and its QR code held up to the camera.
+//    saying its card by sound, and its QR code held up to the camera;
+// 4. last, only when asked ("direct" or "all") and only after the person says yes, as it takes this Mac off its
+//    Wi-Fi: connecting directly to a receiver heard over Bluetooth (Direct.swift).
 // SPDX-License-Identifier: GPL-3.0-or-later
 import Foundation
 
 public enum Rung: String, CaseIterable {
-    case mdns, scan, ble, sound, qr
+    case mdns, scan, ble, sound, qr, direct
 
     /// What the person is told while it runs.
     public var trying: String {
@@ -19,6 +21,7 @@ public enum Rung: String, CaseIterable {
         case .ble: return "listening for receivers over Bluetooth"
         case .sound: return "listening on the microphone: on the TV, open Luch and choose \"Say the address\""
         case .qr: return "looking through the camera: hold it up to the QR code on the TV"
+        case .direct: return "asking to connect directly to a receiver heard over Bluetooth (Wi-Fi Direct)"
         }
     }
 }
@@ -42,26 +45,30 @@ public struct Ladder {
     public static let firstPatience: TimeInterval = 4
     public static let bleListen: TimeInterval = 12
     public static let personListen: TimeInterval = 30
+    /// The person's yes, the TV's Allow (and maybe pairing), the group coming up and joining it.
+    public static let directWait: TimeInterval = 180
 
     private var tiers: [FindTier]
     private var next = 0
     private var tierAt: TimeInterval = 0
 
-    /// "auto" (what refresh climbs), "all" (also sound and the camera), or a comma-separated list of rungs to try
-    /// right away.
+    /// "auto" (what refresh climbs), "all" (also sound, the camera and a direct connection), or a comma-separated
+    /// list of rungs to try right away.
     public init(mode: String) throws {
         let first = FindTier(rungs: [.mdns, .scan], patience: Ladder.firstPatience)
         let ble = FindTier(rungs: [.ble], patience: Ladder.bleListen)
         let person = FindTier(rungs: [.sound, .qr], patience: Ladder.personListen)
+        let direct = FindTier(rungs: [.direct], patience: Ladder.directWait)
         switch mode {
         case "", "auto": tiers = [first, ble]
-        case "all": tiers = [first, ble, person]
+        case "all": tiers = [first, ble, person, direct]
         default:
             let rungs = mode.split(separator: ",").map { Rung(rawValue: $0.trimmingCharacters(in: .whitespaces)) }
             guard !rungs.isEmpty, rungs.allSatisfy({ $0 != nil }) else {
-                throw FindError("unknown way to look: \(mode) (auto, all, or some of mdns,scan,ble,sound,qr)")
+                throw FindError("unknown way to look: \(mode) (auto, all, or some of mdns,scan,ble,sound,qr,direct)")
             }
-            tiers = [FindTier(rungs: rungs.compactMap { $0 }, patience: Ladder.personListen)]
+            let asked = rungs.compactMap { $0 }
+            tiers = [FindTier(rungs: asked, patience: asked.contains(.direct) ? Ladder.directWait : Ladder.personListen)]
         }
     }
 
