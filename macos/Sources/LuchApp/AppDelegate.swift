@@ -203,6 +203,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if request["ultra"] != nil, ultra == nil { return ["error": "ultra: speed, quality or mac"] }
             startMirror(receiver, extend: request["extend"] as? Bool, ultra: ultra)
             return ["ok": true, "receiver": receiver.name]
+        case "screen":
+            guard let mode = (request["mode"] as? String).flatMap(ScreenMode.init(rawValue:)) else {
+                return ["error": "screen: asis, speed, quality, mac or extend"]
+            }
+            guard let id = currentReceiverID, let r = receivers.first(where: { $0.id == id }) else {
+                return ["error": "not mirroring"]
+            }
+            Preferences.shared.setScreenMode(mode, for: r.id)
+            switchScreen(mode, on: r)
+            return ["ok": true, "receiver": r.name]
         case "warmth":
             let value: Double
             if let number = request["value"] as? NSNumber { value = number.doubleValue }
@@ -674,7 +684,10 @@ extension AppDelegate {
         let modeMenu = NSMenu()
         for each in ScreenMode.allCases {
             if each == .extend { modeMenu.addItem(.separator()) }
-            let item = NSMenuItem.run(each.label) { Preferences.shared.setScreenMode(each, for: r.id) }
+            let item = NSMenuItem.run(each.label) { [weak self] in
+                Preferences.shared.setScreenMode(each, for: r.id)
+                self?.switchScreen(each, on: r)
+            }
             if each == mode { item.state = .on }
             modeMenu.addItem(item)
         }
@@ -866,6 +879,32 @@ extension AppDelegate: NSMenuDelegate {
 }
 
 // MARK: - how the screen reaches a receiver
+
+extension AppDelegate {
+    /// A new way to show the screen takes effect at once when this TV is being mirrored to (sound only stays).
+    fileprivate func switchScreen(_ mode: ScreenMode, on r: Receiver) {
+        guard let engine, currentReceiverID == r.id, engine.streaming, !engine.options.soundOnly else { return }
+        state = "Switching \(r.name) to \(mode.short)…"
+        rebuildMenu()
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            do {
+                try engine.switchScreen(extend: mode == .extend, ultra: mode.ultra)
+                let codec = engine.plan?.codec.label ?? ""
+                let at = engine.ultraMode.map { " at its \($0)" } ?? ""
+                DispatchQueue.main.async {
+                    self?.state = "\(mode == .extend ? "Extended" : "Mirroring") to \(r.name)\(at) · \(codec)"
+                    self?.rebuildMenu()
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self?.state = "Error: \(error.localizedDescription)"
+                    self?.rebuildMenu()
+                }
+                engine.stop(reason: "switch failed")
+            }
+        }
+    }
+}
 
 /// The receiver menu's choice of how this Mac's screen is shown, kept per TV.
 enum ScreenMode: String, CaseIterable {
