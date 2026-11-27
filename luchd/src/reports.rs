@@ -257,6 +257,9 @@ mod tests {
 
     #[test]
     fn stored_reports_are_listed_and_removed() {
+        let _env = crate::tests::CONFIG_HOME
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let home = std::env::temp_dir().join(format!("luch-reports-{}", std::process::id()));
         std::env::set_var("XDG_CONFIG_HOME", &home);
         let mut bad = report();

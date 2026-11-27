@@ -2443,14 +2443,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
 mod tests {
     use super::*;
 
+    /// Tests that point XDG_CONFIG_HOME somewhere of their own hold this: the variable is one for the process.
+    pub(crate) static CONFIG_HOME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// A receiver that has reports gets them taken over the control channel: answered with `reports_taken`, kept on
     /// disk. Needs a session bus (the channel signals changes on it); skipped without one.
     #[tokio::test]
+    #[allow(clippy::await_holding_lock)] // held on purpose for the whole test; nothing else in it takes the lock
     async fn reports_from_a_receiver_are_taken_and_kept() {
         let Ok(conn) = Connection::session().await else {
             eprintln!("no session bus: skipped");
             return;
         };
+        let _env = CONFIG_HOME.lock().unwrap_or_else(|e| e.into_inner());
         let home = std::env::temp_dir().join(format!("luch-chan-{}", uuid::Uuid::new_v4()));
         std::env::set_var("XDG_CONFIG_HOME", &home);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
