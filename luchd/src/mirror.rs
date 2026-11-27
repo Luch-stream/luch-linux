@@ -73,6 +73,10 @@ pub struct Target {
     pub audio: Option<Value>,
     /// Sound only, like a speaker (PROTOCOL.md 4d): no capture of the screen, no video stream.
     pub audio_only: bool,
+    /// The receiver's input may drive this computer once the person allows it (PROTOCOL.md 4i).
+    pub input: Option<crate::input::Config>,
+    /// The receiver's id: what an "always" is remembered by.
+    pub id: String,
 }
 
 fn parse_size(s: &str) -> Option<(u32, u32)> {
@@ -420,6 +424,15 @@ pub fn available_sources() -> Vec<&'static str> {
     v
 }
 
+async fn niri_outputs() -> Option<Value> {
+    let o = tokio::process::Command::new("niri")
+        .args(["msg", "-j", "outputs"])
+        .output()
+        .await
+        .ok()?;
+    serde_json::from_slice(&o.stdout).ok()
+}
+
 pub fn niri_virtual_available() -> bool {
     std::env::var_os("NIRI_SOCKET").is_some()
         && std::env::var_os("PATH")
@@ -676,6 +689,14 @@ impl Tx {
         }
     }
 
+    /// The UDP socket, for the input that comes back on the same flow.
+    fn udp(&self) -> Option<&UdpSocket> {
+        match &self.out {
+            Out::Udp(s) => Some(s),
+            Out::Ws(..) => None,
+        }
+    }
+
     // ponytail: one send() per shard; sendmmsg/UDP_SEGMENT if the syscall count ever shows up in profiles.
     fn send_frame(&self, data: &[u8], flags: u8, pts_us: u64, host_lat: u16) {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
@@ -857,6 +878,56 @@ async fn portal(
         return Ok((sc, session, fd, node));
     }
     Err("portal returned a different source type".into())
+}
+
+/// What the portal gave for a session: a plain screencast, or the RemoteDesktop session that carries it and
+/// the receiver's input (one approval for both).
+enum Capture {
+    /// The proxy lives as long as its session.
+    Cast(
+        #[allow(dead_code)] Screencast,
+        ashpd::desktop::Session<Screencast>,
+        OwnedFd,
+        u32,
+    ),
+    Remote(Arc<crate::input::portal::Remote>, OwnedFd),
+}
+
+impl Capture {
+    fn pipewire(&self) -> (i32, u32) {
+        match self {
+            Capture::Cast(_, _, fd, node) => (fd.as_raw_fd(), *node),
+            Capture::Remote(r, fd) => (fd.as_raw_fd(), r.node),
+        }
+    }
+
+    fn remote(&self) -> Option<Arc<crate::input::portal::Remote>> {
+        match self {
+            Capture::Remote(r, _) => Some(r.clone()),
+            Capture::Cast(..) => None,
+        }
+    }
+
+    async fn close(&self) {
+        let _ = match self {
+            Capture::Cast(_, session, _, _) => session.close().await,
+            Capture::Remote(r, _) => r.session.close().await,
+        };
+    }
+}
+
+/// The screencast, inside a RemoteDesktop session when the receiver's input may be wanted. A desktop without
+/// that portal (niri, wlroots) or a person who refuses it gets the plain screencast: input then goes by uinput.
+async fn capture(source: SourceType, with_input: bool) -> Result<Capture, String> {
+    if with_input {
+        let dir = crate::config_dir().map_err(|e| e.to_string())?;
+        match crate::input::portal::open(source, &dir).await {
+            Ok((r, fd)) => return Ok(Capture::Remote(Arc::new(r), fd)),
+            Err(e) => eprintln!("[luchd] {e}; screencast only"),
+        }
+    }
+    let (sc, session, fd, node) = portal(source).await?;
+    Ok(Capture::Cast(sc, session, fd, node))
 }
 
 /// Video from the portal (`Some((fd, node))`) plus audio, or audio only when luch-kms does video.
@@ -1294,10 +1365,12 @@ pub async fn run(
     } else {
         None
     };
+    let wants_input = t.input.as_ref().is_some_and(|i| i.receiver_can) && t.ws.is_none();
     let portal = if t.kms || t.niri_virtual || t.audio_only {
         None
     } else {
-        Some(portal(t.source).await?)
+        let remote = wants_input && !matches!(crate::input::mode(), "off" | "uinput");
+        Some(capture(t.source, remote).await?)
     };
     let _mode = if t.kms && t.mirror169 {
         switch_to_16x9(size.width).await
@@ -1389,10 +1462,46 @@ pub async fn run(
         )
     };
 
+    // The receiver's input comes back on the video flow (PROTOCOL.md 4i); nothing is injected before a grant.
+    let mut input = match (&t.input, video.udp()) {
+        (Some(_), Some(sock)) if wants_input && crate::input::mode() != "off" => {
+            use crate::input::{inject::Injector, map::Geometry};
+            let remote = portal.as_ref().and_then(Capture::remote);
+            let geo = match (&remote, &nv) {
+                (Some(r), _) => {
+                    Geometry::from_stream(r.position, r.size, (size.width, size.height), None)
+                }
+                (None, Some(n)) => niri_outputs()
+                    .await
+                    .and_then(|v| crate::input::map::niri_geometry(&v, &n._output.0))
+                    .unwrap_or_else(|| Geometry::alone(size.width as f64, size.height as f64)),
+                (None, None) => Geometry::alone(size.width as f64, size.height as f64),
+            };
+            let uinput = crate::input::mode() != "portal" && crate::input::uinput::allowed();
+            match crate::input::Input::start(sock, Injector::new(remote, uinput, geo)) {
+                Ok(i) => Some(i),
+                Err(e) => {
+                    eprintln!("[luchd] input: {e}");
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+    let (answer_tx, mut answers) = mpsc::channel::<crate::input::Answer>(1);
+    if let (Some(i), Some(cfg)) = (input.as_mut(), &t.input) {
+        if let Some(grant) = i.remembered(cfg.always) {
+            let _ = cmd.send(Cmd::Send(grant)).await;
+        }
+    }
+
     let p = pipeline(
         portal
             .as_ref()
-            .map(|(_, _, fd, node)| (Some(fd.as_raw_fd()), *node))
+            .map(|c| {
+                let (fd, node) = c.pipewire();
+                (Some(fd), node)
+            })
             .or(nv.as_ref().map(|n| (None, n.node))),
         size,
         virtual_source,
@@ -1428,8 +1537,8 @@ pub async fn run(
             Err(e) => {
                 let _ = p.set_state(gst::State::Null);
                 let _ = cmd.send(Cmd::Send(json!({"t": "stop"}))).await;
-                if let Some((_, session, _, _)) = &portal {
-                    let _ = session.close().await;
+                if let Some(c) = &portal {
+                    c.close().await;
                 }
                 return Err(e);
             }
@@ -1467,6 +1576,14 @@ pub async fn run(
                 let _ = cmd.send(Cmd::Send(json!({"t": "stop"}))).await;
                 break Ok("stopped");
             }
+            Some(a) = answers.recv() => {
+                if let Some(i) = input.as_mut() {
+                    let _ = cmd.send(Cmd::Send(i.answer(a))).await;
+                }
+                if a == crate::input::Answer::Always {
+                    crate::save_choice(crate::input::ask::CHOICES_FILE, &t.id, "always");
+                }
+            }
             ev = events.recv() => match ev {
                 Ok(v) if v["t"] == "keyframe" => {
                     want_idr.store(true, Ordering::Relaxed);
@@ -1475,6 +1592,27 @@ pub async fn run(
                     }
                 }
                 Ok(v) if v["t"] == "stats" => rx_stats = v,
+                Ok(v) if v["t"] == "input_request" => {
+                    use crate::input::Step;
+                    match (input.as_mut().map(|i| i.request()), &t.input) {
+                        (Some(Step::Reply(m)), _) => {
+                            let _ = cmd.send(Cmd::Send(m)).await;
+                        }
+                        (Some(Step::Ask), Some(cfg)) => {
+                            let (dbus, name, tx) = (cfg.dbus.clone(), t.name.clone(), answer_tx.clone());
+                            let devices: Vec<String> = v["devices"].as_array().into_iter().flatten()
+                                .filter_map(|d| d.as_str().map(String::from)).collect();
+                            tokio::spawn(async move {
+                                let a = crate::input::ask::ask(&dbus, &name, &devices, crate::input::ask::TIMEOUT).await;
+                                let _ = tx.send(a).await;
+                            });
+                        }
+                        (Some(_), _) => {}
+                        (None, _) => {
+                            let _ = cmd.send(Cmd::Send(json!({"t": "input", "grant": "no"}))).await;
+                        }
+                    }
+                }
                 Ok(v) if v["t"] == "_rtt" => rtt = json!(round1(v["ms"].as_f64().unwrap_or(0.0))),
                 Ok(v) if v["t"] == "stop" => {
                     eprintln!("[luchd] {}: receiver sent {v}", t.name);
@@ -1500,9 +1638,9 @@ pub async fn run(
     if let Some(n) = nv {
         let _ = n.session.call::<_, _, ()>("Stop", &()).await;
     }
-    if let Some((_sc, session, fd, _)) = portal {
-        let _ = session.close().await;
-        drop(fd);
+    drop(input);
+    if let Some(c) = portal {
+        c.close().await;
     }
     // Removing the virtual monitor must not disturb the physical ones: restore the layout that
     // was active before extend, once Mutter has dropped the virtual connector.

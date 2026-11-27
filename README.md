@@ -43,6 +43,12 @@ can be installed. Certificate trust support depends on the TV browser. Videos, s
 the receiver plays them itself in their own quality, like Chromecast (see **Use**). Planned: presentation mode with
 a presenter view.
 
+**Control from the receiver.** A tablet or phone running the receiver can drive this desktop: real multitouch
+where you see it, or a touchpad mode. A stylus works with pressure where uinput is allowed. A keyboard, mouse or
+gamepad plugged into the TV goes to the computer. The computer asks first ("May Living room TV control this
+computer?"). Input goes through the RemoteDesktop portal, combined with the screencast so one dialog approves both;
+gamepads, the stylus and desktops without that portal (niri, wlroots) use uinput. See [docs/input.md](docs/input.md).
+
 ## How it works
 
 ```
@@ -205,6 +211,9 @@ tries every one it knows for that receiver:
 - `fast` fails with «needs CAP_SYS_ADMIN»: run the `setcap` line again (reinstalling drops it).
 - Logs: `journalctl --user -u luchd -f`. `LUCH_PROBE=1` in the service environment prints
   per-stage latency.
+- The receiver cannot control the computer: answer the notification, or check `LUCH_INPUT` is not `off`.
+  Gamepads and stylus pressure need write access to `/dev/uinput` (`input` group, or the `steam-devices` udev
+  rules).
 
 ## License
 

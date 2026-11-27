@@ -6,6 +6,7 @@ mod discovery;
 mod display;
 mod enc;
 mod find;
+mod input;
 mod limits;
 mod mirror;
 mod mpris;
@@ -704,6 +705,25 @@ impl Luch {
         Ok(())
     }
 
+    /// Whether a receiver's touch, keyboard, mouse and gamepads may control this computer without asking:
+    /// "always" (the person said so once) or "ask" (the default).
+    async fn input_choice(&self, id: String) -> String {
+        saved_choices(input::ask::CHOICES_FILE)
+            .remove(&id)
+            .unwrap_or_else(|| "ask".into())
+    }
+
+    /// Sets the choice above; "ask" takes an "always" back. Takes effect from the next session.
+    async fn set_input_choice(&self, id: String, choice: String) -> fdo::Result<()> {
+        if choice != "ask" && choice != "always" {
+            return Err(fdo::Error::InvalidArgs(format!(
+                "choice must be ask|always, not {choice}"
+            )));
+        }
+        save_choice(input::ask::CHOICES_FILE, &id, &choice);
+        Ok(())
+    }
+
     /// Whether the sender keeps playing sound itself while mirroring. Off: its sound goes to the
     /// receiver only (a null sink is the default output for the session). Saved across restarts.
     #[zbus(property)]
@@ -1247,7 +1267,7 @@ struct Opened {
 /// open_channel makes it the TLS one.
 fn hello(id: &str, host: &str, token: Option<&str>, probe: bool) -> Value {
     let mut h = json!({"t": "hello", "v": p::VERSION, "id": id, "name": host, "app": p::APP,
-                       "want": ["mirror", "media", "photo", "reports"]});
+                       "want": ["mirror", "media", "photo", "reports", "input"]});
     if let Some(t) = token {
         h["token"] = json!(t);
     }
@@ -1648,7 +1668,8 @@ async fn run_channel(
                         }
                         let _ = events.send(v);
                     }
-                    "ready" | "keyframe" | "stats" | "photo_ready" | "sleeping" | "app_opened" | "blank" => {
+                    "ready" | "keyframe" | "stats" | "photo_ready" | "sleeping" | "app_opened" | "blank"
+                    | "input_request" => {
                         let _ = events.send(v);
                     }
                     "stop" => {
@@ -1938,6 +1959,17 @@ async fn start_mirror(
         mirror169,
         audio,
         audio_only,
+        input: (input::mode() != "off").then(|| input::Config {
+            dbus: conn.clone(),
+            receiver_can: welcome["input"].as_array().is_some_and(|a| !a.is_empty()),
+            always: input::ask::remembered(
+                saved_choices(input::ask::CHOICES_FILE)
+                    .get(id)
+                    .map(String::as_str),
+            )
+            .is_some(),
+        }),
+        id: id.to_string(),
     };
     let (stop_tx, stop_rx) = mpsc::channel(1);
     let stats = mirror::Stats::default();
