@@ -15,13 +15,13 @@ final class Preferences {
     static let shared = Preferences()
     private let defaults = UserDefaults.standard
 
-    /// What ultra-low latency puts first, per receiver id; nil until asked.
-    func ultra(for id: String) -> UltraPriority? {
-        (defaults.string(forKey: "ultra." + id)).flatMap(UltraPriority.init(rawValue:))
+    /// How a receiver gets this Mac's screen; as it is until chosen.
+    func screenMode(for id: String) -> ScreenMode {
+        (defaults.string(forKey: "screen." + id)).flatMap(ScreenMode.init(rawValue:)) ?? .asIs
     }
 
-    func setUltra(_ p: UltraPriority, for id: String) {
-        defaults.set(p.rawValue, forKey: "ultra." + id)
+    func setScreenMode(_ m: ScreenMode, for id: String) {
+        defaults.set(m.rawValue, forKey: "screen." + id)
     }
 
     var bitrate: Int {
@@ -201,7 +201,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let receiver = match else { return ["error": "receiver not found"] }
             let ultra = (request["ultra"] as? String).flatMap(UltraPriority.init(rawValue:))
             if request["ultra"] != nil, ultra == nil { return ["error": "ultra: speed, quality or mac"] }
-            startMirror(receiver, extend: request["extend"] as? Bool ?? false, ultra: ultra)
+            startMirror(receiver, extend: request["extend"] as? Bool, ultra: ultra)
             return ["ok": true, "receiver": receiver.name]
         case "warmth":
             let value: Double
@@ -426,8 +426,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         startMirror(receivers[0])
     }
 
-    private func startMirror(_ receiver: Receiver, soundOnly: Bool = false, extend: Bool = false,
+    private func startMirror(_ receiver: Receiver, soundOnly: Bool = false, extend: Bool? = nil,
                              ultra: UltraPriority? = nil) {
+        // Nothing asked for: the way chosen for this TV in its menu (also for mirror on launch and luchctl).
+        let saved = Preferences.shared.screenMode(for: receiver.id)
+        let ultra = ultra ?? (extend == nil && !soundOnly ? saved.ultra : nil)
+        let extend = extend ?? (!soundOnly && ultra == nil && saved == .extend)
         // Switching sessions: let the receiver close the previous one first, otherwise it tears
         // down the new session a few hundred ms after start.
         if let old = engine {
@@ -524,7 +528,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 DispatchQueue.main.async {
                     self?.state = soundOnly ? "Playing sound on \(receiver.name)"
                         : extend ? "Extended to \(receiver.name) · \(codec)"
-                        : ultra != nil ? "Ultra-low latency to \(receiver.name) · \(engine.ultraMode.map { "\($0)" } ?? "") · \(codec)"
+                        : ultra != nil ? "Mirroring to \(receiver.name) at its \(engine.ultraMode.map { "\($0)" } ?? "") · \(codec)"
                         : "Mirroring to \(receiver.name) · \(codec)\(batteryNote)"
                     self?.rebuildMenu()
                 }
@@ -662,24 +666,20 @@ extension AppDelegate {
     fileprivate func receiverMenu(_ r: Receiver) -> NSMenu {
         let m = NSMenu()
         let mirroringHere = currentReceiverID == r.id
-        m.addItem(.run("Mirror Screen", symbol: "rectangle.on.rectangle") { [weak self] in self?.startMirror(r) })
-        m.addItem(.run("Extend Screen", symbol: "rectangle.split.2x1") { [weak self] in
-            self?.startMirror(r, extend: true)
+        let mode = Preferences.shared.screenMode(for: r.id)
+        m.addItem(.run(mode == .extend ? "Extend Screen" : "Mirror Screen", symbol: mode.symbol) { [weak self] in
+            self?.startMirror(r, extend: mode == .extend, ultra: mode.ultra)
         })
-        m.addItem(.run("Mirror · Ultra-Low Latency", symbol: "bolt") { [weak self] in
-            guard let self, let p = self.ultraPriority(for: r) else { return }
-            self.startMirror(r, ultra: p)
-        })
-        let ultraItem = NSMenuItem(title: "Ultra-Low Latency Puts First", action: nil, keyEquivalent: "")
-        let ultraMenu = NSMenu()
-        let saved = Preferences.shared.ultra(for: r.id)
-        for p in UltraPriority.allCases {
-            let item = NSMenuItem.run(p.label) { Preferences.shared.setUltra(p, for: r.id) }
-            if p == saved { item.state = .on }
-            ultraMenu.addItem(item)
+        let modeItem = NSMenuItem(title: "Screen: \(mode.short)", action: nil, keyEquivalent: "")
+        let modeMenu = NSMenu()
+        for each in ScreenMode.allCases {
+            if each == .extend { modeMenu.addItem(.separator()) }
+            let item = NSMenuItem.run(each.label) { Preferences.shared.setScreenMode(each, for: r.id) }
+            if each == mode { item.state = .on }
+            modeMenu.addItem(item)
         }
-        ultraItem.submenu = ultraMenu
-        m.addItem(ultraItem)
+        modeItem.submenu = modeMenu
+        m.addItem(modeItem)
         m.addItem(.run("Play Sound Only", symbol: "hifispeaker") { [weak self] in self?.startMirror(r, soundOnly: true) })
         if mirroringHere {
             m.addItem(.run("Stop Mirroring", symbol: "stop.circle") { [weak self] in self?.stopMirror() })
@@ -865,28 +865,51 @@ extension AppDelegate: NSMenuDelegate {
     }
 }
 
-// MARK: - ultra-low latency: asked once per TV what it should put first
+// MARK: - how the screen reaches a receiver
 
-extension AppDelegate {
-    /// What this TV's ultra-low latency mode puts first: asked the first time, then kept (and changed in the menu).
-    fileprivate func ultraPriority(for r: Receiver) -> UltraPriority? {
-        if let p = Preferences.shared.ultra(for: r.id) { return p }
-        let alert = NSAlert()
-        alert.messageText = "Ultra-low latency on \(r.name)"
-        alert.informativeText = "This Mac will draw its desktop at one of the TV's own modes, so no frame is scaled on "
-            + "either side; its own screen shows a copy. What should it put first? It is asked once for this TV and "
-            + "can be changed in its menu."
-        for p in [UltraPriority.speed, .quality, .likeMac] {
-            alert.addButton(withTitle: p.label)
+/// The receiver menu's choice of how this Mac's screen is shown, kept per TV.
+enum ScreenMode: String, CaseIterable {
+    /// This Mac's screen as it is, scaled to the stream: nothing changes on the Mac.
+    case asIs = "asis"
+    /// The desktop drawn at one of the TV's own modes (this Mac's screen shows a copy with bars): nothing is scaled.
+    case speed, quality, likeMac = "mac"
+    /// A second screen of the TV's size beside this Mac's.
+    case extend
+
+    var ultra: UltraPriority? {
+        switch self {
+        case .speed: return .speed
+        case .quality: return .quality
+        case .likeMac: return .likeMac
+        case .asIs, .extend: return nil
         }
-        NSApp.activate(ignoringOtherApps: true)
-        let picked: UltraPriority
-        switch alert.runModal() {
-        case .alertFirstButtonReturn: picked = .speed
-        case .alertSecondButtonReturn: picked = .quality
-        default: picked = .likeMac
+    }
+
+    var label: String {
+        switch self {
+        case .asIs: return "As It Is: this Mac's screen, scaled"
+        case .speed: return "Match the TV · Speed: 1080p at its fastest rate"
+        case .quality: return "Match the TV · Quality: its sharpest mode"
+        case .likeMac: return "Match the TV · Like This Mac: the nearest size"
+        case .extend: return "Extend: a second screen"
         }
-        Preferences.shared.setUltra(picked, for: r.id)
-        return picked
+    }
+
+    var short: String {
+        switch self {
+        case .asIs: return "As It Is"
+        case .speed: return "Match the TV, Speed"
+        case .quality: return "Match the TV, Quality"
+        case .likeMac: return "Match the TV, Like This Mac"
+        case .extend: return "Extend"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .asIs: return "rectangle.on.rectangle"
+        case .speed, .quality, .likeMac: return "bolt"
+        case .extend: return "rectangle.split.2x1"
+        }
     }
 }
