@@ -119,10 +119,11 @@ final class BluetoothTests: XCTestCase {
     func testTheRemotesSignalIsRelayedByAReceiverThatCan() throws {
         let cannot = LoopbackReceiver(id: "aaaaaaaa-0000-4000-8000-000000000001", name: "Bedroom TV")
         let can = LoopbackReceiver(id: "bbbbbbbb-0000-4000-8000-000000000002", name: "Kitchen phone", modes: ["ble_wake"])
-        let relays = [cannot, can].map {
-            Receiver(id: "", name: $0 === can ? "Kitchen phone" : "Bedroom TV", model: "", address: "127.0.0.1",
-                     interfaceName: "lo0", interfaceIndex: 0, port: $0.port, service: "")
+        func relay(_ r: LoopbackReceiver, _ name: String) -> Receiver {
+            Receiver(id: "", name: name, model: "", address: "127.0.0.1", interfaceName: "lo0", interfaceIndex: 0,
+                     port: r.port, service: "")
         }
+        let relays = [relay(cannot, "Bedroom TV"), relay(can, "Kitchen phone")]
         let adv = parseHex("7e8089b6a22f1cffffff3043524b544d")!
         let me = ProbeIdentity(id: "s", name: "Test Mac")
         XCTAssertEqual(try WakeRelay.ask(relays, data: adv, holdMs: 100, me: me), "Kitchen phone")
