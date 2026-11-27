@@ -129,6 +129,7 @@ public enum EngineError: Error, LocalizedError {
     case encoder
     case noSoundOnly
     case noVirtualScreen
+    case refused(String)
 
     public var errorDescription: String? {
         switch self {
@@ -139,6 +140,7 @@ public enum EngineError: Error, LocalizedError {
         case .encoder: return "cannot create the video encoder"
         case .noSoundOnly: return "this receiver cannot play sound only"
         case .noVirtualScreen: return "macOS made no second screen for the TV"
+        case let .refused(why): return why
         }
     }
 }
@@ -320,8 +322,7 @@ public final class Engine {
             start["audio"] = ["codec": "audio/opus", "rate": 48_000, "channels": 2,
                               "frame_ms": options.audioFrameMs]
         }
-        ctl.send(start)
-        guard let ready = ctl.waitFor("ready", timeout: 5) else { throw EngineError.noReady }
+        let ready = try startWhenAllowed(ctl, start)
         guard let videoPort = (ready["video_port"] as? NSNumber)?.uint16Value, videoPort > 0 else {
             throw EngineError.noReady
         }
@@ -362,10 +363,9 @@ public final class Engine {
     /// Sound only: an `audio` block and no `video`; the receiver shows what plays instead of a picture.
     private func startSound(_ ctl: ControlChannel, caps: ReceiverCaps, receiver r: Receiver) throws {
         guard caps.modes.contains("audio"), caps.hasOpus else { throw EngineError.noSoundOnly }
-        ctl.send(["t": "start", "mode": "audio",
-                  "audio": ["codec": "audio/opus", "rate": 48_000, "channels": 2, "frame_ms": options.audioFrameMs]])
-        guard let ready = ctl.waitFor("ready", timeout: 5),
-              let port = (ready["audio_port"] as? NSNumber)?.uint16Value, port > 0 else {
+        let ready = try startWhenAllowed(ctl, ["t": "start", "mode": "audio",
+            "audio": ["codec": "audio/opus", "rate": 48_000, "channels": 2, "frame_ms": options.audioFrameMs]])
+        guard let port = (ready["audio_port"] as? NSNumber)?.uint16Value, port > 0 else {
             throw EngineError.noReady
         }
         log("ready: sound only, audio port \(port)")
@@ -383,6 +383,34 @@ public final class Engine {
         startTimers()
         watchNowPlaying()
         log("playing sound on \(caps.name); Ctrl-C to stop")
+    }
+
+    /// The receiver asks its person first (Allow on the TV, PROTOCOL.md 3a): the app says so.
+    public var onWaitingForAllow: (() -> Void)?
+
+    /// Sends `start` until the receiver takes it. A receiver that asks its person about this sender answers
+    /// not_allowed until they press Allow, and says nothing when they do, so the start is sent again every 1.5 s for
+    /// a minute; Deny closes the connection.
+    private func startWhenAllowed(_ ctl: ControlChannel, _ start: [String: Any]) throws -> [String: Any] {
+        let until = Date().addingTimeInterval(60)
+        var told = false
+        while Date() < until {
+            ctl.send(start)
+            guard let r = ctl.waitForAny(["ready", "error"], timeout: 5) else { throw EngineError.noReady }
+            if r["t"] as? String == "ready" { return r }
+            let detail = r["detail"] as? String ?? r["code"] as? String ?? "refused"
+            guard r["code"] as? String == "not_allowed", !detail.contains("refused") else {
+                throw EngineError.refused(detail)
+            }
+            if !told {
+                told = true
+                log("waiting for Allow on the TV")
+                onWaitingForAllow?()
+            }
+            Thread.sleep(forTimeInterval: 1.5)
+            if ctl.isClosed { throw EngineError.refused("refused on the TV") }
+        }
+        throw EngineError.refused("nobody pressed Allow on the TV")
     }
 
     public func run() {

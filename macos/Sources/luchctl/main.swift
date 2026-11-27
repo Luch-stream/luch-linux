@@ -93,6 +93,16 @@ case "mirror":
             index += 2
             continue
         }
+        if args[index] == "--ultra", index + 1 < args.count {
+            request["ultra"] = args[index + 1]
+            index += 2
+            continue
+        }
+        if args[index] == "--extend" {
+            request["extend"] = true
+            index += 1
+            continue
+        }
         if args[index] == "--size-mode", index + 1 < args.count {
             request["size_mode"] = args[index + 1]
             index += 2
