@@ -1,6 +1,8 @@
 //! Luch protocol v0 constants shared by luchd and luchctl.
 
+/// The plain control port's version (older receivers); `VERSION_TLS` on the TLS port, with pairing (PROTOCOL.md 3a).
 pub const VERSION: u32 = 0;
+pub const VERSION_TLS: u32 = 1;
 pub const RECEIVER_TYPE: &str = "_luch._tcp";
 pub const SENDER_TYPE: &str = "_luchsrc._tcp";
 pub const CONTROL_PORT: u16 = 47800;

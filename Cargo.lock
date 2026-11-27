@@ -994,6 +994,7 @@ name = "luchd"
 version = "0.4.0"
 dependencies = [
  "ashpd",
+ "base64 0.22.1",
  "cc",
  "futures-util",
  "gstreamer",
@@ -1005,6 +1006,7 @@ dependencies = [
  "pkg-config",
  "rcgen",
  "reqwest",
+ "ring",
  "serde_json",
  "socket2",
  "tokio",

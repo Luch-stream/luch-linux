@@ -117,6 +117,12 @@ processes (Sunshine's KMS capture needs the same). It is given to the tiny `luch
 Install and open **Luch** on the receiver (see [luch-android](https://github.com/Toxblh/luch-android)).
 It appears on the LAN by itself.
 
+**Pairing.** The first time this computer connects to a TV, the TV shows a six-digit code in a corner of its screen
+(if something is playing, it asks "Allow?" first); type it in the GNOME dialog that opens, or in the terminal
+(`luchctl pair`, or any command that connects asks for it). From then on both know each other: the control channel is
+TLS with pinned certificates, the picture and sound are encrypted, and nothing is asked again. `luchctl forget <tv>`
+pairs again; a receiver with another certificate under a paired TV's id is refused.
+
 **GNOME:** Quick Settings → **Luch**. A tap mirrors the whole screen in `fast` mode to the last or
 only receiver; the arrow opens the list with all modes. While mirroring, the toggle shows the
 estimated latency. On the TV, press OK on the remote to show the statistics overlay.
@@ -133,6 +139,8 @@ luchctl stats                             # live latency, fps, bitrate
 luchctl stop
 luchctl info                              # the receiver's Android and what works worse on it
 luchctl audio sync                        # sound: auto | on | off | sync (per receiver, remembered)
+luchctl pair                              # type the code the TV shows; luchctl paired, luchctl forget <tv>
+luchctl web                               # browsers allowed to watch through the web receiver
 luchctl reports                           # crash and error reports the receivers handed over
 luchctl report 1 open                     # file one as an issue (or: report 1, report 1 dismiss)
 luchctl known                             # every receiver luchd has talked to, on or off, and how to wake it

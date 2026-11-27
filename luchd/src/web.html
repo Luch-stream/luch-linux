@@ -23,10 +23,12 @@ canvas{position:fixed;inset:0;width:100vw;height:100vh;object-fit:contain}
 const RU = navigator.language.startsWith('ru');
 const T = RU ? {go:'Смотреть', hint:'Нажмите, чтобы принимать трансляцию с компьютера', wait:'Подключение…',
                 lost:'Связь потеряна', err:'Ошибка', stop:'Остановлено', noweb:'Браузер без WebCodecs — обновите его',
-                insecure:'Браузер блокирует WebCodecs по HTTP. Откройте Luch по HTTPS с доверенным сертификатом. Адрес 127.0.0.1 работает только на самом компьютере.'}
+                insecure:'Браузер блокирует WebCodecs по HTTP. Откройте Luch по HTTPS с доверенным сертификатом. Адрес 127.0.0.1 работает только на самом компьютере.',
+                confirm:'Разрешите на компьютере, если там тот же код', denied:'Не разрешено'}
              : {go:'Watch', hint:'Press to receive the stream from your computer', wait:'Connecting…',
                 lost:'Connection lost', err:'Error', stop:'Stopped', noweb:'No WebCodecs in this browser — update it',
-                insecure:'The browser blocks WebCodecs over HTTP. Open Luch over HTTPS with a trusted certificate. The address 127.0.0.1 only works on the sender itself.'};
+                insecure:'The browser blocks WebCodecs over HTTP. Open Luch over HTTPS with a trusted certificate. The address 127.0.0.1 only works on the sender itself.',
+                confirm:'Allow it on the computer if it shows the same code', denied:'Not allowed'};
 const $ = id => document.getElementById(id);
 // Luch datagram header, 24 bytes big-endian: kind, flags, idx, shards, parity, seq, pts_us, len, host_lat.
 const head = b => ({kind: b[0], flags: b[1], pts: (b[12]<<24|b[13]<<16|b[14]<<8|b[15])>>>0, len: b[16]<<24|b[17]<<16|b[18]<<8|b[19]});
@@ -93,6 +95,7 @@ document.addEventListener('visibilitychange', keepScreenOn);
 addEventListener('pagehide', () => setStreaming(false));
 
 function start() {
+  stopping = false;
   setStreaming(false);
   msg(T.wait, '', false);
   document.documentElement.requestFullscreen?.().catch(() => {});
@@ -123,6 +126,14 @@ function ctrl(m) {
       send({t: 'ready', video_port: 0, audio_port: 0});
       send({t: 'keyframe'});                      // begin with a clean IDR
       break;
+    // The first visit: the computer asks its person, showing the same code as here.
+    case 'confirm': msg(m.code, T.confirm, false); break;
+    // Allowed: the token becomes a cookie the page cannot read, so the next visit is let straight in.
+    case 'authorized':
+      $('msg').style.display = 'none';
+      fetch('/auth', {method: 'POST', body: m.token, credentials: 'same-origin'}).catch(() => {});
+      break;
+    case 'denied': stopping = true; msg(T.denied, m.reason || '', true); break;
     case 'ping': send({t: 'pong', n: m.n}); break;
     case 'sender_stats': stat = m; break;
     case 'stop': case 'bye': setStreaming(false); stopping = true; msg(T.stop, '', false); ws.close(); break;

@@ -49,7 +49,8 @@ The CLI also exposes `luchctl refresh`.
 
 ### `Connect(s id) → s`
 
-Opens the control channel (TCP, JSON lines) and keeps it alive with a ping every second.
+Opens the control channel (JSON lines; TLS to a receiver that offers it, PROTOCOL.md 3a) and keeps it alive with a
+ping every second.
 Returns the receiver's `welcome` message as a JSON string: decoders, maximum size, hardware
 passport (`hw`) and decoder benchmark (`bench`). `Mirror` connects by itself, so calling this is
 optional.
@@ -58,8 +59,31 @@ Before connecting, resolves the selected receiver again to obtain its current ad
 sharing an existing lookup if one is running. A resolution error fails the connection attempt
 but keeps the last known entry in the list.
 
+A receiver this computer has not paired with yet shows a code on its screen (maybe after its person allows the
+connection there): `Connect`, and everything that connects by itself (`Mirror`, `Cast`, `Sleep`, `SetVolume`), then
+fails with `AccessDenied` saying "… asks for pairing … (`luchctl pair <id>`)" while the connection waits for the code
+(`Pair`); `PairChanged` tells front-ends to ask for it. A paired receiver is checked against its pinned certificate:
+another one under its id, or no TLS where there was TLS, is refused with `AccessDenied`.
+
 Errors: `org.freedesktop.DBus.Error.InvalidArgs` for an unknown id, `org.freedesktop.DBus.Error.Failed`
-if already connected or the handshake fails.
+if already connected or the handshake fails, `org.freedesktop.DBus.Error.AccessDenied` for pairing (above).
+
+### `Pair(s id, s code) → s`
+
+The code shown on a receiver that asked for pairing, as typed (six digits, spaces allowed). luchd and the receiver
+check it digit by digit and pin each other's certificate; returns the `welcome`, and the receiver is connected. A
+wrong code ends this pairing (the TV shows a new code on the next `Connect`). Errors read as they are meant to be
+shown: "wrong code …", "Living room TV refused the connection", "… ignores this computer for 59 min".
+
+### `Pairing(s id) → s`
+
+Where pairing stands, as JSON: `step` `none`, `allow` (the TV asks its person first), `code` (call `Pair`), `paired`
+or `failed` (with `reason` in words); `name`, `digits`.
+
+### `Paired() → s`, `Forget(s id)`
+
+The receivers this computer is paired with (`id`, `name`, `fp`: the SHA-256 of their certificate, `paired`: unix
+time), and forgetting one: the next `Connect` pairs again.
 
 ### `Disconnect(s id)`
 
@@ -141,7 +165,8 @@ The same sender numbers are sent to the receiver (`sender_stats`) for its on-scr
 
 ### `Info(s id) → s`
 
-What a person should know about a receiver, as JSON: `android` (e.g. `Android 5.1`; empty until it has been
+What a person should know about a receiver, as JSON: `paired` (its certificate is pinned), `encrypted` (the
+channel open now is TLS), `android` (e.g. `Android 5.1`; empty until it has been
 connected once), `limits` (what works worse on its Android, in plain words), `audio_latency_ms` (how far its sound
 trails the picture) and `audio` (the sound mode in use). From the receiver's `welcome` (`sdk`, `limits`).
 
@@ -229,7 +254,22 @@ Ends what was cast (media or photos) and stops serving its files.
 Puts the receiver to standby, as its remote's power key (PROTOCOL.md 4c). Fails with what is missing: the receiver's
 accessibility switch for Luch is off, or its Android is older than 9. `Wake` turns it on again.
 
+### `WebClients() → s`, `ApproveWeb(s request, b allow)`, `ForgetWeb(s id)`
+
+The browsers allowed to watch this screen through the web receiver (`id`, `name`, `address`, `allowed`, `used`),
+and the one waiting to be (`waiting`, `code`); letting it in or not (the notification's buttons do the same);
+forgetting an allowed one (it is asked about again next time).
+
 ## Signals
+
+### `PairChanged(s id, s state)`
+
+Pairing moved on; `state` as in `Pairing`. The GNOME extension asks for the code on `code`.
+
+### `WebApproval(s request, s name, s address, s code)`
+
+A browser opened the web receiver and waits: its page shows `code`. luchd also asks with a desktop notification
+(Allow / Deny).
 
 ### `MediaStateChanged(s id, s state)`
 
@@ -266,6 +306,12 @@ HTTPS runs locally without a domain or internet access. On first opening, the br
 the self-signed certificate; proceed if the browser allows it. Some browsers require importing the
 certificate as trusted before enabling WebCodecs; if the TV cannot do that, use the Android receiver.
 Plain LAN HTTP cannot enable WebCodecs and redirects to HTTPS.
+
+The first time a browser connects, its page shows a 4-digit code and this computer asks (a notification with Allow
+and Deny, or `luchctl web allow <code>`) whether to let it watch: allow it only if the page in front of you shows
+the same code. An allowed browser keeps a cookie (a year, HttpOnly) and is let straight in afterwards; at most 20
+are remembered (`luchctl web`, `luchctl web forget <n>`). Three refusals from an address and it is not asked about
+for an hour; one question at a time.
 The certificate and private key live in `~/.config/luch/web-cert.pem` and `web-key.pem`
 (or `$XDG_CONFIG_HOME/luch/`). The key is owner-only. The certificate survives restarts; connecting
 through a new IP reissues it with the same key, so the browser may ask for trust again.
@@ -304,6 +350,9 @@ proxy.connectSignal('ReceiversChanged', () => { /* refresh */ });
 | Path / variable | Purpose |
 |-----------------|---------|
 | `~/.config/luch/id` | sender id |
+| `~/.config/luch/sender-cert.pem`, `sender-key.pem` | this computer's certificate for TLS receivers (the key owner-only) |
+| `~/.config/luch/paired.json` | receivers paired with: their certificate's SHA-256, pinned |
+| `~/.config/luch/web-browsers.json` | browsers allowed to watch through the web receiver (a hash of each one's cookie) |
 | `~/.config/luch/known.json` | receivers luchd has connected to, with the ways to wake them |
 | `~/.config/luch/restore-token` | screencast portal restore token (no picker after the first time) |
 | `LUCH_KMS_SOCKET` | a privileged `luch-kms --serve SOCKET [--uid N]` that `luchd` uses for the `fast` mode instead of running `luch-kms` itself (default `$XDG_RUNTIME_DIR/luch/kms.sock`, used when it exists): for a `luchd` in a sandbox (Flatpak), where file capabilities do not work. The socket is owned by `--uid`, mode 0600 |

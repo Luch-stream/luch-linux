@@ -21,3 +21,15 @@ test('a D-Bus error is shown without its prefix', () => {
     assert.equal(reason(new Error('GDBus.Error:org.freedesktop.DBus.Error.Failed: sleep is off on the receiver')),
         'sleep is off on the receiver');
 });
+
+test('a refusal that asks for pairing is told from any other', () => {
+    const body = ext.match(/function asksForPairing\(text\) \{([\s\S]*?)\n\}/)[1];
+    const asks = new Function('text', body);
+    assert.ok(asks('Living room TV asks for pairing: enter the code it shows (`luchctl pair tv`)'));
+    assert.ok(!asks('Living room TV refused the connection'));
+});
+
+test('the pairing signal is the one luchd sends', () => {
+    assert.match(ext, /<signal name="PairChanged">/);
+    assert.match(luchd, /async fn pair_changed\(e: &SignalEmitter<'_>, id: &str, state: &str\)/);
+});

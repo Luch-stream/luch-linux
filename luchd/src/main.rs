@@ -8,9 +8,11 @@ mod enc;
 mod limits;
 mod mirror;
 mod mpris;
+mod pair;
 mod reports;
 mod volume;
 mod wake;
+mod web_auth;
 mod web_tls;
 
 use std::{collections::HashMap, error::Error, io, net::SocketAddr, sync::Arc, time::Duration};
@@ -20,9 +22,12 @@ use luch_proto::{self as p, ReceiverRow};
 use mirror::Cmd;
 use serde_json::{json, Value};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
-    net::{tcp::OwnedWriteHalf, TcpSocket},
-    sync::{broadcast, mpsc, Mutex},
+    io::{
+        AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt,
+        BufReader,
+    },
+    net::TcpSocket,
+    sync::{broadcast, mpsc, oneshot, Mutex},
     time::{timeout, Instant},
 };
 use tokio_tungstenite::{accept_async, tungstenite::Message, WebSocketStream};
@@ -48,6 +53,8 @@ struct Receiver {
     ifname: String,
     ifindex: i32,
     port: u16,
+    /// The TLS port from the TXT "tls" (protocol v1, pairing), 0 for an older receiver.
+    tls_port: u16,
     service: String, // Avahi instance name, for ItemRemove
 }
 
@@ -77,7 +84,20 @@ struct State {
     docs: HashMap<String, (u64, u64)>, // id -> (page, pages) of the document it shows for us (4g)
     /// Receivers we stopped: a report still on its way is no longer news, until the next media_ready.
     stopped: std::collections::HashSet<String>,
+    /// Receivers asking for pairing: where the code typed here goes, and the state for Pairing (JSON).
+    codes: HashMap<String, mpsc::Sender<CodeTyped>>,
+    pairing: HashMap<String, Value>,
+    /// Receivers connected over TLS (pinned), for Info.
+    secure: std::collections::HashSet<String>,
+    /// Browsers waiting for this computer's confirmation (web receiver): request id -> what it is (for WebClients)
+    /// and the way back for ApproveWeb.
+    web_waiting: HashMap<String, (Value, oneshot::Sender<bool>)>,
+    web_limits: web_auth::Limits,
 }
+
+/// The code a person typed for a receiver, and where Pair's answer goes (the welcome, or why not).
+type CodeTyped = (Vec<u8>, PairReply);
+type PairReply = oneshot::Sender<Result<String, String>>;
 type Shared = Arc<Mutex<State>>;
 
 /// Whether something accepts TCP at `address:port` within a second: tells a receiver that is on from one Avahi
@@ -96,6 +116,8 @@ struct Luch {
     sender_id: String,
     host: String,
     discovery: discovery::Discovery,
+    /// This computer's certificate for TLS receivers; None if it could not be made (then older receivers only).
+    ident: Option<Arc<pair::Identity>>,
 }
 
 #[interface(name = "dev.luch.Luch1")]
@@ -128,7 +150,9 @@ impl Luch {
         self.discovery.refresh();
     }
 
-    /// Opens and keeps a control channel; returns the receiver's welcome as JSON.
+    /// Opens and keeps a control channel; returns the receiver's welcome as JSON. A receiver not paired yet answers
+    /// with a code on its screen: this then fails with AccessDenied ("... asks for pairing ...") and the connection
+    /// waits for the code (Pair), the state in Pairing and PairChanged.
     async fn connect(
         &self,
         id: String,
@@ -139,6 +163,9 @@ impl Luch {
             if st.conns.contains_key(&id) {
                 return Err(fdo::Error::Failed(format!("already connected: {id}")));
             }
+            if st.codes.contains_key(&id) {
+                return Err(pairing_needed(&id, "the receiver", &st.pairing[&id]));
+            }
             if !st.found.contains_key(&id) {
                 return Err(fdo::Error::InvalidArgs(format!("unknown receiver: {id}")));
             }
@@ -148,45 +175,154 @@ impl Luch {
             .receiver(id.clone())
             .await
             .map_err(fdo::Error::Failed)?;
-        let (welcome, rd, wr, addrs) =
-            handshake(&r, &self.sender_id, &self.host)
-                .await
-                .map_err(|e| {
-                    fdo::Error::Failed(format!("{} ({}%{}): {e}", r.name, r.address, r.ifname))
-                })?;
-        let (tx, rx) = mpsc::channel(8);
-        let (events, _) = broadcast::channel(16);
-        {
-            let mut st = self.st.lock().await;
-            st.conns.insert(
-                id.clone(),
-                Conn {
-                    cmd: tx,
-                    events: events.clone(),
-                    media: None,
-                    addrs: Some(addrs),
-                },
-            );
-            st.welcomes.insert(id.clone(), welcome.clone());
+        let dir = config_dir().map_err(|e| fdo::Error::Failed(e.to_string()))?;
+        let pinned = pair::pinned_fp(&dir, &id);
+        let ident = self.ident.as_deref().filter(|_| r.tls_port > 0);
+        if ident.is_none() && pinned.is_some() {
+            // Paired once, so it spoke TLS: a receiver at its name that does not is not let pass.
+            return Err(fdo::Error::AccessDenied(format!(
+                "{} was paired but now offers no encryption: refused (another device under its name, or an older \
+                 Luch on it). `luchctl forget {id}` to use it unencrypted",
+                r.name
+            )));
         }
-        // Remembered with its MAC (the handshake has just filled the ARP table), to wake it later.
-        wake::remember(&id, &r.name, &r.model, &r.address);
-        eprintln!(
-            "[luchd] connected to {} ({}:{} via {})",
-            r.name, r.address, r.port, r.ifname
-        );
-        changed(conn).await;
-        tokio::spawn(run_channel(
-            r.name,
-            id,
-            rd,
-            wr,
-            rx,
-            events,
-            self.st.clone(),
-            conn.clone(),
-        ));
-        Ok(welcome.to_string())
+        let o = handshake(&r, &self.sender_id, &self.host, ident, pinned)
+            .await
+            .map_err(|e| {
+                if e.kind() == io::ErrorKind::PermissionDenied {
+                    fdo::Error::AccessDenied(format!("{}: {e}. If it was reset or Luch was reinstalled on it, `luchctl forget {id}` and pair again", r.name))
+                } else {
+                    fdo::Error::Failed(format!("{} ({}%{}): {e}", r.name, r.address, r.ifname))
+                }
+            })?;
+        match o.first["t"].as_str().unwrap_or("") {
+            "welcome" if ident.is_some() && pinned.is_none() => {
+                Err(fdo::Error::AccessDenied(format!(
+                    "{} let this computer in without pairing: not trusted, nothing sent",
+                    r.name
+                )))
+            }
+            "welcome" => {
+                install(
+                    &self.st,
+                    conn,
+                    r,
+                    id,
+                    o.first.clone(),
+                    o.rd,
+                    o.wr,
+                    o.addrs,
+                    ident.is_some(),
+                )
+                .await;
+                Ok(o.first.to_string())
+            }
+            "pair" => {
+                let (Some(theirs), Some(me)) = (o.receiver_fp, ident) else {
+                    return Err(fdo::Error::Failed("pairing asked for without TLS".into()));
+                };
+                let (tx, rx) = mpsc::channel(1);
+                let state = pair_state(&o.first, &r.name);
+                {
+                    let mut st = self.st.lock().await;
+                    st.codes.insert(id.clone(), tx);
+                    st.pairing.insert(id.clone(), state.clone());
+                }
+                pair_changed(conn, &id, &state).await;
+                let err = pairing_needed(&id, &r.name, &state);
+                tokio::spawn(pairing(
+                    self.st.clone(),
+                    conn.clone(),
+                    r,
+                    id,
+                    o,
+                    me.fp,
+                    theirs,
+                    dir,
+                    rx,
+                ));
+                Err(err)
+            }
+            "pair_refused" => Err(fdo::Error::AccessDenied(pair::explain(
+                &pair::refused(&o.first),
+                &r.name,
+            ))),
+            _ => Err(fdo::Error::Failed(format!(
+                "{}: expected welcome, got {}",
+                r.name, o.first
+            ))),
+        }
+    }
+
+    /// The code shown on a receiver that asked for pairing (see Connect), as typed: six digits, spaces allowed.
+    /// Both sides then pin each other's certificate; returns the welcome. A wrong code ends this pairing: connect
+    /// again for a new code.
+    async fn pair(&self, id: String, code: String) -> fdo::Result<String> {
+        let code = pair::clean_code(&code).map_err(fdo::Error::InvalidArgs)?;
+        let (tx, step) = {
+            let st = self.st.lock().await;
+            (
+                st.codes.get(&id).cloned(),
+                st.pairing.get(&id).map(|v| v["step"].clone()),
+            )
+        };
+        let tx = tx.ok_or_else(|| {
+            fdo::Error::Failed(format!(
+                "no pairing with {id} going on: connect to it first"
+            ))
+        })?;
+        if step.as_ref().and_then(Value::as_str) != Some("code") {
+            return Err(fdo::Error::Failed(
+                "no code on the TV yet: allow the connection there first".into(),
+            ));
+        }
+        let (rtx, rrx) = oneshot::channel();
+        tx.send((code, rtx))
+            .await
+            .map_err(|_| fdo::Error::Failed("the pairing ended meanwhile".into()))?;
+        timeout(Duration::from_secs(20), rrx)
+            .await
+            .map_err(|_| fdo::Error::Failed("the receiver did not finish pairing".into()))?
+            .map_err(|_| fdo::Error::Failed("the pairing ended meanwhile".into()))?
+            .map_err(fdo::Error::AccessDenied)
+    }
+
+    /// Where pairing with a receiver stands, as JSON: `step` "none", "allow" (waiting for the TV's allow), "code"
+    /// (a code is on the TV: Pair), "paired" or "failed" (with `reason` in words), and `name`, `digits`.
+    async fn pairing(&self, id: String) -> String {
+        self.st
+            .lock()
+            .await
+            .pairing
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| json!({"step": "none"}))
+            .to_string()
+    }
+
+    /// The receivers this computer is paired with, as a JSON array of {id, name, fp, paired (unix time)}.
+    async fn paired(&self) -> String {
+        let dir = config_dir().ok();
+        let all = dir.as_deref().map(pair::pinned).unwrap_or_default();
+        let mut rows: Vec<Value> = all
+            .into_iter()
+            .map(|(id, mut v)| {
+                v["id"] = json!(id);
+                v
+            })
+            .collect();
+        rows.sort_by_key(|v| v["name"].as_str().unwrap_or("").to_string());
+        Value::Array(rows).to_string()
+    }
+
+    /// Forgets a receiver's pinned certificate: the next connection pairs again with a new code.
+    async fn forget(&self, id: String) -> fdo::Result<()> {
+        let dir = config_dir().map_err(|e| fdo::Error::Failed(e.to_string()))?;
+        match pair::forget(&dir, &id) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(fdo::Error::InvalidArgs(format!("not paired with {id}"))),
+            Err(e) => Err(fdo::Error::Failed(e.to_string())),
+        }
     }
 
     async fn disconnect(&self, id: String) -> fdo::Result<()> {
@@ -301,7 +437,8 @@ impl Luch {
         audio_choice(&self.st, &id).await
     }
 
-    /// What a person should know about a receiver, as JSON: `android` ("Android 5.1", empty until connected once),
+    /// What a person should know about a receiver, as JSON: `paired` (its certificate is pinned), `encrypted` (the
+    /// channel now is TLS), `android` ("Android 5.1", empty until connected once),
     /// `limits` (what works worse there, in plain words), `audio_latency_ms`, `audio` (the sound mode in use).
     async fn info(&self, id: String) -> String {
         let welcome = self
@@ -312,7 +449,14 @@ impl Luch {
             .get(&id)
             .cloned()
             .unwrap_or(Value::Null);
+        let paired = config_dir()
+            .ok()
+            .and_then(|d| pair::pinned_fp(&d, &id))
+            .is_some();
+        let encrypted = self.st.lock().await.secure.contains(&id);
         json!({
+            "paired": paired,
+            "encrypted": encrypted,
             "android": welcome["sdk"].as_u64().map(limits::android).unwrap_or_default(),
             "limits": limits::describe(&welcome),
             "audio_latency_ms": limits::audio_latency_ms(&welcome),
@@ -736,6 +880,57 @@ impl Luch {
     #[zbus(signal)]
     async fn receivers_changed(e: &SignalEmitter<'_>) -> zbus::Result<()>;
 
+    /// The browsers allowed to watch this screen through the web receiver, and the one waiting to be (with
+    /// `waiting` and its `code`), as a JSON array of {id, name, address, allowed, used}.
+    async fn web_clients(&self) -> String {
+        let mut rows: Vec<Value> = self
+            .st
+            .lock()
+            .await
+            .web_waiting
+            .values()
+            .map(|(v, _)| v.clone())
+            .collect();
+        if let Ok(d) = config_dir() {
+            rows.extend(web_auth::list(&d));
+        }
+        Value::Array(rows).to_string()
+    }
+
+    /// Lets a waiting browser in (or not): `request` from WebApproval or WebClients. The notification's buttons do
+    /// the same.
+    async fn approve_web(&self, request: String, allow: bool) -> fdo::Result<()> {
+        let w = self.st.lock().await.web_waiting.remove(&request);
+        let (_, tx) =
+            w.ok_or_else(|| fdo::Error::InvalidArgs(format!("no browser waiting as {request}")))?;
+        let _ = tx.send(allow);
+        Ok(())
+    }
+
+    /// Forgets an allowed browser: it is asked about again next time.
+    async fn forget_web(&self, id: String) -> fdo::Result<()> {
+        let d = config_dir().map_err(|e| fdo::Error::Failed(e.to_string()))?;
+        match web_auth::forget(&d, &id) {
+            Ok(true) => Ok(()),
+            Ok(false) => Err(fdo::Error::InvalidArgs(format!("no browser {id}"))),
+            Err(e) => Err(fdo::Error::Failed(e.to_string())),
+        }
+    }
+
+    /// A browser opened the web receiver and waits to be allowed: its page shows `code` too.
+    #[zbus(signal)]
+    async fn web_approval(
+        e: &SignalEmitter<'_>,
+        request: &str,
+        name: &str,
+        address: &str,
+        code: &str,
+    ) -> zbus::Result<()>;
+
+    /// Pairing with a receiver moved on (JSON as in Pairing): "allow", "code", "paired" or "failed".
+    #[zbus(signal)]
+    async fn pair_changed(e: &SignalEmitter<'_>, id: &str, state: &str) -> zbus::Result<()>;
+
     /// A receiver's `media_state` changed (JSON); {"state":"stopped"} when it ended.
     #[zbus(signal)]
     async fn media_state_changed(e: &SignalEmitter<'_>, id: &str, state: &str) -> zbus::Result<()>;
@@ -760,10 +955,12 @@ async fn changed(conn: &Connection) {
 
 // ---------- control channel ----------
 
-type Reader = BufReader<tokio::net::tcp::OwnedReadHalf>;
+/// A control channel's two ends, over TCP or TLS alike.
+type Reader = BufReader<Box<dyn AsyncRead + Send + Unpin>>;
+type Writer = Box<dyn AsyncWrite + Send + Unpin>;
 
 /// One JSON line, at most MAX_LINE bytes. Ok(None) on EOF.
-async fn read_msg(rd: &mut Reader) -> io::Result<Option<Value>> {
+pub(crate) async fn read_msg<R: AsyncBufRead + Unpin>(rd: &mut R) -> io::Result<Option<Value>> {
     let mut buf = Vec::new();
     let n = (&mut *rd)
         .take(p::MAX_LINE as u64 + 1)
@@ -783,25 +980,36 @@ async fn read_msg(rd: &mut Reader) -> io::Result<Option<Value>> {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
-async fn send(wr: &mut OwnedWriteHalf, v: &Value) -> io::Result<()> {
+pub(crate) async fn send<W: AsyncWrite + Unpin>(wr: &mut W, v: &Value) -> io::Result<()> {
     let mut line = v.to_string();
     line.push('\n');
-    wr.write_all(line.as_bytes()).await
+    wr.write_all(line.as_bytes()).await?;
+    wr.flush().await
+}
+
+/// A control connection just opened: the receiver's first answer to hello (welcome, pair or pair_refused) and the
+/// two ends, with the receiver's certificate when it is TLS.
+struct Opened {
+    first: Value,
+    rd: Reader,
+    wr: Writer,
+    addrs: (std::net::IpAddr, std::net::IpAddr),
+    receiver_fp: Option<pair::Fingerprint>,
 }
 
 /// Socket pinned to the interface the receiver was discovered on: the default
 /// route may be a full-tunnel VPN, so it must never decide where this goes.
+/// With `ident`, TLS to the receiver's TLS port, its certificate taken only if it is `pinned` (when there is one);
+/// without a pin the hello asks the receiver to pair even if it knows this computer.
 async fn handshake(
     r: &Receiver,
     id: &str,
     host: &str,
-) -> io::Result<(
-    Value,
-    Reader,
-    OwnedWriteHalf,
-    (std::net::IpAddr, std::net::IpAddr),
-)> {
-    let addr: SocketAddr = format!("{}:{}", r.address, r.port)
+    ident: Option<&pair::Identity>,
+    pinned: Option<pair::Fingerprint>,
+) -> io::Result<Opened> {
+    let port = if ident.is_some() { r.tls_port } else { r.port };
+    let addr: SocketAddr = format!("{}:{}", r.address, port)
         .parse()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
     let sock = TcpSocket::new_v4()?;
@@ -809,30 +1017,254 @@ async fn handshake(
     let stream = timeout(HANDSHAKE_TIMEOUT, sock.connect(addr))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timed out"))??;
+    let opened = open_channel(stream, id, host, ident, pinned).await?;
+    Ok(opened)
+}
+
+/// TLS (or not) and hello on a connected stream; the half of handshake that tests drive over localhost.
+async fn open_channel(
+    stream: tokio::net::TcpStream,
+    id: &str,
+    host: &str,
+    ident: Option<&pair::Identity>,
+    pinned: Option<pair::Fingerprint>,
+) -> io::Result<Opened> {
+    stream.set_nodelay(true)?;
     let addrs = (stream.local_addr()?.ip(), stream.peer_addr()?.ip());
-    let (rd, mut wr) = stream.into_split();
+    let (rd, mut wr, receiver_fp): (Box<dyn AsyncRead + Send + Unpin>, Writer, _) = match ident {
+        Some(me) => {
+            let (connector, pin) = me.connector(pinned)?;
+            let name = tokio_rustls::rustls::pki_types::ServerName::IpAddress(addrs.1.into());
+            let tls = timeout(HANDSHAKE_TIMEOUT, connector.connect(name, stream))
+                .await
+                .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timed out"))?
+                .map_err(|e| {
+                    if e.to_string().contains(pair::PIN_MISMATCH) {
+                        io::Error::new(io::ErrorKind::PermissionDenied, pair::PIN_MISMATCH)
+                    } else {
+                        e
+                    }
+                })?;
+            let fp = *pin.seen.lock().unwrap();
+            let (rd, wr) = tokio::io::split(tls);
+            (Box::new(rd), Box::new(wr), fp)
+        }
+        None => {
+            let (rd, wr) = stream.into_split();
+            (Box::new(rd), Box::new(wr), None)
+        }
+    };
     let mut rd = BufReader::new(rd);
-    let hello = json!({"t": "hello", "v": p::VERSION, "id": id, "name": host, "app": p::APP,
-                       "want": ["mirror", "media", "photo", "reports"]});
+    let mut hello = json!({"t": "hello", "v": if ident.is_some() { p::VERSION_TLS } else { p::VERSION },
+                           "id": id, "name": host, "app": p::APP,
+                           "want": ["mirror", "media", "photo", "reports"]});
+    if ident.is_some() && pinned.is_none() {
+        hello["pair"] = json!(true);
+    }
     send(&mut wr, &hello).await?;
-    let welcome = timeout(HANDSHAKE_TIMEOUT, read_msg(&mut rd))
+    let first = timeout(HANDSHAKE_TIMEOUT, read_msg(&mut rd))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "no welcome"))??
         .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "closed before welcome"))?;
-    if welcome["t"] != "welcome" {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("expected welcome, got {welcome}"),
-        ));
-    }
-    Ok((welcome, rd, wr, addrs))
+    Ok(Opened {
+        first,
+        rd,
+        wr,
+        addrs,
+        receiver_fp,
+    })
 }
 
+/// A channel with its welcome becomes a receiver luchd is connected to.
+#[allow(clippy::too_many_arguments)]
+async fn install(
+    st: &Shared,
+    conn: &Connection,
+    r: Receiver,
+    id: String,
+    welcome: Value,
+    rd: Reader,
+    wr: Writer,
+    addrs: (std::net::IpAddr, std::net::IpAddr),
+    secure: bool,
+) {
+    let (tx, rx) = mpsc::channel(8);
+    let (events, _) = broadcast::channel(16);
+    {
+        let mut st = st.lock().await;
+        st.conns.insert(
+            id.clone(),
+            Conn {
+                cmd: tx,
+                events: events.clone(),
+                media: None,
+                addrs: Some(addrs),
+            },
+        );
+        st.welcomes.insert(id.clone(), welcome);
+        if secure {
+            st.secure.insert(id.clone());
+        } else {
+            st.secure.remove(&id);
+        }
+    }
+    // Remembered with its MAC (the handshake has just filled the ARP table), to wake it later.
+    wake::remember(&id, &r.name, &r.model, &r.address);
+    eprintln!(
+        "[luchd] connected to {} ({}:{} via {}{})",
+        r.name,
+        r.address,
+        r.port,
+        r.ifname,
+        if secure { ", TLS" } else { ", not encrypted" }
+    );
+    changed(conn).await;
+    tokio::spawn(run_channel(
+        r.name,
+        id,
+        rd,
+        wr,
+        rx,
+        events,
+        st.clone(),
+        conn.clone(),
+    ));
+}
+
+/// What Pairing says about a receiver's `pair` message.
+fn pair_state(msg: &Value, name: &str) -> Value {
+    json!({"step": msg["step"], "digits": msg["digits"].as_u64().unwrap_or(pair::DIGITS as u64), "name": name})
+}
+
+/// The error Connect (and everything that connects) gives while a receiver waits for its code.
+fn pairing_needed(id: &str, name: &str, state: &Value) -> fdo::Error {
+    let name = state["name"].as_str().unwrap_or(name);
+    fdo::Error::AccessDenied(if state["step"] == "allow" {
+        format!("{name} asks for pairing: allow it on the TV, then enter the code it shows (`luchctl pair {id}`)")
+    } else {
+        format!("{name} asks for pairing: enter the code it shows (`luchctl pair {id}`)")
+    })
+}
+
+async fn pair_changed(conn: &Connection, id: &str, state: &Value) {
+    if let Ok(e) = SignalEmitter::new(conn, p::DBUS_PATH) {
+        let _ = Luch::pair_changed(&e, id, &state.to_string()).await;
+    }
+}
+
+/// A receiver asking for pairing: waits for its allow (when it asks that first) and for the code typed here (Pair),
+/// runs the code check, pins its certificate and goes on as a connected receiver. Gives up after two minutes.
+#[allow(clippy::too_many_arguments)]
+async fn pairing(
+    st: Shared,
+    conn: Connection,
+    r: Receiver,
+    id: String,
+    o: Opened,
+    me: pair::Fingerprint,
+    theirs: pair::Fingerprint,
+    dir: std::path::PathBuf,
+    mut codes: mpsc::Receiver<CodeTyped>,
+) {
+    let Opened {
+        mut first,
+        mut rd,
+        mut wr,
+        addrs,
+        ..
+    } = o;
+    let name = r.name.clone();
+    let deadline = Instant::now() + Duration::from_secs(130);
+    // The welcome, or why not; and Pair's caller when a code was typed.
+    let result: Result<(Value, Option<PairReply>), (String, Option<PairReply>)> = async {
+        loop {
+            if first["t"] == "pair_refused" {
+                return Err((pair::explain(&pair::refused(&first), &name), None));
+            }
+            if first["t"] != "pair" {
+                return Err((format!("{name}: unexpected {first}"), None));
+            }
+            let state = pair_state(&first, &name);
+            st.lock().await.pairing.insert(id.clone(), state.clone());
+            pair_changed(&conn, &id, &state).await;
+            if first["step"] == "allow" {
+                // The TV asks its person first; its next word is the code step or a refusal.
+                first = match tokio::time::timeout_at(deadline, read_msg(&mut rd)).await {
+                    Ok(Ok(Some(v))) => v,
+                    Ok(_) => return Err((format!("{name} closed the connection"), None)),
+                    Err(_) => return Err((format!("nobody answered on {name} in time"), None)),
+                };
+                continue;
+            }
+            // The code is on the TV: wait for it from here, or for the TV to give up (fill_buf is cancel-safe).
+            let (code, reply) = tokio::select! {
+                c = codes.recv() => match c {
+                    Some(c) => c,
+                    None => return Err(("luchd is stopping".into(), None)),
+                },
+                _ = rd.fill_buf() => {
+                    let v = read_msg(&mut rd).await.ok().flatten().unwrap_or(Value::Null);
+                    return Err((pair::explain(&pair::refused(&v), &name), None));
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    let _ = send(&mut wr, &json!({"t": "bye"})).await;
+                    return Err((format!("no code was entered for {name} in time"), None));
+                }
+            };
+            return match pair::code_check(&mut rd, &mut wr, &code, &me, &theirs).await {
+                Ok(()) => match timeout(HANDSHAKE_TIMEOUT, read_msg(&mut rd)).await {
+                    Ok(Ok(Some(w))) if w["t"] == "welcome" => Ok((w, Some(reply))),
+                    _ => Err((format!("{name} paired but sent no welcome"), Some(reply))),
+                },
+                Err(f) => Err((pair::explain(&f, &name), Some(reply))),
+            };
+        }
+    }
+    .await;
+    st.lock().await.codes.remove(&id);
+    match result {
+        Ok((welcome, reply)) => {
+            if let Err(e) = pair::pin(&dir, &id, &theirs, &name) {
+                eprintln!("[luchd] cannot keep the pairing with {name}: {e}");
+            }
+            eprintln!("[luchd] paired with {name}");
+            let state = json!({"step": "paired", "name": name});
+            st.lock().await.pairing.insert(id.clone(), state.clone());
+            install(
+                &st,
+                &conn,
+                r,
+                id.clone(),
+                welcome.clone(),
+                rd,
+                wr,
+                addrs,
+                true,
+            )
+            .await;
+            pair_changed(&conn, &id, &state).await;
+            if let Some(reply) = reply {
+                let _ = reply.send(Ok(welcome.to_string()));
+            }
+        }
+        Err((why, reply)) => {
+            eprintln!("[luchd] pairing with {name}: {why}");
+            let state = json!({"step": "failed", "name": name, "reason": why});
+            st.lock().await.pairing.insert(id.clone(), state.clone());
+            pair_changed(&conn, &id, &state).await;
+            if let Some(reply) = reply {
+                let _ = reply.send(Err(why));
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn run_channel(
     name: String,
     id: String,
     mut rd: Reader,
-    mut wr: OwnedWriteHalf,
+    mut wr: Writer,
     mut cmds: mpsc::Receiver<Cmd>,
     events: broadcast::Sender<Value>,
     st: Shared,
@@ -992,6 +1424,7 @@ async fn run_channel(
         let mut s = st.lock().await;
         s.conns.remove(&id);
         s.playing.remove(&id);
+        s.secure.remove(&id);
     }
     changed(&conn).await;
 }
@@ -1259,6 +1692,9 @@ fn lan_ip() -> Option<std::net::IpAddr> {
 }
 
 async fn serve_web(st: Shared, dbus: Connection, sender_id: String, host: String) {
+    let Ok(config) = config_dir() else {
+        return eprintln!("[luchd] web receiver off: no config directory");
+    };
     let mut identity = match config_dir()
         .map_err(Box::<dyn Error>::from)
         .and_then(|dir| web_tls::Identity::load(&dir, lan_ip()))
@@ -1288,7 +1724,13 @@ async fn serve_web(st: Shared, dbus: Connection, sender_id: String, host: String
                 continue;
             }
         };
-        let (st, dbus, sid, host) = (st.clone(), dbus.clone(), sender_id.clone(), host.clone());
+        let (st, dbus, sid, host, dir) = (
+            st.clone(),
+            dbus.clone(),
+            sender_id.clone(),
+            host.clone(),
+            config.clone(),
+        );
         tokio::spawn(async move {
             let result: io::Result<()> = async {
                 let mut first = [0u8; 1];
@@ -1305,7 +1747,7 @@ async fn serve_web(st: Shared, dbus: Connection, sender_id: String, host: String
                 }
                 let stream = timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await
                     .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "TLS handshake timeout"))??;
-                web_session(stream, peer, st, dbus, sid, host).await
+                web_session(stream, peer, st, dbus, sid, host, dir).await
             }.await;
             if let Err(e) = result {
                 eprintln!("[luchd] web {peer}: {e}");
@@ -1322,13 +1764,19 @@ async fn web_session<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     dbus: Connection,
     sender_id: String,
     host: String,
+    dir: std::path::PathBuf,
 ) -> io::Result<()> {
     let head = timeout(HANDSHAKE_TIMEOUT, read_http_head(&mut stream))
         .await
         .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "HTTP header timeout"))??;
-    let text = String::from_utf8_lossy(&head);
+    let text = String::from_utf8_lossy(&head).into_owned();
     let first = text.split("\r\n").next().unwrap_or_default().to_string();
     let path = first.split(' ').nth(1).unwrap_or_default().to_string();
+    // A browser allowed before carries its cookie; any other is asked about on this computer first.
+    let allowed = web_auth::cookie(&text).is_some_and(|t| web_auth::known(&dir, t));
+    if first.starts_with("POST /auth ") {
+        return set_cookie(stream, &text, &dir).await;
+    }
     if text.to_ascii_lowercase().contains("upgrade: websocket")
         && path.split('?').next() == Some("/ws")
     {
@@ -1339,7 +1787,7 @@ async fn web_session<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
         let ws = accept_async(stream)
             .await
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        return run_web(ws, peer, st, dbus, sender_id, host).await;
+        return run_web(ws, peer, st, dbus, sender_id, host, allowed, &dir).await;
     }
     // Any GET (not just /) serves the page: TV browsers append or mangle paths.
     let (code, body, ctype) = if first.starts_with("GET ") {
@@ -1351,6 +1799,111 @@ async fn web_session<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     stream.write_all(resp.as_bytes()).await?;
     stream.write_all(body.as_bytes()).await?;
     stream.shutdown().await
+}
+
+/// `POST /auth` with the token the page was given over its websocket: answered with that token as an HttpOnly
+/// cookie, which the page's scripts cannot read and the browser sends with every later visit.
+async fn set_cookie<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
+    head: &str,
+    dir: &std::path::Path,
+) -> io::Result<()> {
+    let len = head
+        .split("\r\n")
+        .find_map(|l| {
+            let (k, v) = l.split_once(':')?;
+            k.eq_ignore_ascii_case("content-length")
+                .then(|| v.trim().parse::<usize>().ok())?
+        })
+        .unwrap_or(0);
+    let mut body = vec![0u8; len.min(256)];
+    timeout(HANDSHAKE_TIMEOUT, stream.read_exact(&mut body))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "auth body timeout"))??;
+    let token = String::from_utf8_lossy(&body).trim().to_string();
+    let resp = if web_auth::known(dir, &token) {
+        format!("HTTP/1.1 204 No Content\r\nSet-Cookie: {}={token}; Max-Age=31536000; Path=/; Secure; HttpOnly; SameSite=Strict\r\nConnection: close\r\n\r\n", web_auth::COOKIE)
+    } else {
+        "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_string()
+    };
+    stream.write_all(resp.as_bytes()).await?;
+    stream.shutdown().await
+}
+
+/// Before a browser that is not allowed yet becomes a receiver: the code on its page and in a question here. Ok
+/// with the browser let in (and given its token), Err with what its page says otherwise.
+async fn approve_browser<W>(
+    sink: &mut W,
+    st: &Shared,
+    dbus: &Connection,
+    dir: &std::path::Path,
+    name: &str,
+    address: &str,
+) -> Result<(), String>
+where
+    W: futures_util::Sink<Message> + Unpin,
+{
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let verdict = st.lock().await.web_limits.check(address, now);
+    match verdict {
+        web_auth::Verdict::Banned(s) => {
+            return Err(format!(
+                "refused on the computer; try again in {} min",
+                s.div_ceil(60)
+            ))
+        }
+        web_auth::Verdict::Busy => {
+            return Err("another browser is waiting to be allowed; try again in a minute".into())
+        }
+        web_auth::Verdict::Ask => {}
+    }
+    let code = web_auth::code();
+    let request = uuid::Uuid::new_v4().to_string();
+    let (tx, rx) = oneshot::channel();
+    st.lock().await.web_waiting.insert(
+        request.clone(),
+        (
+            json!({"id": request, "name": name, "address": address, "code": code, "waiting": true}),
+            tx,
+        ),
+    );
+    let _ = sink
+        .send(Message::Text(
+            json!({"t": "confirm", "code": code}).to_string().into(),
+        ))
+        .await;
+    if let Ok(e) = SignalEmitter::new(dbus, p::DBUS_PATH) {
+        let _ = Luch::web_approval(&e, &request, name, address, &code).await;
+    }
+    eprintln!("[luchd] web receiver: asking about {name} ({address}), code {code}");
+    let answer = web_auth::ask(dbus, name, address, &code, rx).await;
+    {
+        let mut s = st.lock().await;
+        s.web_waiting.remove(&request);
+        s.web_limits.done();
+        if answer == Some(false) {
+            s.web_limits.strike(address, now);
+        }
+    }
+    match answer {
+        Some(true) => {
+            let token = web_auth::allow(dir, name, address).map_err(|e| e.to_string())?;
+            let _ = sink
+                .send(Message::Text(
+                    json!({"t": "authorized", "token": token})
+                        .to_string()
+                        .into(),
+                ))
+                .await;
+            eprintln!("[luchd] web receiver: {name} ({address}) allowed");
+            Ok(())
+        }
+        Some(false) => Err("refused on the computer".into()),
+        None => Err("nobody answered on the computer".into()),
+    }
 }
 
 async fn read_http_head<S: AsyncRead + Unpin>(stream: &mut S) -> io::Result<Vec<u8>> {
@@ -1407,6 +1960,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin> AsyncWrite for Prefixed<S> {
 
 /// A web receiver: hello/welcome over the websocket, then it behaves like any other receiver
 /// (start/ready, keyframe, pings); media goes back over the same socket as binary frames.
+#[allow(clippy::too_many_arguments)]
 async fn run_web<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     ws: WebSocketStream<S>,
     peer: SocketAddr,
@@ -1414,8 +1968,11 @@ async fn run_web<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     dbus: Connection,
     sender_id: String,
     host: String,
+    // A browser allowed before (its cookie); else it is asked about here first, and remembered in `dir`.
+    allowed: bool,
+    dir: &std::path::Path,
 ) -> io::Result<()> {
-    let (sink, mut stream) = ws.split();
+    let (mut sink, mut stream) = ws.split();
     let hello = match timeout(HANDSHAKE_TIMEOUT, stream.next()).await {
         Ok(Some(Ok(Message::Text(s)))) => {
             serde_json::from_str::<Value>(s.as_str()).unwrap_or(Value::Null)
@@ -1432,6 +1989,21 @@ async fn run_web<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     if hello["t"] != "hello" {
         eprintln!("[luchd] web {peer}: expected hello, got {hello}");
         return Ok(());
+    }
+    if !allowed {
+        let who = hello["model"].as_str().unwrap_or("a browser").to_string();
+        if let Err(why) =
+            approve_browser(&mut sink, &st, &dbus, dir, &who, &peer.ip().to_string()).await
+        {
+            eprintln!("[luchd] web {peer}: not let in ({why})");
+            let _ = sink
+                .send(Message::Text(
+                    json!({"t": "denied", "reason": why}).to_string().into(),
+                ))
+                .await;
+            let _ = sink.close().await;
+            return Ok(());
+        }
     }
     let id = format!("web-{}", uuid::Uuid::new_v4());
     let name = hello["name"].as_str().unwrap_or("Web").to_string();
@@ -1453,6 +2025,7 @@ async fn run_web<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                 ifname: String::new(),
                 ifindex: 0,
                 port: p::WEB_PORT,
+                tls_port: 0,
                 service: String::new(),
                 id: id.clone(),
             },
@@ -1709,6 +2282,7 @@ async fn resolve(
         ifname: ifname(ifindex),
         ifindex,
         port,
+        tls_port: t.get("tls").and_then(|p| p.parse().ok()).unwrap_or(0),
         service,
     }))
 }
@@ -1806,6 +2380,16 @@ async fn main() -> Result<(), Box<dyn Error>> {
             None
         }
     };
+    let ident = match config_dir()
+        .map_err(Box::<dyn Error>::from)
+        .and_then(|d| pair::Identity::load(&d))
+    {
+        Ok(i) => Some(Arc::new(i)),
+        Err(e) => {
+            eprintln!("[luchd] no sender certificate ({e}): older, unencrypted receivers only");
+            None
+        }
+    };
     let (discovery, worker) = discovery::Discovery::new();
     let conn = zbus::connection::Builder::session()?
         .name(p::DBUS_NAME)?
@@ -1816,6 +2400,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 sender_id: id.clone(),
                 host: host.clone(),
                 discovery,
+                ident,
             },
         )?
         .build()
@@ -1874,13 +2459,15 @@ mod tests {
             listener.accept().await.unwrap()
         });
         let (rd, wr) = client.unwrap().into_split();
+        let rd: Reader = BufReader::new(Box::new(rd));
+        let wr: Writer = Box::new(wr);
         let (_cmd_tx, cmd_rx) = mpsc::channel(8);
         let (events, _) = broadcast::channel(16);
         let st = Shared::default();
         tokio::spawn(run_channel(
             "TV".into(),
             "rx".into(),
-            BufReader::new(rd),
+            rd,
             wr,
             cmd_rx,
             events,
@@ -1912,6 +2499,479 @@ mod tests {
         assert_eq!(taken["ids"], json!([id]));
         assert_eq!(reports::list().len(), 1);
         let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// A TV made of Rust for the pairing tests: its own certificate, any client certificate let through and
+    /// remembered, and a script for what it says after the hello.
+    mod tv {
+        use super::*;
+        use tokio_rustls::rustls::{
+            self,
+            client::danger::HandshakeSignatureValid,
+            pki_types::{CertificateDer, PrivateKeyDer, UnixTime},
+            server::danger::{ClientCertVerified, ClientCertVerifier},
+            DigitallySignedStruct, DistinguishedName, SignatureScheme,
+        };
+
+        #[derive(Debug)]
+        pub struct AnyClient(std::sync::Mutex<Option<pair::Fingerprint>>);
+
+        fn algs() -> rustls::crypto::WebPkiSupportedAlgorithms {
+            rustls::crypto::ring::default_provider().signature_verification_algorithms
+        }
+
+        impl ClientCertVerifier for AnyClient {
+            fn root_hint_subjects(&self) -> &[DistinguishedName] {
+                &[]
+            }
+            fn verify_client_cert(
+                &self,
+                end_entity: &CertificateDer<'_>,
+                _: &[CertificateDer<'_>],
+                _: UnixTime,
+            ) -> Result<ClientCertVerified, rustls::Error> {
+                *self.0.lock().unwrap() = Some(pair::fingerprint(end_entity));
+                Ok(ClientCertVerified::assertion())
+            }
+            fn verify_tls12_signature(
+                &self,
+                m: &[u8],
+                c: &CertificateDer<'_>,
+                d: &DigitallySignedStruct,
+            ) -> Result<HandshakeSignatureValid, rustls::Error> {
+                rustls::crypto::verify_tls12_signature(m, c, d, &algs())
+            }
+            fn verify_tls13_signature(
+                &self,
+                m: &[u8],
+                c: &CertificateDer<'_>,
+                d: &DigitallySignedStruct,
+            ) -> Result<HandshakeSignatureValid, rustls::Error> {
+                rustls::crypto::verify_tls13_signature(m, c, d, &algs())
+            }
+            fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+                algs().supported_schemes()
+            }
+        }
+
+        pub struct Tv {
+            pub fp: pair::Fingerprint,
+            config: Arc<rustls::ServerConfig>,
+            client: Arc<AnyClient>,
+        }
+
+        impl Tv {
+            pub fn new() -> Tv {
+                let key = rcgen::KeyPair::generate().unwrap();
+                let cert = rcgen::CertificateParams::new(Vec::<String>::new())
+                    .unwrap()
+                    .self_signed(&key)
+                    .unwrap();
+                let client = Arc::new(AnyClient(std::sync::Mutex::new(None)));
+                let config = rustls::ServerConfig::builder_with_provider(
+                    rustls::crypto::ring::default_provider().into(),
+                )
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_client_cert_verifier(client.clone())
+                .with_single_cert(
+                    vec![cert.der().clone()],
+                    PrivateKeyDer::try_from(key.serialize_der()).unwrap(),
+                )
+                .unwrap();
+                Tv {
+                    fp: pair::fingerprint(cert.der()),
+                    config: Arc::new(config),
+                    client,
+                }
+            }
+
+            /// Accepts one sender; after its hello runs `script` with the hello, the two ends and the sender's
+            /// fingerprint.
+            pub async fn serve<F, Fut>(&self, script: F) -> std::net::SocketAddr
+            where
+                F: FnOnce(Value, Reader, Writer, pair::Fingerprint) -> Fut + Send + 'static,
+                Fut: std::future::Future<Output = ()> + Send,
+            {
+                let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = l.local_addr().unwrap();
+                let acceptor = tokio_rustls::TlsAcceptor::from(self.config.clone());
+                let client = self.client.clone();
+                tokio::spawn(async move {
+                    let (s, _) = l.accept().await.unwrap();
+                    let Ok(tls) = acceptor.accept(s).await else {
+                        return; // the sender refused our certificate
+                    };
+                    let (rd, wr) = tokio::io::split(tls);
+                    let mut rd: Reader = BufReader::new(Box::new(rd));
+                    let wr: Writer = Box::new(wr);
+                    let hello = read_msg(&mut rd).await.unwrap().unwrap();
+                    let fp = client.0.lock().unwrap().unwrap();
+                    script(hello, rd, wr, fp).await;
+                });
+                addr
+            }
+        }
+    }
+
+    fn temp_dir(what: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("luch-{what}-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    async fn dial(
+        addr: std::net::SocketAddr,
+        me: &pair::Identity,
+        pinned: Option<pair::Fingerprint>,
+    ) -> io::Result<Opened> {
+        let s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        open_channel(s, "sender-id", "Linux Laptop", Some(me), pinned).await
+    }
+
+    fn test_receiver(addr: std::net::SocketAddr) -> Receiver {
+        Receiver {
+            id: "tv".into(),
+            name: "Living room TV".into(),
+            model: String::new(),
+            address: addr.ip().to_string(),
+            ifname: "lo".into(),
+            ifindex: 1,
+            port: addr.port(),
+            tls_port: addr.port(),
+            service: String::new(),
+        }
+    }
+
+    /// The whole of it against a TV that asks for the code: luchd waits for the code (as Pair hands it over), both
+    /// sides check it, luchd pins the TV and is connected; next time TLS alone lets it in; and a TV with another
+    /// certificate under the same id is refused in the handshake, before a single line is sent.
+    #[tokio::test]
+    async fn pairing_pins_the_receiver_and_another_certificate_is_refused() {
+        let Ok(conn) = Connection::session().await else {
+            eprintln!("no session bus: skipped");
+            return;
+        };
+        let dir = temp_dir("pairing");
+        let me = pair::Identity::load(&dir).unwrap();
+        let tv = tv::Tv::new();
+        let tv_fp = tv.fp;
+        let addr = tv
+            .serve(move |hello, mut rd, mut wr, sender| async move {
+                assert_eq!(hello["v"], 1);
+                assert_eq!(hello["pair"], true, "nothing pinned yet: it asks to pair");
+                send(&mut wr, &json!({"t": "pair", "step": "code", "digits": 6}))
+                    .await
+                    .unwrap();
+                assert!(
+                    pair::tests::receiver_side(&mut rd, &mut wr, b"123456", &sender, &tv_fp).await
+                );
+                send(&mut wr, &json!({"t": "welcome", "v": 1}))
+                    .await
+                    .unwrap();
+                while let Ok(Some(_)) = read_msg(&mut rd).await {}
+            })
+            .await;
+        let o = dial(addr, &me, None).await.unwrap();
+        assert_eq!(o.first["t"], "pair");
+        assert_eq!(o.receiver_fp, Some(tv.fp));
+
+        let st = Shared::default();
+        let (tx, rx) = mpsc::channel(1);
+        st.lock().await.codes.insert("tv".into(), tx.clone());
+        tokio::spawn(pairing(
+            st.clone(),
+            conn.clone(),
+            test_receiver(addr),
+            "tv".into(),
+            o,
+            me.fp,
+            tv.fp,
+            dir.clone(),
+            rx,
+        ));
+        let (reply, answer) = oneshot::channel();
+        tx.send((pair::clean_code("123 456").unwrap(), reply))
+            .await
+            .unwrap();
+        let welcome = timeout(Duration::from_secs(5), answer)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert!(welcome.contains("welcome"));
+        assert_eq!(pair::pinned_fp(&dir, "tv"), Some(tv.fp));
+        {
+            let s = st.lock().await;
+            assert!(s.conns.contains_key("tv") && s.secure.contains("tv"));
+            assert_eq!(s.pairing["tv"]["step"], "paired");
+            assert!(!s.codes.contains_key("tv"));
+        }
+
+        // Paired: the same TV takes us at once, and the hello no longer asks to pair.
+        let again = tv
+            .serve(|hello, _, mut wr, _| async move {
+                assert!(hello.get("pair").is_none());
+                send(&mut wr, &json!({"t": "welcome", "v": 1}))
+                    .await
+                    .unwrap();
+            })
+            .await;
+        assert_eq!(
+            dial(again, &me, Some(tv.fp)).await.unwrap().first["t"],
+            "welcome"
+        );
+
+        // Another TV (or one reset) under the paired id: refused by its certificate.
+        let other = tv::Tv::new();
+        let impostor =
+            other
+                .serve(|_, _, _, _| async move {
+                    panic!("nothing may reach a TV with another certificate")
+                })
+                .await;
+        let e = dial(impostor, &me, Some(tv.fp))
+            .await
+            .err()
+            .expect("refused");
+        assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A mistyped code: the TV refuses, nothing is pinned, and Pair hears why in words.
+    #[tokio::test]
+    async fn a_wrong_code_pins_nothing() {
+        let Ok(conn) = Connection::session().await else {
+            eprintln!("no session bus: skipped");
+            return;
+        };
+        let dir = temp_dir("wrong-code");
+        let me = pair::Identity::load(&dir).unwrap();
+        let tv = tv::Tv::new();
+        let tv_fp = tv.fp;
+        let addr = tv
+            .serve(move |_, mut rd, mut wr, sender| async move {
+                send(&mut wr, &json!({"t": "pair", "step": "allow"}))
+                    .await
+                    .unwrap();
+                send(&mut wr, &json!({"t": "pair", "step": "code", "digits": 6}))
+                    .await
+                    .unwrap();
+                assert!(
+                    !pair::tests::receiver_side(&mut rd, &mut wr, b"123456", &sender, &tv_fp).await
+                );
+            })
+            .await;
+        let o = dial(addr, &me, None).await.unwrap();
+        assert_eq!(o.first["step"], "allow");
+        let st = Shared::default();
+        let (tx, rx) = mpsc::channel(1);
+        st.lock().await.codes.insert("tv".into(), tx.clone());
+        tokio::spawn(pairing(
+            st.clone(),
+            conn,
+            test_receiver(addr),
+            "tv".into(),
+            o,
+            me.fp,
+            tv.fp,
+            dir.clone(),
+            rx,
+        ));
+        // The code is asked for only once the TV has moved on from "allow".
+        timeout(Duration::from_secs(5), async {
+            while st
+                .lock()
+                .await
+                .pairing
+                .get("tv")
+                .map(|v| v["step"] == "code")
+                != Some(true)
+            {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let (reply, answer) = oneshot::channel();
+        tx.send((b"123457".to_vec(), reply)).await.unwrap();
+        let why = timeout(Duration::from_secs(5), answer)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(why, "wrong code: try again, Living room TV shows a new one");
+        assert_eq!(pair::pinned_fp(&dir, "tv"), None);
+        assert_eq!(st.lock().await.pairing["tv"]["step"], "failed");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A TV that says no on its screen while the code is up: told at once, in words, without waiting for a code.
+    #[tokio::test]
+    async fn a_denial_on_the_tv_ends_the_wait_for_the_code() {
+        let Ok(conn) = Connection::session().await else {
+            eprintln!("no session bus: skipped");
+            return;
+        };
+        let dir = temp_dir("denied");
+        let me = pair::Identity::load(&dir).unwrap();
+        let tv = tv::Tv::new();
+        let addr = tv
+            .serve(|_, _, mut wr, _| async move {
+                send(&mut wr, &json!({"t": "pair", "step": "code", "digits": 6}))
+                    .await
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                send(&mut wr, &json!({"t": "pair_refused", "reason": "denied"}))
+                    .await
+                    .unwrap();
+            })
+            .await;
+        let o = dial(addr, &me, None).await.unwrap();
+        let st = Shared::default();
+        let (_tx, rx) = mpsc::channel(1);
+        pairing(
+            st.clone(),
+            conn,
+            test_receiver(addr),
+            "tv".into(),
+            o,
+            me.fp,
+            tv.fp,
+            dir.clone(),
+            rx,
+        )
+        .await;
+        let s = st.lock().await;
+        assert_eq!(
+            s.pairing["tv"]["reason"],
+            "Living room TV refused the connection"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The web receiver: a new browser sees a code and waits for this computer; allowed, it gets a token that comes
+    /// back as an HttpOnly cookie and lets it straight in the next time; refused, its page says so.
+    #[tokio::test]
+    async fn a_browser_is_let_in_once_confirmed_and_keeps_its_cookie() {
+        let Ok(dbus) = Connection::session().await else {
+            eprintln!("no session bus: skipped");
+            return;
+        };
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let dir = temp_dir("web");
+        let st = Shared::default();
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        {
+            let (st, dbus, dir) = (st.clone(), dbus.clone(), dir.clone());
+            tokio::spawn(async move {
+                loop {
+                    let (s, peer) = l.accept().await.unwrap();
+                    let (st, dbus, dir) = (st.clone(), dbus.clone(), dir.clone());
+                    tokio::spawn(web_session(
+                        s,
+                        peer,
+                        st,
+                        dbus,
+                        "sid".into(),
+                        "Linux Laptop".into(),
+                        dir,
+                    ));
+                }
+            });
+        }
+        let browser = |cookie: Option<String>| async move {
+            let mut req = format!("ws://{addr}/ws?mode=none")
+                .into_client_request()
+                .unwrap();
+            if let Some(c) = cookie {
+                req.headers_mut().insert("Cookie", c.parse().unwrap());
+            }
+            let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let (mut ws, _) = tokio_tungstenite::client_async(req, tcp).await.unwrap();
+            ws.send(Message::Text(
+                json!({"t": "hello", "model": "Chrome/120", "mode": "none"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .unwrap();
+            ws
+        };
+        async fn next_json<S: AsyncRead + AsyncWrite + Unpin>(
+            ws: &mut WebSocketStream<S>,
+        ) -> Value {
+            loop {
+                match timeout(Duration::from_secs(5), ws.next()).await.unwrap() {
+                    Some(Ok(Message::Text(t))) => return serde_json::from_str(t.as_str()).unwrap(),
+                    Some(Ok(_)) => continue,
+                    other => panic!("closed: {other:?}"),
+                }
+            }
+        }
+        let answer = |st: Shared, allow: bool| async move {
+            let (req, code) = timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some((id, (v, _))) = st.lock().await.web_waiting.iter().next() {
+                        return (id.clone(), v["code"].as_str().unwrap().to_string());
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap();
+            let (_, tx) = st.lock().await.web_waiting.remove(&req).unwrap();
+            tx.send(allow).unwrap();
+            code
+        };
+
+        // A new browser: its page shows the same code as the question here; allowed, it gets a token.
+        let mut ws = browser(None).await;
+        let confirm = next_json(&mut ws).await;
+        assert_eq!(confirm["t"], "confirm");
+        assert_eq!(
+            answer(st.clone(), true).await,
+            confirm["code"].as_str().unwrap()
+        );
+        let ok = next_json(&mut ws).await;
+        assert_eq!(ok["t"], "authorized");
+        let token = ok["token"].as_str().unwrap().to_string();
+        assert_eq!(next_json(&mut ws).await["t"], "welcome");
+        drop(ws);
+
+        // The page trades the token for an HttpOnly cookie.
+        let mut post = tokio::net::TcpStream::connect(addr).await.unwrap();
+        post.write_all(
+            format!(
+                "POST /auth HTTP/1.1\r\nHost: x\r\nContent-Length: {}\r\n\r\n{token}",
+                token.len()
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut resp = String::new();
+        post.read_to_string(&mut resp).await.unwrap();
+        assert!(resp.starts_with("HTTP/1.1 204"), "{resp}");
+        assert!(
+            resp.contains(&format!("Set-Cookie: luch_web={token};")) && resp.contains("HttpOnly")
+        );
+
+        // With the cookie: straight in, nothing asked.
+        let mut ws = browser(Some(format!("luch_web={token}"))).await;
+        assert_eq!(next_json(&mut ws).await["t"], "welcome");
+        assert!(st.lock().await.web_waiting.is_empty());
+        drop(ws);
+
+        // A made-up cookie is asked about like a new browser; refused, its page says so.
+        let mut ws = browser(Some("luch_web=0000".into())).await;
+        assert_eq!(next_json(&mut ws).await["t"], "confirm");
+        answer(st.clone(), false).await;
+        let no = next_json(&mut ws).await;
+        assert_eq!(no["t"], "denied");
+        assert_eq!(no["reason"], "refused on the computer");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
