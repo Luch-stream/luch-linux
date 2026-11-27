@@ -96,6 +96,8 @@ public struct MirrorOptions {
     public var synthetic = false
     /// The receiver as a speaker (PROTOCOL.md 4d): the Mac's sound and no picture.
     public var soundOnly = false
+    /// Ask the receiver's decoder to run flat out (an experiment of the receiver's; off: it made a MediaTek TV slower).
+    public var operatingRate = false
     /// A screen of its own for the TV, beside this Mac's (a virtual display), instead of a copy of this one.
     public var extend = false
     /// Ultra-low latency: the desktop drawn at exactly one of the TV's own modes (UltraMode), chosen by this.
@@ -129,6 +131,7 @@ public enum EngineError: Error, LocalizedError {
     case encoder
     case noSoundOnly
     case noVirtualScreen
+    case refused(String)
 
     public var errorDescription: String? {
         switch self {
@@ -139,6 +142,7 @@ public enum EngineError: Error, LocalizedError {
         case .encoder: return "cannot create the video encoder"
         case .noSoundOnly: return "this receiver cannot play sound only"
         case .noVirtualScreen: return "macOS made no second screen for the TV"
+        case let .refused(why): return why
         }
     }
 }
@@ -312,16 +316,18 @@ public final class Engine {
 
         var start: [String: Any] = ["t": "start", "mode": "mirror",
                                     "video": ["codec": plan.codec.rawValue, "width": plan.width,
-                                              "height": plan.height, "fps": plan.fps,
-                                              // Ask the receiver to run the decoder at full operating rate:
-                                              // without it MediaCodec pipelines ~5 frames at 60 fps.
-                                              "operating_rate": true]]
+                                              "height": plan.height, "fps": plan.fps]]
+        // No "operating_rate": on a Horizon 20 Pro (MediaTek) it made the picture ~100 ms later than luchd's,
+        // which does not send it (measured with the latency lab: 10-11 refreshes against 4).
+        if options.operatingRate, var video = start["video"] as? [String: Any] {
+            video["operating_rate"] = true
+            start["video"] = video
+        }
         if plan.audio {
             start["audio"] = ["codec": "audio/opus", "rate": 48_000, "channels": 2,
                               "frame_ms": options.audioFrameMs]
         }
-        ctl.send(start)
-        guard let ready = ctl.waitFor("ready", timeout: 5) else { throw EngineError.noReady }
+        let ready = try startWhenAllowed(ctl, start)
         guard let videoPort = (ready["video_port"] as? NSNumber)?.uint16Value, videoPort > 0 else {
             throw EngineError.noReady
         }
@@ -362,10 +368,9 @@ public final class Engine {
     /// Sound only: an `audio` block and no `video`; the receiver shows what plays instead of a picture.
     private func startSound(_ ctl: ControlChannel, caps: ReceiverCaps, receiver r: Receiver) throws {
         guard caps.modes.contains("audio"), caps.hasOpus else { throw EngineError.noSoundOnly }
-        ctl.send(["t": "start", "mode": "audio",
-                  "audio": ["codec": "audio/opus", "rate": 48_000, "channels": 2, "frame_ms": options.audioFrameMs]])
-        guard let ready = ctl.waitFor("ready", timeout: 5),
-              let port = (ready["audio_port"] as? NSNumber)?.uint16Value, port > 0 else {
+        let ready = try startWhenAllowed(ctl, ["t": "start", "mode": "audio",
+            "audio": ["codec": "audio/opus", "rate": 48_000, "channels": 2, "frame_ms": options.audioFrameMs]])
+        guard let port = (ready["audio_port"] as? NSNumber)?.uint16Value, port > 0 else {
             throw EngineError.noReady
         }
         log("ready: sound only, audio port \(port)")
@@ -383,6 +388,34 @@ public final class Engine {
         startTimers()
         watchNowPlaying()
         log("playing sound on \(caps.name); Ctrl-C to stop")
+    }
+
+    /// The receiver asks its person first (Allow on the TV, PROTOCOL.md 3a): the app says so.
+    public var onWaitingForAllow: (() -> Void)?
+
+    /// Sends `start` until the receiver takes it. A receiver that asks its person about this sender answers
+    /// not_allowed until they press Allow, and says nothing when they do, so the start is sent again every 1.5 s for
+    /// a minute; Deny closes the connection.
+    private func startWhenAllowed(_ ctl: ControlChannel, _ start: [String: Any]) throws -> [String: Any] {
+        let until = Date().addingTimeInterval(60)
+        var told = false
+        while Date() < until {
+            ctl.send(start)
+            guard let r = ctl.waitForAny(["ready", "error"], timeout: 5) else { throw EngineError.noReady }
+            if r["t"] as? String == "ready" { return r }
+            let detail = r["detail"] as? String ?? r["code"] as? String ?? "refused"
+            guard r["code"] as? String == "not_allowed", !detail.contains("refused") else {
+                throw EngineError.refused(detail)
+            }
+            if !told {
+                told = true
+                log("waiting for Allow on the TV")
+                onWaitingForAllow?()
+            }
+            Thread.sleep(forTimeInterval: 1.5)
+            if ctl.isClosed { throw EngineError.refused("refused on the TV") }
+        }
+        throw EngineError.refused("nobody pressed Allow on the TV")
     }
 
     public func run() {

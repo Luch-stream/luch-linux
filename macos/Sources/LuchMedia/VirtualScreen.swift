@@ -52,11 +52,17 @@ public final class VirtualScreen {
         log("virtual screen: \(displayID), \(l.pointsWide)x\(l.pointsHigh) points, \(width)x\(height) pixels @\(fps)")
     }
 
-    /// Waits until macOS shows the screen with its mode (about a second after it is made); false after `timeout`.
+    /// Waits until macOS shows the screen (about a second after it is made, or once the person answers its "Extend or
+    /// Mirror" question); false after `timeout`. Mirrored, it may show at another mode: the log says which.
     public func waitUntilShown(timeout: TimeInterval = 4) -> Bool {
         let until = Date().addingTimeInterval(timeout)
         while Date() < until {
-            if let m = CGDisplayCopyDisplayMode(displayID), m.pixelWidth == pixelWidth { return true }
+            if let m = CGDisplayCopyDisplayMode(displayID) {
+                if m.pixelWidth != pixelWidth {
+                    log("virtual screen: \(displayID) shows at \(m.pixelWidth)x\(m.pixelHeight), not \(pixelWidth)x\(pixelHeight)")
+                }
+                return true
+            }
             Thread.sleep(forTimeInterval: 0.1) // the session starts off the main thread, which has no run loop to turn
         }
         return false

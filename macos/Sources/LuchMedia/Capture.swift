@@ -150,6 +150,7 @@ public final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate {
             guard sampleBuffer.isValid, isComplete(sampleBuffer),
                   let buffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
             frames += 1
+            noteDelivery(sampleBuffer)
             onFrame?(buffer, CMSampleBufferGetPresentationTimeStamp(sampleBuffer))
         case .audio:
             guard sampleBuffer.isValid else { return }
@@ -163,6 +164,38 @@ public final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate {
     public func stream(_ stream: SCStream, didStopWithError error: Error) {
         log("capture: stream stopped: \(error.localizedDescription)")
         onStop?(error.localizedDescription)
+    }
+
+    private var delays: [Double] = []
+    private static let tick: Double = {
+        var tb = mach_timebase_info_data_t()
+        mach_timebase_info(&tb)
+        return Double(tb.numer) / Double(tb.denom) / 1e6
+    }()
+
+    /// How long after a frame was on the screen it reaches us (its displayTime against now): what capture costs
+    /// before anything of ours runs, which host_ms does not see. The median every 2 s or so.
+    private func noteDelivery(_ sampleBuffer: CMSampleBuffer) {
+        guard let raw = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
+              let value = raw.first?[.displayTime] else {
+            if delays.isEmpty, frames == 5 {
+                let keys = (CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[AnyHashable: Any]])?
+                    .first.map { $0.map { "\($0.key)=\(type(of: $0.value))" } } ?? []
+                log("capture: no displayTime; attachments: \(keys)")
+            }
+            return
+        }
+        let shown = (value as? NSNumber)?.uint64Value ?? (value as? UInt64) ?? 0
+        guard shown > 0 else { return }
+        let now = mach_absolute_time()
+        guard now > shown else { return }
+        delays.append(Double(now - shown) * Self.tick)
+        if delays.count >= 120 {
+            let sorted = delays.sorted()
+            log(String(format: "capture: a frame reaches us %.1f ms after it was on the screen (median, p90 %.1f)",
+                       sorted[sorted.count / 2], sorted[sorted.count * 9 / 10]))
+            delays.removeAll(keepingCapacity: true)
+        }
     }
 
     /// ScreenCaptureKit also delivers "idle" frames (nothing changed): those have no new picture.

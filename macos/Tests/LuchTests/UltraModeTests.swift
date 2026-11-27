@@ -36,6 +36,16 @@ final class UltraModeTests: XCTestCase {
         XCTAssertEqual(UltraMode.choose(.quality, caps: tv, macPixelWidth: 3024)?.description, "1920x1080@240")
     }
 
+    /// What a Horizon 20 Pro says: one panel mode, 4K, and Android drawing at 1080p.
+    func testAProjectorThatListsOnly4kStillHasItsCurrent1080p() {
+        let welcome: [String: Any] = ["t": "welcome", "hw": [
+            "display": ["modes": ["3840x2160@60"], "current": "1920x1080@60", "refresh": 60],
+            "video": ["video/hevc": ["max": "4096x2304"]]]]
+        let tv = ReceiverCaps(welcome: welcome)!
+        XCTAssertEqual(UltraMode.choose(.speed, caps: tv, macPixelWidth: 3024)?.description, "1920x1080@60")
+        XCTAssertEqual(UltraMode.choose(.quality, caps: tv, macPixelWidth: 3024)?.description, "3840x2160@60")
+    }
+
     func testWithoutAListTheCurrentModeIsTaken() {
         let welcome: [String: Any] = ["t": "welcome", "hw": ["display": ["current": "1920x1080@60", "refresh": 60]]]
         let tv = ReceiverCaps(welcome: welcome)!

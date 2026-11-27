@@ -199,7 +199,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let match = receivers.first { $0.id == wanted || $0.name == wanted }
                 ?? (receivers.count == 1 ? receivers[0] : nil)
             guard let receiver = match else { return ["error": "receiver not found"] }
-            startMirror(receiver)
+            let ultra = (request["ultra"] as? String).flatMap(UltraPriority.init(rawValue:))
+            if request["ultra"] != nil, ultra == nil { return ["error": "ultra: speed, quality or mac"] }
+            startMirror(receiver, extend: request["extend"] as? Bool ?? false, ultra: ultra)
             return ["ok": true, "receiver": receiver.name]
         case "warmth":
             let value: Double
@@ -488,6 +490,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         options.ultra = ultra
         let engine = Engine(options: options)
         engine.shareArt = { [caster] file, client, me in caster.shareArt(file, client: client, me: me) }
+        engine.onWaitingForAllow = { [weak self] in
+            DispatchQueue.main.async {
+                self?.state = "Press Allow on \(receiver.name) (left, then OK on its remote)"
+                self?.rebuildMenu()
+            }
+        }
         engine.onStats = { [weak self] stats in
             DispatchQueue.main.async { self?.apply(stats) }
         }
