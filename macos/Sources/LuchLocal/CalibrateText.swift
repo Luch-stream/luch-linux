@@ -28,8 +28,8 @@ public enum CalibrateText {
                 "offset now \(offset) (\(sure.joined(separator: ", ")))"
         }
         if results.contains(where: { $0["measured"] as? Bool == true }) {
-            out.append("(heard − played includes this Mac's microphone delay, the same for every TV: only the " +
-                       "differences matter)")
+            out.append("(heard − played: what each TV adds after the moment it says the sound left its DAC, plus " +
+                       "the air, 2.9 ms per metre; this Mac's microphone delay is already taken off)")
         }
         return out
     }

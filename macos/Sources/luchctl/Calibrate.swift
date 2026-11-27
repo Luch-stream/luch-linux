@@ -17,8 +17,8 @@ func calibrateCommand(_ args: [String]) {
         let r = (try? LocalClient.request(["cmd": "calibrate", "self": true], timeout: 30)) ?? ["error": "Luch.app is not running"]
         fail(r)
         let f = { (k: String) in (r[k] as? NSNumber).map { String(format: "%.1f ms", $0.doubleValue) } ?? "–" }
-        print("heard \(f("loop_ms")) after it was played (each: \((r["each_ms"] as? [NSNumber] ?? []).map { String(format: "%.2f", $0.doubleValue) }.joined(separator: " ")))")
-        print("macOS says: output \(f("output_latency_ms")), microphone \(f("input_latency_ms")); detector: \(r["why"] as? String ?? "?"), peak \(r["peak"] ?? "?")")
+        print("heard \(f("loop_ms")) after it was played, the microphone's own \(f("input_latency_ms")) taken off (each: \((r["each_ms"] as? [NSNumber] ?? []).map { String(format: "%.2f", $0.doubleValue) }.joined(separator: " ")))")
+        print("Core Audio says the speaker adds \(f("output_latency_ms")): the two should agree within a ms or two; detector: \(r["why"] as? String ?? "?"), peak \(r["peak"] ?? "?")")
         return
     }
     guard args.count == 1 else {

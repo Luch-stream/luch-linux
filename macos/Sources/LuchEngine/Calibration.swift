@@ -96,9 +96,12 @@ public struct MicRecording {
     public var samples: [Float]
     public var rate: Double
     public var anchors: [(sample: Int, host: Double)]
+    /// How long before its buffer's host time a sound reached the microphone (s): the device's own path, 31.5 ms on
+    /// a MacBook's built-in array. Taken off every time heard, so "heard − played" is what the TV adds, plus the air.
+    public var captureLatency: Double
 
-    public init(samples: [Float], rate: Double, anchors: [(sample: Int, host: Double)]) {
-        (self.samples, self.rate, self.anchors) = (samples, rate, anchors)
+    public init(samples: [Float], rate: Double, anchors: [(sample: Int, host: Double)], captureLatency: Double = 0) {
+        (self.samples, self.rate, self.anchors, self.captureLatency) = (samples, rate, anchors, captureLatency)
     }
 
     /// sample = a + slope · (host − t0), fitted over all buffers: one buffer's time jitters, and the microphone's
@@ -120,14 +123,14 @@ public struct MicRecording {
         return (t0, my - slope * mx, slope)
     }
 
-    /// Where in `samples` a host-clock time falls (fractional).
+    /// Where in `samples` a sound that reached the microphone at a host-clock time lies (fractional).
     public func position(host: Double) -> Double? {
-        line.map { $0.a + $0.slope * (host - $0.t0) }
+        line.map { $0.a + $0.slope * (host + captureLatency - $0.t0) }
     }
 
-    /// The host-clock time of a (fractional) sample.
+    /// When the sound at a (fractional) sample reached the microphone, on the host clock.
     public func host(position: Double) -> Double? {
-        line.map { $0.t0 + (position - $0.a) / $0.slope }
+        line.map { $0.t0 + (position - $0.a) / $0.slope - captureLatency }
     }
 
     /// The loudest sample: a muted or forbidden microphone records digital silence.

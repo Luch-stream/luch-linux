@@ -42,14 +42,16 @@ enum SelfLoop {
         Thread.sleep(forTimeInterval: (starts.last ?? now) - now + 0.2 + 0.6)
 
         let snap = mic.snapshot()
-        let rec = MicRecording(samples: snap.samples, rate: snap.rate, anchors: snap.anchors)
+        let rec = MicRecording(samples: snap.samples, rate: snap.rate, anchors: snap.anchors,
+                               captureLatency: AudioLatency.input)
         let probe = AcousticProbe(rate: Int(rec.rate.rounded()))
         let positions = starts.compactMap { rec.position(host: $0) }
         guard positions.count == starts.count else { throw CalibrationError("the microphone gave no timestamps") }
         let r = probe.measure(rec.samples, scheduled: positions, windowMs: 150)
+        // The microphone's path is taken off by the recording: what is left is the speaker's path and the air.
         var result: [String: Any] = [
-            "output_latency_ms": out.outputNode.presentationLatency * 1000,
-            "input_latency_ms": mic.inputLatency * 1000,
+            "output_latency_ms": AudioLatency.output * 1000,
+            "input_latency_ms": AudioLatency.input * 1000,
             "peak": rec.peak,
             "why": r.why,
             "psr_db": r.arrivals.map(\.psrDb),

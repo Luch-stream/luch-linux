@@ -97,7 +97,7 @@ private final class Mic: CalibrationMic {
 
     func recording() -> MicRecording {
         let r = recorder.snapshot()
-        return MicRecording(samples: r.samples, rate: r.rate, anchors: r.anchors)
+        return MicRecording(samples: r.samples, rate: r.rate, anchors: r.anchors, captureLatency: AudioLatency.input)
     }
 
     func stop() { recorder.stop() }
