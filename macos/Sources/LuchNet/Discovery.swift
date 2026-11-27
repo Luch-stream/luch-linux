@@ -15,9 +15,11 @@ public struct Receiver {
     public var interfaceIndex: UInt32
     public var port: UInt16
     public var service: String
+    /// The TLS port from the TXT "tls" (protocol v1, pairing), 0 for an older receiver.
+    public var tlsPort: UInt16
 
     public init(id: String, name: String, model: String, address: String, interfaceName: String,
-                interfaceIndex: UInt32, port: UInt16, service: String) {
+                interfaceIndex: UInt32, port: UInt16, service: String, tlsPort: UInt16 = 0) {
         self.id = id
         self.name = name
         self.model = model
@@ -26,6 +28,7 @@ public struct Receiver {
         self.interfaceIndex = interfaceIndex
         self.port = port
         self.service = service
+        self.tlsPort = tlsPort
     }
 }
 
@@ -71,27 +74,6 @@ private func resolveIPv4(_ host: String) -> String? {
         cur = ai.pointee.ai_next
     }
     return nil
-}
-
-/// Interface index of the LAN (an up, non-loopback interface with an IPv4 address).
-public func lanInterfaceIndex() -> UInt32 {
-    var head: UnsafeMutablePointer<ifaddrs>?
-    guard getifaddrs(&head) == 0, let first = head else { return 0 }
-    defer { freeifaddrs(head) }
-    var best: (UInt32, String) = (0, "")
-    var cur: UnsafeMutablePointer<ifaddrs>? = first
-    while let ifa = cur {
-        defer { cur = ifa.pointee.ifa_next }
-        let flags = Int32(ifa.pointee.ifa_flags)
-        guard let sa = ifa.pointee.ifa_addr, sa.pointee.sa_family == UInt8(AF_INET) else { continue }
-        guard flags & IFF_UP != 0, flags & IFF_LOOPBACK == 0 else { continue }
-        let name = String(cString: ifa.pointee.ifa_name)
-        let idx = if_nametoindex(name)
-        // Prefer the usual Wi-Fi/Ethernet names when several interfaces qualify.
-        if name.hasPrefix("en") { return idx }
-        if best.0 == 0 { best = (idx, name) }
-    }
-    return best.0
 }
 
 private let browseCallback: DNSServiceBrowseReply = { _, flags, ifIndex, err, name, _, _, ctx in
@@ -228,16 +210,20 @@ public final class Discovery {
                 log("bonjour: no IPv4 for \(hostTarget)")
                 return
             }
-            // A loopback service can be resolved on en0 (Bonjour publishes on every interface); pinning
-            // 127.0.0.1 to en0 would fail, so the index must follow the address.
+            // The index must follow the address: a loopback service can be resolved on en0 (Bonjour publishes on
+            // every interface), and a VPN's interface, or an address of another subnet, must not carry the stream
+            // (section 2). Then the LAN that holds the address is used, as luchd does.
             var index = ifIndex
-            if address.hasPrefix("127.") {
-                index = if_nametoindex("lo0")
+            let all = netInterfaces()
+            if let ip = parseIPv4(address),
+               !all.contains(where: { $0.index == ifIndex && (scannable($0) || $0.isLoopback) && $0.holds(ip) }),
+               let lan = interfaceFor(ip, in: all) {
+                index = lan.index
             }
             let receiver = Receiver(id: txt["id"] ?? serviceName, name: txt["name"] ?? serviceName,
                                     model: txt["model"] ?? "", address: address,
                                     interfaceName: interfaceName(index), interfaceIndex: index,
-                                    port: portHost, service: serviceName)
+                                    port: portHost, service: serviceName, tlsPort: UInt16(txt["tls"] ?? "") ?? 0)
             self.lock.lock()
             self.receivers[receiver.service] = receiver
             self.lock.unlock()

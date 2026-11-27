@@ -1,4 +1,5 @@
-// Control channel: TCP, one JSON object per line, exactly as luch-android/PROTOCOL.md describes.
+// Control channel: one JSON object per line, exactly as luch-android/PROTOCOL.md describes, over plain TCP (v0) or
+// TLS (v1, TLSLink.swift).
 // SPDX-License-Identifier: GPL-3.0-or-later
 import Darwin
 import Foundation
@@ -7,9 +8,13 @@ import LuchProto
 public final class ControlChannel {
     public var onEvent: (([String: Any]) -> Void)?
     public var onClosed: ((String) -> Void)?
+    /// The receiver's crash and error reports (PROTOCOL.md 6), taken here instead of queued: set before the hello.
+    public var onReports: (([String: Any]) -> Void)?
     public private(set) var rttMs: Double = 0
+    /// TLS (v1), not the plain port.
+    public let secure: Bool
 
-    private let fd: Int32
+    private let link: ControlLink
     private let lock = NSLock()
     private let cond = NSCondition()
     private var inbox: [[String: Any]] = []
@@ -19,11 +24,14 @@ public final class ControlChannel {
     private var pingAt = Date()
     private var pingTimer: DispatchSourceTimer?
 
-    private init(fd: Int32) { self.fd = fd }
+    private init(link: ControlLink, secure: Bool) {
+        self.link = link
+        self.secure = secure
+    }
 
     deinit {
         pingTimer?.cancel()
-        close(fd)
+        link.close()
     }
 
     /// Connects to the receiver, pinning the socket to the interface it was discovered on.
@@ -78,9 +86,21 @@ public final class ControlChannel {
         }
         _ = fcntl(s, F_SETFL, 0)
         log("control: connected to \(ip):\(port) via ifindex \(interfaceIndex)")
-        let channel = ControlChannel(fd: s)
+        let channel = ControlChannel(link: SocketLink(fd: s), secure: false)
         channel.start()
         return channel
+    }
+
+    /// TLS to the receiver's TLS port (PROTOCOL.md 3a) with this Mac's certificate; the receiver's is taken only if
+    /// it is `pinned` (when there is one). Returns the channel and the receiver's certificate fingerprint.
+    public static func openTLS(ip: String, port: UInt16, interfaceIndex: UInt32, me: SenderCertificate,
+                               pinned: Fingerprint?, timeout: TimeInterval = 5) throws -> (ControlChannel, Fingerprint) {
+        let (link, fp) = try TLSLink.connect(ip: ip, port: port, interfaceIndex: interfaceIndex, identity: me.identity,
+                                             pinned: pinned, timeout: timeout)
+        log("control: TLS to \(ip):\(port) via ifindex \(interfaceIndex)")
+        let channel = ControlChannel(link: link, secure: true)
+        channel.start()
+        return (channel, fp)
     }
 
     private func start() {
@@ -121,19 +141,7 @@ public final class ControlChannel {
         lock.lock()
         defer { lock.unlock() }
         guard !closed else { return false }
-        var written = 0
-        let ok = data.withUnsafeBytes { (buf: UnsafeRawBufferPointer) -> Bool in
-            while written < buf.count {
-                let n = Darwin.send(fd, buf.baseAddress!.advanced(by: written), buf.count - written, 0)
-                if n <= 0 {
-                    if errno == EINTR { continue }
-                    return false
-                }
-                written += n
-            }
-            return true
-        }
-        return ok
+        return link.write(data)
     }
 
     /// Blocks until a message with `t == type` arrives (other messages are dropped) or the timeout expires.
@@ -174,14 +182,7 @@ public final class ControlChannel {
     }
 
     /// This Mac's address on the connection: what the receiver reaches us at.
-    public var localAddress: String {
-        var a = sockaddr_in()
-        var len = socklen_t(MemoryLayout<sockaddr_in>.size)
-        withUnsafeMutablePointer(to: &a) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { _ = getsockname(fd, $0, &len) } }
-        var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
-        inet_ntop(AF_INET, &a.sin_addr, &buf, socklen_t(INET_ADDRSTRLEN))
-        return String(cString: buf)
-    }
+    public var localAddress: String { link.localAddress }
 
     public var isClosed: Bool {
         lock.lock()
@@ -190,12 +191,17 @@ public final class ControlChannel {
     }
 
     private func readLoop() {
-        var buf = [UInt8](repeating: 0, count: 65536)
         var pending = Data()
         while true {
-            let n = recv(fd, &buf, buf.count, 0)
-            if n > 0 {
-                pending.append(contentsOf: buf[0..<Int(n)])
+            let chunk: Data
+            do {
+                chunk = try link.read()
+            } catch {
+                closeChannel("read: \(error.localizedDescription)")
+                return
+            }
+            if !chunk.isEmpty {
+                pending.append(chunk)
                 while let nl = pending.firstIndex(of: 0x0a) {
                     let line = pending[pending.startIndex..<nl]
                     pending.removeSubrange(pending.startIndex...nl)
@@ -211,12 +217,8 @@ public final class ControlChannel {
                     closeChannel("line too long")
                     return
                 }
-            } else if n == 0 {
-                closeChannel("closed by receiver")
-                return
             } else {
-                if errno == EINTR { continue }
-                closeChannel("read: \(errnoString())")
+                closeChannel("closed by receiver")
                 return
             }
         }
@@ -240,6 +242,9 @@ public final class ControlChannel {
                 rttMs = Date().timeIntervalSince(pingAt) * 1000
             }
             lock.unlock()
+            return
+        case "reports" where onReports != nil:
+            onReports?(obj)
             return
         default:
             break
@@ -265,11 +270,77 @@ public final class ControlChannel {
         cond.broadcast()
         cond.unlock()
         log("control: closed (\(why))")
+        link.close()
         onClosed?(why)
     }
 
     public func bye() {
         _ = send(["t": "bye"])
-        shutdown(fd, SHUT_WR)
+        link.shutdownWrite()
+    }
+}
+
+/// The bytes under a control channel: a TCP socket, or TLS over one.
+protocol ControlLink: AnyObject {
+    /// All of it, or false.
+    func write(_ data: Data) -> Bool
+    /// The next bytes; empty when the other side closed.
+    func read() throws -> Data
+    func shutdownWrite()
+    /// Ends it both ways; a read in progress returns.
+    func close()
+    var localAddress: String { get }
+}
+
+struct LinkError: Error, LocalizedError {
+    let errorDescription: String?
+    init(_ why: String) { errorDescription = why }
+}
+
+/// Plain TCP (v0): a connected socket.
+final class SocketLink: ControlLink {
+    private let fd: Int32
+
+    init(fd: Int32) { self.fd = fd }
+
+    /// Only here: a descriptor closed earlier could be reused by another socket while a read still names it.
+    deinit { Darwin.close(fd) }
+
+    func write(_ data: Data) -> Bool {
+        var written = 0
+        return data.withUnsafeBytes { (buf: UnsafeRawBufferPointer) -> Bool in
+            while written < buf.count {
+                let n = Darwin.send(fd, buf.baseAddress!.advanced(by: written), buf.count - written, 0)
+                if n <= 0 {
+                    if errno == EINTR { continue }
+                    return false
+                }
+                written += n
+            }
+            return true
+        }
+    }
+
+    func read() throws -> Data {
+        var buf = [UInt8](repeating: 0, count: 65536)
+        while true {
+            let n = recv(fd, &buf, buf.count, 0)
+            if n >= 0 { return Data(buf[0..<n]) }
+            if errno == EINTR { continue }
+            throw LinkError(errnoString())
+        }
+    }
+
+    func shutdownWrite() { shutdown(fd, SHUT_WR) }
+
+    func close() { shutdown(fd, SHUT_RDWR) }
+
+    var localAddress: String {
+        var a = sockaddr_in()
+        var len = socklen_t(MemoryLayout<sockaddr_in>.size)
+        withUnsafeMutablePointer(to: &a) { $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { _ = getsockname(fd, $0, &len) } }
+        var buf = [CChar](repeating: 0, count: Int(INET_ADDRSTRLEN))
+        inet_ntop(AF_INET, &a.sin_addr, &buf, socklen_t(INET_ADDRSTRLEN))
+        return String(cString: buf)
     }
 }

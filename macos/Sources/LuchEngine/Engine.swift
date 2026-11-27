@@ -82,6 +82,8 @@ public struct MirrorOptions {
     // 20 ms measured best on a real Android receiver: 5 ms and 10 ms crackled because the
     // receiver's AudioTrack buffer (~4 frames) underruns on Wi-Fi jitter.
     public var audioFrameMs = 20
+    /// How the sound goes with the picture (PROTOCOL.md 4, "Audio modes"); `audio` false still means none at all.
+    public var audioMode = AudioMode.auto
     public var codec: CodecChoice = .auto
     public var fit: FitMode = .crop
     public var profile: VideoProfile?
@@ -102,6 +104,10 @@ public struct MirrorOptions {
     public var extend = false
     /// Ultra-low latency: the desktop drawn at exactly one of the TV's own modes (UltraMode), chosen by this.
     public var ultra: UltraPriority?
+    /// One window alone (`mirror window`), fitted into the TV's shape.
+    public var window: CGWindowID?
+    /// One of this Mac's displays (`mirror monitor`); nil: the main one, or `display`.
+    public var displayID: CGDirectDisplayID?
     /// Tell the receiver what this Mac plays (`now_playing`), whatever the session shows.
     public var nowPlaying = true
     public init() {}
@@ -124,7 +130,6 @@ public struct SessionStats {
 }
 
 public enum EngineError: Error, LocalizedError {
-    case cannotConnect(String)
     case noWelcome
     case noReady
     case socket
@@ -135,7 +140,6 @@ public enum EngineError: Error, LocalizedError {
 
     public var errorDescription: String? {
         switch self {
-        case let .cannotConnect(what): return "cannot connect: \(what)"
         case .noWelcome: return "receiver did not answer hello"
         case .noReady: return "receiver did not answer start"
         case .socket: return "cannot open the media socket"
@@ -214,6 +218,8 @@ public final class Engine {
     public private(set) var receiver: Receiver?
     /// A link on this Mac for the cover in `file` that `receiver` may fetch (the app's file server), or nil.
     public var shareArt: ((_ file: URL, _ receiver: String, _ me: String) -> String?)?
+    /// The receiver's input may drive this Mac once the person allows it (PROTOCOL.md 4i); nil: never asked.
+    public var input: InputControl?
 
     private var control: ControlChannel?
     private var videoTx: UdpSender?
@@ -263,18 +269,17 @@ public final class Engine {
         self.receiver = r
         warmth = options.warmth
         let identity = senderIdentity()
-
-        guard let ctl = ControlChannel.open(ip: r.address, port: r.port, interfaceIndex: r.interfaceIndex) else {
-            throw EngineError.cannotConnect("\(r.address):\(r.port)")
-        }
+        // TLS and pairing when the receiver offers them (Connector); fails with "asks for pairing" while a code waits.
+        let want = ["mirror", "reports"] + (input == nil ? [] : [InputControl.want])
+        let connection = try Connector.shared.open(r, hello: ["t": "hello", "v": Int(Proto.version), "id": identity.id,
+                                                              "name": identity.name, "app": Proto.app, "want": want])
+        let ctl = connection.channel
         control = ctl
         ctl.onEvent = { [weak self] msg in self?.handle(msg) }
-
-        ctl.send(["t": "hello", "v": Int(Proto.version), "id": identity.id, "name": identity.name,
-                  "app": Proto.app, "want": ["mirror"]])
-        guard let welcome = ctl.waitFor("welcome", timeout: 5) else { throw EngineError.noWelcome }
+        let welcome = connection.welcome
         guard let caps = ReceiverCaps(welcome: welcome) else { throw EngineError.noWelcome }
         log(caps.describe())
+        input?.welcome(welcome, name: caps.name)
         self.caps = caps
         if options.soundOnly {
             try startSound(ctl, caps: caps, receiver: r)
@@ -286,19 +291,23 @@ public final class Engine {
     /// Changes how this Mac's screen is shown (as it is, at the TV's mode, or extended) while the session runs:
     /// a new start on the same connection, which the receiver takes as the same sender's, so nobody is asked to
     /// Allow again and the TV keeps its screen up.
-    public func switchScreen(extend: Bool, ultra: UltraPriority?) throws {
+    public func switchScreen(extend: Bool, ultra: UltraPriority?, window: CGWindowID? = nil,
+                             displayID: CGDirectDisplayID? = nil) throws {
         guard running, !stopping, !options.soundOnly, let ctl = control, let caps, let r = receiver else {
             throw EngineError.noReady
         }
-        log("switching the screen: \(ultra.map { "at the TV's mode, " + $0.rawValue } ?? (extend ? "extended" : "as it is"))")
+        log("switching the screen: \(ultra.map { "at the TV's mode, " + $0.rawValue } ?? (extend ? "extended" : window != nil ? "one window" : "as it is"))")
         tearDownMedia()
         options.extend = extend
         options.ultra = ultra
+        options.window = window
+        options.displayID = displayID
         try begin(ctl, caps: caps, receiver: r)
     }
 
     /// Everything of one picture's pipeline, the connection left open.
     private func tearDownMedia() {
+        input?.ended()
         stopTimers()
         watcher?.stop()
         watcher = nil
@@ -327,8 +336,8 @@ public final class Engine {
     /// The picture: the plan, the screen to capture, the start, then capture, encoder and sockets.
     private func begin(_ ctl: ControlChannel, caps: ReceiverCaps, receiver r: Receiver) throws {
         var planned = options
-        // A screen of the TV's own takes the TV's shape: nothing to crop or fit.
-        if planned.extend { planned.sizeMode = .client }
+        // A screen of the TV's own takes the TV's shape: nothing to crop or fit. A window is fitted into it.
+        if planned.extend || planned.window != nil { planned.sizeMode = .client }
         if let priority = options.ultra {
             let panel = CGDisplayCopyDisplayMode(CGMainDisplayID())?.pixelWidth ?? 1920
             guard let m = UltraMode.choose(priority, caps: caps, macPixelWidth: panel) else {
@@ -372,9 +381,8 @@ public final class Engine {
             video["operating_rate"] = true
             start["video"] = video
         }
-        if plan.audio {
-            start["audio"] = ["codec": "audio/opus", "rate": 48_000, "channels": 2,
-                              "frame_ms": options.audioFrameMs]
+        if plan.audio, let audio = options.audioMode.startBlock(limits: caps.limits, frameMs: options.audioFrameMs) {
+            start["audio"] = audio
         }
         let ready = try startWhenAllowed(ctl, start)
         guard let videoPort = (ready["video_port"] as? NSNumber)?.uint16Value, videoPort > 0 else {
@@ -382,14 +390,16 @@ public final class Engine {
         }
         log("ready: video port \(videoPort), audio port \(ready["audio_port"] ?? 0)")
 
+        // Over TLS the receiver gives this session's media key: every frame is sealed with it (PROTOCOL.md 4).
+        let seal = try MediaSeal.key(ready: ready).flatMap { MediaSeal(key: $0) }
         guard let vtx = UdpSender.open(kind: .video, ip: r.address, port: videoPort,
-                                       interfaceIndex: r.interfaceIndex, dscp: 40) else {
+                                       interfaceIndex: r.interfaceIndex, dscp: 40, seal: seal) else {
             throw EngineError.socket
         }
         videoTx = vtx
         if plan.audio, let audioPort = (ready["audio_port"] as? NSNumber)?.uint16Value, audioPort > 0 {
             audioTx = UdpSender.open(kind: .audio, ip: r.address, port: audioPort,
-                                     interfaceIndex: r.interfaceIndex, dscp: 48)
+                                     interfaceIndex: r.interfaceIndex, dscp: 48, seal: seal)
         } else if plan.audio {
             log("audio: receiver gave no audio port, continuing without sound")
         }
@@ -409,6 +419,9 @@ public final class Engine {
         running = true
         streaming = true
         try startMedia()
+        let frame = CGSize(width: plan.width, height: plan.height)
+        input?.started(video: vtx, geometry: { [weak self] in InputGeometry.of(self?.capture?.shown, frame: frame) },
+                       send: { ctl.send($0) })
         startTimers()
         watchNowPlaying()
         log("streaming; Ctrl-C to stop")
@@ -423,8 +436,9 @@ public final class Engine {
             throw EngineError.noReady
         }
         log("ready: sound only, audio port \(port)")
+        let seal = try MediaSeal.key(ready: ready).flatMap { MediaSeal(key: $0) }
         guard let tx = UdpSender.open(kind: .audio, ip: r.address, port: port,
-                                      interfaceIndex: r.interfaceIndex, dscp: 48),
+                                      interfaceIndex: r.interfaceIndex, dscp: 48, seal: seal),
               let audio = OpusAudio(frameMs: options.audioFrameMs) else { throw EngineError.socket }
         audioTx = tx
         self.audio = audio
@@ -491,6 +505,7 @@ public final class Engine {
         log("finishing: \(reason)")
         control?.send(["t": "stop"])
         control?.bye()
+        input?.ended()
         stopTimers()
         watcher?.stop()
         watcher = nil
@@ -510,6 +525,14 @@ public final class Engine {
         onStopped?(reason)
         if terminateOnStop { exit(0) }
         if ownsRunLoop { CFRunLoopStop(CFRunLoopGetMain()) }
+    }
+
+    /// A control message to the receiver of the running session: the latency lab's flag, an offset, and pointer, ink
+    /// and blank (PROTOCOL.md 4h), which only the sender of what is shown may draw.
+    @discardableResult
+    public func send(_ message: [String: Any]) -> Bool {
+        guard running, !stopping, let control else { return false }
+        return control.send(message)
     }
 
     // MARK: - wiring
@@ -602,8 +625,9 @@ public final class Engine {
             : (w: plan?.width ?? options.width, h: plan?.height ?? options.height, fps: plan?.fps ?? options.fps)
         Task {
             do {
-                try await capture.start(displayIndex: options.display, displayID: self.virtualScreen?.displayID,
-                                        width: size.w, height: size.h,
+                try await capture.start(displayIndex: options.display,
+                                        displayID: self.virtualScreen?.displayID ?? options.displayID,
+                                        windowID: options.window, width: size.w, height: size.h,
                                         fps: size.fps, audio: audio, fit: options.fit)
             } catch {
                 failure = error
@@ -642,6 +666,7 @@ public final class Engine {
     // MARK: - events
 
     private func handle(_ msg: [String: Any]) {
+        if input?.handle(msg) == true { return }
         switch msg["t"] as? String ?? "" {
         case "keyframe":
             log("<- keyframe request")

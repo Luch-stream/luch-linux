@@ -82,7 +82,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private let menu = NSMenu()
     private let discovery = Discovery()
-    private var engine: Engine?
+    /// Receivers past mDNS, the ones talked to before, waking them (Finding.swift).
+    private lazy var finding = Finding(discovery: discovery)
+    /// Do-not-disturb follows a mirroring session (sound only does not count).
+    private(set) var engine: Engine? { didSet { caster.presenter.mirroring(engine.map { !$0.options.soundOnly } ?? false) } }
     private var state = "Idle"
     private var statsLine = "Not streaming"
     private var statsItem: NSMenuItem?
@@ -91,7 +94,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var pendingMenuRefresh = false
     private var menuOpen = false
     private var server: LocalServer?
-    private var currentReceiverID: String?
+    private(set) var currentReceiverID: String?
     private var currentReceiver: Receiver?
     private weak var warmPercent: NSTextField?
     /// Set from `luchctl mirror --frame-ms N`, for A/B testing the audio buffer without a rebuild.
@@ -120,10 +123,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.async { self?.refreshReceivers() }
         }
         discovery.start()
+        finding.onChange = { [weak self] in DispatchQueue.main.async { self?.refreshReceivers() } }
+        finding.finder.isConnected = { [caster] id in caster.existing(id) != nil }
+        caster.onOpen = { [finding] r in finding.finder.remember(r) }
+        try? finding.finder.start("auto")
         let identity = senderIdentity()
         discovery.publish(name: identity.name, id: identity.id)
         startLocalServer()
         caster.onChange = { [weak self] in DispatchQueue.main.async { self?.rebuildMenu() } }
+        pairPrompt.start()
+        pairPrompt.onChange = { [weak self] in self?.rebuildMenu() }
+        ReportNotices.shared.start()
+        setUpPresenting { [weak self] id in self?.currentReceiverID == id ? self?.engine : nil }
+        wireTogether()
         caster.tvs.onChange = { [weak self] in DispatchQueue.main.async { self?.refreshReceivers() } }
         caster.tvs.start()
         startWebReceiver()
@@ -143,11 +155,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - local API (luchctl)
 
     let caster = Caster()
+    let pairPrompt = PairPrompt()
+    let together = Together()
 
     private func startLocalServer() {
         let server = LocalServer()
         server.handler = { [weak self] request in
             guard let self else { return ["error": "app is shutting down"] }
+            if PairingCommands.commands.contains(request["cmd"] as? String ?? "") {
+                var known: [Receiver] = []
+                DispatchQueue.main.sync { known = self.receivers }
+                return PairingCommands.handle(request, receivers: known)
+            }
+            if let answer = self.together.intercept(request) { return answer }
             // What waits for a receiver's answer runs here, on the socket's thread, not on the main one.
             if WebReceiver.commands.contains(request["cmd"] as? String ?? "") { return webReceiver.handle(request) }
             if Caster.commands.contains(request["cmd"] as? String ?? "") {
@@ -158,6 +178,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     mirroring = self.currentReceiverID
                 }
                 return self.caster.handle(request, receivers: known, mirroring: mirroring)
+            }
+            if Finding.commands.contains(request["cmd"] as? String ?? "") {
+                var listed: [Receiver] = []
+                DispatchQueue.main.sync { listed = self.receivers }
+                return self.finding.handle(request, receivers: listed)
             }
             var response: [String: Any] = [:]
             // The socket thread must not touch AppKit state directly.
@@ -177,6 +202,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case "ping":
             return ["ok": true]
         case "receivers":
+            try? finding.finder.start("auto") // as luchd's list: the automatic ladder, at most every 30 s
             return ["receivers": receivers.map { receiver in
                 ["id": receiver.id, "name": receiver.name, "model": receiver.model,
                  "address": receiver.address, "iface": receiver.interfaceName,
@@ -208,6 +234,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if TVKind.of(receiver.id) != .luch {
                 return ["error": "\(receiver.name) has no Luch app: it plays files and links (luchctl cast), not this screen"]
             }
+            if let word = request["source"] as? String {
+                guard let source = MirrorSource.parse(word, which: request["which"] as? String) else {
+                    return ["error": "mirror: fast|monitor|window|virtual|audio or asis|extend|speed|quality|mac"]
+                }
+                return mirror(source, on: receiver)
+            }
             let ultra = (request["ultra"] as? String).flatMap(UltraPriority.init(rawValue:))
             if request["ultra"] != nil, ultra == nil { return ["error": "ultra: speed, quality or mac"] }
             startMirror(receiver, extend: request["extend"] as? Bool, ultra: ultra)
@@ -235,6 +267,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case "stop":
             stopMirror()
             return ["ok": true]
+        case "displays", "windows":
+            return sources(request["cmd"] as? String ?? "")
         default:
             return ["error": "unknown command"]
         }
@@ -252,7 +286,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - menu
 
     func refreshReceivers() {
-        receivers = caster.rows(discovery.all()) + webReceiver.receivers
+        receivers = caster.rows(finding.finder.list()) + webReceiver.receivers
         rebuildMenu()
     }
 
@@ -278,7 +312,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if index == 0 { item.image = NSImage(systemSymbolName: "tv", accessibilityDescription: nil) }
             menu.addItem(item)
         }
+        finding.addMenu(to: menu, online: receivers)
 
+        menu.addItem(.separator())
+        together.addMenuItems(to: menu, receivers: receivers)
         menu.addItem(.separator())
 
         let stats = NSMenuItem(title: statsLine, action: nil, keyEquivalent: "")
@@ -399,6 +436,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(webMenuItem())
         menu.addItem(.separator())
 
+        menu.addItem(quietItem())
+
         let launch = NSMenuItem(title: "Mirror on launch", action: #selector(toggleMirrorOnLaunch), keyEquivalent: "")
         launch.target = self
         launch.state = Preferences.shared.mirrorOnLaunch ? .on : .off
@@ -449,7 +488,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func startMirror(_ receiver: Receiver, soundOnly: Bool = false, extend: Bool? = nil,
-                     ultra: UltraPriority? = nil) {
+                     ultra: UltraPriority? = nil, window: CGWindowID? = nil, displayID: CGDirectDisplayID? = nil) {
         // Nothing asked for: the way chosen for this TV in its menu (also for mirror on launch and luchctl).
         let saved = Preferences.shared.screenMode(for: receiver.id)
         let ultra = ultra ?? (extend == nil && !soundOnly ? saved.ultra : nil)
@@ -464,14 +503,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.global(qos: .userInitiated).async {
                 old.stop(reason: "switch")
                 Thread.sleep(forTimeInterval: 0.8)
-                DispatchQueue.main.async { [weak self] in self?.beginMirror(receiver, soundOnly: soundOnly, extend: extend, ultra: ultra) }
+                DispatchQueue.main.async { [weak self] in
+                    self?.beginMirror(receiver, soundOnly: soundOnly, extend: extend, ultra: ultra, window: window,
+                                      displayID: displayID)
+                }
             }
             return
         }
-        beginMirror(receiver, soundOnly: soundOnly, extend: extend, ultra: ultra)
+        beginMirror(receiver, soundOnly: soundOnly, extend: extend, ultra: ultra, window: window, displayID: displayID)
     }
 
-    private func beginMirror(_ receiver: Receiver, soundOnly: Bool, extend: Bool, ultra: UltraPriority?) {
+    private func beginMirror(_ receiver: Receiver, soundOnly: Bool, extend: Bool, ultra: UltraPriority?,
+                             window: CGWindowID?, displayID: CGDirectDisplayID?) {
         if !CGPreflightScreenCaptureAccess() {
             // The system dialog only comes forward for a regular, active app; a background
             // accessory app gets an immediate "declined" with no window at all.
@@ -501,9 +544,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         stopMirror()
+        DispatchQueue.global(qos: .userInitiated).async { [together] in together.stop() }
         var options = MirrorOptions()
         options.bitrate = Preferences.shared.bitrate
-        options.audio = Preferences.shared.audio
+        options.audioMode = SyncStore.shared.audioMode(receiver.id)
+        options.audio = Preferences.shared.audio && options.audioMode != .off
         options.display = Preferences.shared.display
         options.codec = codecOverride ?? (CodecChoice(rawValue: Preferences.shared.codec) ?? .auto)
         options.sizeMode = sizeModeOverride ?? (SizeMode(rawValue: Preferences.shared.sizeMode) ?? .fit)
@@ -514,7 +559,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         options.soundOnly = soundOnly
         options.extend = extend
         options.ultra = ultra
+        options.window = window
+        options.displayID = displayID ?? (extend || ultra != nil || window != nil ? nil : self.displayID(for: receiver))
         let engine = Engine(options: options)
+        if !soundOnly { engine.input = inputControl(for: receiver) }
         engine.shareArt = { [caster] file, client, me in caster.shareArt(file, client: client, me: me) }
         engine.onWaitingForAllow = { [weak self] in
             DispatchQueue.main.async {
@@ -545,18 +593,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             do {
                 try engine.start(receiver: receiver)
+                self?.together.sessionStarted(receiver.id)
+                self?.finding.finder.remember(receiver)
                 let codec = engine.plan?.codec.label ?? ""
                 let batteryNote = engine.deviceOnBattery ? " · 🔋 on battery" : ""
                 DispatchQueue.main.async {
                     self?.state = soundOnly ? "Playing sound on \(receiver.name)"
                         : extend ? "Extended to \(receiver.name) · \(codec)"
                         : ultra != nil ? "Mirroring to \(receiver.name) at its \(engine.ultraMode.map { "\($0)" } ?? "") · \(codec)"
+                        : window != nil ? "Showing a window on \(receiver.name) · \(codec)"
                         : "Mirroring to \(receiver.name) · \(codec)\(batteryNote)"
                     self?.rebuildMenu()
                 }
             } catch {
                 DispatchQueue.main.async {
-                    self?.state = "Error: \(error.localizedDescription)"
+                    // The TV shows a code: the window for it comes with the pairing, and the mirror starts after.
+                    if case ConnectError.pairingNeeded = error {
+                        self?.pairPrompt.after(receiver.id) {
+                            self?.startMirror(receiver, soundOnly: soundOnly, extend: extend, ultra: ultra)
+                        }
+                        self?.state = "Pairing with \(receiver.name): type the code the TV shows"
+                    } else {
+                        self?.state = "Error: \(error.localizedDescription)"
+                    }
                     self?.engine = nil
                     self?.rebuildMenu()
                 }
@@ -658,7 +717,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         log("app: setting changed while streaming, restarting (engine=\(engine != nil), receiver=\(receiver.name))")
-        startMirror(receiver)
+        // A window shown stays shown.
+        if let window = engine?.options.window { startMirror(receiver, extend: false, window: window) }
+        else { startMirror(receiver) }
     }
 
     @objc private func toggleMirrorOnLaunch() {
@@ -703,12 +764,15 @@ extension AppDelegate {
             if each == mode { item.state = .on }
             modeMenu.addItem(item)
         }
+        addScreenSources(to: modeMenu, for: r)
         modeItem.submenu = modeMenu
         m.addItem(modeItem)
         m.addItem(.run("Play Sound Only", symbol: "hifispeaker") { [weak self] in self?.startMirror(r, soundOnly: true) })
         if mirroringHere {
             m.addItem(.run("Stop Mirroring", symbol: "stop.circle") { [weak self] in self?.stopMirror() })
         }
+        inputItems(for: r).forEach(m.addItem)
+        together.addReceiverItems(to: m, receiver: r)
 
         m.addItem(.separator())
         m.addItem(.run("Show File…", symbol: "doc") { [weak self] in self?.chooseFiles(for: r) })
@@ -718,6 +782,7 @@ extension AppDelegate {
         m.addItem(.run(linkTitle, enabled: link != nil, symbol: "link") { [weak self] in
             if let link { self?.send(["cmd": "cast", "items": [link]], to: r) }
         })
+        presentingItems(r, mirroringHere: mirroringHere).forEach(m.addItem)
 
         if let s = caster.existing(r.id), let kind = s.showing {
             m.addItem(.separator())
@@ -727,6 +792,8 @@ extension AppDelegate {
         m.addItem(.separator())
         m.addItem(volumeItem(r))
         m.addItem(.run("Put to Sleep", symbol: "moon") { [weak self] in self?.send(["cmd": "sleep"], to: r) })
+        m.addItem(.separator())
+        pairPrompt.menuItems(for: r) { [weak self] in self?.send(["cmd": "connect"], to: r) }.forEach(m.addItem)
         return m
     }
 
@@ -827,7 +894,10 @@ extension AppDelegate {
             guard let self else { return }
             let response = self.caster.run(request, on: r)
             DispatchQueue.main.async {
-                if let error = response["error"] as? String {
+                if let error = response["error"] as? String, error.contains("asks for pairing") {
+                    // The window for the code comes with the pairing; this is done again once paired.
+                    self.pairPrompt.after(r.id) { self.send(request, to: r) }
+                } else if let error = response["error"] as? String {
                     let alert = NSAlert()
                     alert.messageText = r.name
                     alert.informativeText = error
@@ -894,13 +964,15 @@ extension AppDelegate: NSMenuDelegate {
 
 extension AppDelegate {
     /// A new way to show the screen takes effect at once when this TV is being mirrored to (sound only stays).
-    fileprivate func switchScreen(_ mode: ScreenMode, on r: Receiver) {
+    /// `window`: that window alone instead of the screen.
+    func switchScreen(_ mode: ScreenMode, on r: Receiver, window: CGWindowID? = nil) {
         guard let engine, currentReceiverID == r.id, engine.streaming, !engine.options.soundOnly else { return }
-        state = "Switching \(r.name) to \(mode.short)…"
+        state = "Switching \(r.name) to \(window == nil ? mode.short : "one window")…"
         rebuildMenu()
+        let display = mode == .asIs && window == nil ? displayID(for: r) : nil
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             do {
-                try engine.switchScreen(extend: mode == .extend, ultra: mode.ultra)
+                try engine.switchScreen(extend: mode == .extend, ultra: mode.ultra, window: window, displayID: display)
                 let codec = engine.plan?.codec.label ?? ""
                 let at = engine.ultraMode.map { " at its \($0)" } ?? ""
                 DispatchQueue.main.async {
@@ -962,5 +1034,32 @@ enum ScreenMode: String, CaseIterable {
         case .speed, .quality, .likeMac: return "bolt"
         case .extend: return "rectangle.split.2x1"
         }
+    }
+}
+
+// MARK: - playing in step, sound modes, the latency lab (Together.swift)
+
+extension AppDelegate {
+    fileprivate func wireTogether() {
+        together.hooks.receivers = { [weak self] in self?.receivers ?? [] }
+        together.hooks.mirroring = { [weak self] in
+            guard let self, let engine, let id = currentReceiverID else { return nil }
+            let mode = engine.options.soundOnly ? "audio" : Preferences.shared.screenMode(for: id).rawValue
+            return (id, engine, mode)
+        }
+        together.hooks.stopMirror = { [weak self] in self?.stopMirror() }
+        together.hooks.options = {
+            var o = MirrorOptions()
+            o.bitrate = Preferences.shared.bitrate
+            o.audio = Preferences.shared.audio
+            o.display = Preferences.shared.display
+            o.codec = CodecChoice(rawValue: Preferences.shared.codec) ?? .auto
+            o.sizeMode = SizeMode(rawValue: Preferences.shared.sizeMode) ?? .fit
+            o.preset = QualityPreset.parse(Preferences.shared.preset) ?? .balanced
+            o.warmth = Preferences.shared.warmth
+            return o
+        }
+        together.hooks.restart = { [weak self] _ in self?.restartIfStreaming() }
+        together.hooks.changed = { [weak self] in self?.rebuildMenu() }
     }
 }

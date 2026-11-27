@@ -40,8 +40,9 @@ func withReceiver(_ request: [String: Any], _ name: String?) -> [String: Any] {
 }
 
 /// Sends a request; when it named no receiver and the app cannot tell which one is meant, asks on the terminal and
-/// sends it again to the one picked. A script without a terminal gets the app's error, which names them.
-func callPicking(_ request: [String: Any], timeout: TimeInterval = 10) -> [String: Any] {
+/// sends it again to the one picked. A script without a terminal gets the app's error, which names them. A receiver
+/// that asks for pairing gets its code typed here (`askCode`), and the request goes again.
+func callPicking(_ request: [String: Any], timeout: TimeInterval = 10, askCode: Bool = true) -> [String: Any] {
     var response = (try? LocalClient.request(request, timeout: timeout)) ?? ["error": "Luch.app is not running"]
     if request["id"] == nil, (response["error"] as? String)?.hasPrefix("several receivers") == true,
        let picked = chooseReceiver() {
@@ -49,7 +50,7 @@ func callPicking(_ request: [String: Any], timeout: TimeInterval = 10) -> [Strin
         again["id"] = picked
         response = (try? LocalClient.request(again, timeout: timeout)) ?? ["error": "Luch.app is not running"]
     }
-    return response
+    return askCode ? pairedAndAgain(request, response, timeout: timeout) : response
 }
 
 func chooseReceiver() -> String? {
@@ -60,6 +61,8 @@ func chooseReceiver() -> String? {
     guard all.count > 1 else { return nil }
     return ReceiverChoice.ask(all)?.id
 }
+
+if FindCommands.handles(args) { exit(FindCommands.run(args)) }
 
 switch command {
 case "list":
@@ -125,10 +128,36 @@ case "mirror":
         positionals.append(args[index])
         index += 1
     }
-    if let name = positionals.first { request["name"] = name }
+    let (name, source, which) = MirrorSource.split(positionals) { word in
+        (call(["cmd": "receivers"])["receivers"] as? [[String: Any]] ?? []).contains {
+            ($0["name"] as? String)?.lowercased() == word.lowercased() || $0["id"] as? String == word
+        }
+    }
+    if let name { request["name"] = name }
+    if let source {
+        guard let parsed = MirrorSource.parse(source) else {
+            print("usage: luchctl mirror [r] [fast|monitor|window|virtual|audio|asis|extend|speed|quality|mac] [which]")
+            exit(2)
+        }
+        request["source"] = source
+        if let which { request["which"] = which }
+        // No display or window named, several there: picked here, on the terminal.
+        if which == nil, parsed == .monitor(nil) || parsed == .window(nil) {
+            let what = parsed == .window(nil) ? "windows" : "displays"
+            let all = (call(["cmd": what])[what] as? [[String: Any]] ?? []).compactMap { e -> ReceiverEntry? in
+                guard let id = e["id"] as? String, let name = e["name"] as? String else { return nil }
+                return ReceiverEntry(id: id, name: name)
+            }
+            if all.count > 1, let picked = SourceChoice.ask(String(what.dropLast()), all) {
+                request["which"] = "#" + picked.id
+            }
+        }
+    }
     let response = call(request)
     if let error = response["error"] as? String { print("error: \(error)"); exit(1) }
+    if let asking = response["asking"] as? String { print(asking) }
     print("mirroring to \(response["receiver"] as? String ?? "?")")
+    codeIfAskedWhileMirroring(response["receiver"] as? String ?? "")
 
 case "stats":
     let response = call(["cmd": "stats"])
@@ -150,6 +179,19 @@ case "stats":
         if let thermal = stats["thermal"] as? String, thermal != "none" { line += " · \(thermal)" }
         print(line)
     }
+    printGroup()
+
+case "group":
+    groupCommand(args)
+
+case "offset":
+    offsetCommand(args)
+
+case "audio":
+    audioCommand(args)
+
+case "latency":
+    latencyCommand(args)
 
 case "state":
     let response = call(["cmd": "state"])
@@ -246,6 +288,31 @@ case "page":
     fail(r)
     print(r["page"] as? String ?? "")
 
+case "present" where (2...3).contains(args.count):
+    // A PDF or a presentation on the receiver, the presenter view here (current and next slide, notes, timer).
+    let (name, file) = args.count == 3 ? (args[1], args[2]) : (nil, args[1])
+    let path = URL(fileURLWithPath: (file as NSString).expandingTildeInPath).standardizedFileURL.path
+    let r = callPicking(withReceiver(["cmd": "present", "file": path], name), timeout: 120)
+    fail(r)
+    let url = r["url"] as? String ?? ""
+    print("presenter view: \(url)")
+    let open = Process()
+    open.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+    open.arguments = [url]
+    if (try? open.run()) == nil { print("(open it in a browser)") }
+
+case "blank" where (2...3).contains(args.count):
+    let (name, word) = args.count == 3 ? (args[1], args[2]) : (nil, args[1])
+    guard word == "on" || word == "off" else { print("error: blank on|off, not \(word)"); exit(1) }
+    fail(callPicking(withReceiver(["cmd": "annotate", "msg": ["t": "blank", "on": word == "on"]], name)))
+
+case "quiet" where args.count <= 2:
+    // Do not disturb while presenting or mirroring; ask: the app asks once.
+    let r = call(args.count == 2 ? ["cmd": "quiet", "mode": args[1]] : ["cmd": "quiet"])
+    fail(r)
+    if args.count == 1 { print(r["mode"] as? String ?? "?") }
+    if let note = r["note"] as? String { print(note) }
+
 case "stop-cast":
     fail(callPicking(withReceiver(["cmd": "stop_cast"], args.count > 1 ? args[1] : nil)))
 
@@ -299,18 +366,52 @@ case "web":
         exit(2)
     }
 
+case "pair":
+    let words = Array(args.dropFirst())
+    guard words.count <= 2 else { print("usage: luchctl pair [r] [code]"); exit(2) }
+    if words.count == 1, isPairCode(words[0]) {
+        pairWith(nil, code: words[0])
+    } else {
+        pairWith(words.first, code: words.count > 1 ? words[1] : nil)
+    }
+
+case "paired":
+    listPaired()
+
+case "forget":
+    guard args.count == 2 else { print("usage: luchctl forget <r>"); exit(2) }
+    forget(args[1])
+
+case "reports":
+    listReports()
+
+case "report":
+    guard args.count == 2 || args.count == 3 else { print("usage: luchctl report <n> [open|dismiss]"); exit(2) }
+    report(args[1], args.count == 3 ? args[2] : nil)
+
 case "ping":
     let response = call(["cmd": "ping"])
     print((response["ok"] as? Bool) == true ? "app is running" : "no response")
 
 default:
     print("""
-    usage: luchctl list | mirror [name] [--codec auto|h264|hevc] [--profile baseline|main|high]
-                          [--frame-ms N] | stats | state | stop | ping
+    usage: luchctl list | mirror [r] [fast|monitor|window|virtual|audio|asis|extend|speed|quality|mac] [display|window]
+                          [--codec auto|h264|hevc] [--profile baseline|main|high] [--frame-ms N]
+                   | stats | state | stop | ping
                    | cast <file|link>... [--to r] [--title T] [--start m:ss] [--sub file] [--relay] | stop-cast [r]
                    | media [r] [play|pause|toggle|seek m:ss|skip s|rate x|audio id|sub id|sub off]
-                   | volume [r] [0..100|+|-|mute|unmute] | page [r] next|prev|<n> | sleep [r] | browser install
+                   | volume [r] [0..100|+|-|mute|unmute] | page [r] next|prev|<n> | blank [r] on|off
+                   | present [r] <file> | quiet [ask|on|off] | sleep [r] | browser install
+                   | find [auto|all|mdns,scan,ble,sound,qr] | add <link|host[:port]> | refresh | id | info [r]
+                   | known | wake [r] | wake <r> learn | wake <r> mac|ble <value>|off
+                   | pair [r] [code] | paired | forget <r> | reports | report <n> [open|dismiss]
                    | web [allow|deny <code> | forget <n>]
-    """)
+           present: shows a PDF or a presentation on the receiver and opens the presenter view here (current and
+           next slide, notes, timer; the mouse is a laser pointer, dragging draws, a clicker turns the slides)
+           quiet: hide notification banners while presenting or mirroring (ask: the app asks once); macOS allows it
+           only through Shortcuts, so the app adds two shortcuts the first time
+           pair: the first connection to a receiver shows a code on the TV, typed here (any command that connects
+           asks for it too); both then know each other and later connections need nothing. forget: pair again next time
+    """ + "\n" + togetherUsage)
     exit(2)
 }

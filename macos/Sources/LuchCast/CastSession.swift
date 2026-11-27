@@ -20,6 +20,8 @@ public final class CastSession {
     public var onShowing: (() -> Void)?
     private var shown: String?
     private var volumeNow: [String: Any]?
+    /// Every message from the receiver, and {"t":"stop"} when what it shows for us ends (the presenter view).
+    public var onMessage: (([String: Any]) -> Void)?
 
     /// The receiver's volume as it last said ({"level":N,"muted":B}); nil when it keeps its volume to itself.
     public var currentVolume: [String: Any]? {
@@ -43,6 +45,8 @@ public final class CastSession {
     }
 
     public var isOpen: Bool { !ctl.isClosed }
+    /// TLS (v1), not the plain port of an older receiver.
+    public var isEncrypted: Bool { ctl.secure }
 
     private init(receiver: Receiver, ctl: ControlChannel, welcome: [String: Any]) {
         self.receiver = receiver
@@ -51,16 +55,12 @@ public final class CastSession {
     }
 
     public static func open(_ r: Receiver) throws -> CastSession {
-        guard let ctl = ControlChannel.open(ip: r.address, port: r.port, interfaceIndex: r.interfaceIndex) else {
-            throw CastError.bad("cannot reach \(r.name) (\(r.address):\(r.port))")
-        }
         let me = senderIdentity()
-        ctl.send(["t": "hello", "v": Int(Proto.version), "id": me.id, "name": me.name, "app": Proto.app,
-                  "want": ["media", "photo"]])
-        guard let welcome = ctl.waitFor("welcome", timeout: 5) else {
-            ctl.closeChannel("no welcome")
-            throw CastError.bad("\(r.name) did not answer")
-        }
+        // TLS and pairing when the receiver offers them; fails with "asks for pairing" while a code waits.
+        let c = try Connector.shared.open(r, hello: ["t": "hello", "v": Int(Proto.version), "id": me.id, "name": me.name,
+                                                     "app": Proto.app, "want": ["media", "photo", "reports"]])
+        let ctl = c.channel
+        let welcome = c.welcome
         let s = CastSession(receiver: r, ctl: ctl, welcome: welcome)
         s.volumeNow = welcome["volume"] as? [String: Any]
         ctl.onEvent = { [weak s] msg in s?.event(msg) }
@@ -73,6 +73,7 @@ public final class CastSession {
     }
 
     private func event(_ m: [String: Any]) {
+        if m["t"] as? String != "stop" { onMessage?(m) }
         switch m["t"] as? String ?? "" {
         case "media_state":
             lock.lock()
@@ -117,6 +118,7 @@ public final class CastSession {
         shown = nil
         docPages = (0, 0)
         lock.unlock()
+        onMessage?(["t": "stop", "reason": reason])
         if was != nil { onShowing?() }
         if had { onState?(["t": "media_state", "state": "stopped", "reason": reason]) }
     }
@@ -156,6 +158,12 @@ public final class CastSession {
         lock.unlock()
         onShowing?()
         return kind
+    }
+
+    /// Pointer, ink, blank and page turns (PROTOCOL.md 4h): on this channel, as only the sender of what is shown may
+    /// draw on it.
+    public func send(_ m: [String: Any]) {
+        ctl.send(m)
     }
 
     public func command(_ cmd: [String: Any]) {

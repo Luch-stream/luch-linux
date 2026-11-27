@@ -8,15 +8,16 @@ import LuchTV
 
 extension Caster {
     /// One row per TV, as luchd's Receivers: a Luch receiver as it was found, a TV without Luch as a row of its own
-    /// unless a Luch receiver (or a better way) is at its address.
+    /// unless a Luch receiver (or a better way) is at its address. Luch rows keep the finder's order (the nearest
+    /// first, where Bluetooth heard them), the other TVs follow by name.
     func rows(_ luch: [Receiver]) -> [Receiver] {
-        let byID = Dictionary(luch.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
-        return tvs.groups(luch: Self.entries(luch)).compactMap { g in
-            let best = g[0]
-            if best.kind == .luch { return byID[best.id] }
-            return Receiver(id: best.id, name: best.name, model: best.model, address: best.address, interfaceName: "",
-                            interfaceIndex: 0, port: best.port, service: best.kind.rawValue)
+        let groups = tvs.groups(luch: Self.entries(luch))
+        let best = Set(groups.map { $0[0].id })
+        let others = groups.map { $0[0] }.filter { $0.kind != .luch }.map {
+            Receiver(id: $0.id, name: $0.name, model: $0.model, address: $0.address, interfaceName: "",
+                     interfaceIndex: 0, port: $0.port, service: $0.kind.rawValue)
         }
+        return luch.filter { best.contains($0.id) } + others
     }
 
     static func entries(_ receivers: [Receiver]) -> [Entry] {

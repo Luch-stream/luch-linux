@@ -9,7 +9,7 @@ describes, so no change is needed on the TV side.
 | Capture | ScreenCaptureKit: display, NV12 video range, cursor drawn in; the size follows the client |
 | Audio | ScreenCaptureKit system audio → libopus, 48 kHz stereo, CBR 128 kbit/s, 20 ms frames |
 | Video | VideoToolbox H.264 or HEVC, real time, no B-frames, IDR on request, Annex-B with SPS/PPS before every IDR |
-| Discovery | DNS-SD (Bonjour); every socket is pinned to the interface the receiver was announced on |
+| Discovery | DNS-SD (Bonjour), a sweep of the LAN, Bluetooth LE, the TV's sound and its QR code; every socket is pinned to a LAN interface, never a VPN's |
 | Control | Unix socket + JSON, the stand-in for the Linux sender's D-Bus API |
 
 ## Requirements
@@ -140,13 +140,40 @@ python3 Tools/fakerecv.py --seconds 20 --out .tmp/capture.h264 &
   delivers ~1 fps on a still desktop);
 - menu bar with receiver list, live latency, warmth, quality, size, codec, bitrate, display and login item;
 - the client's battery, charging, thermal state and headroom, shown but never acted on silently;
-- `luchctl` over a Unix socket.
+- `luchctl` over a Unix socket;
+- what the TV shows, per TV in its **Screen** menu or `luchctl mirror [r] <source> [which]`, with luchd's
+  words and the Mac's: `fast`/`asis` (this screen as it is), `virtual`/`extend` (a second screen),
+  `speed`/`quality`/`mac` (drawn at one of the TV's modes), `monitor [n|name]` (one of several displays),
+  `window [app or title]` (one window alone, fitted into the TV's shape, followed as it moves), `audio`;
+- input from the TV (PROTOCOL.md 4i): a keyboard, mouse or touch screen on the receiver drives this Mac
+  (keys by position, the Mac's own layout makes the characters; a finger is the pointer). "Allow TV to
+  Control This Mac" in the TV's menu; the first use asks (once, always, no), then macOS asks once for
+  Accessibility. "Always" is kept per TV; "Take Back Control" ends it during a session;
+- pairing and encryption (below): TLS to the receiver, its certificate pinned, every frame sealed.
+
+## Pairing and encryption
+
+As luchd (PROTOCOL.md 3a, 4): a receiver that announces a TLS port (`tls=` in its TXT) is reached over TLS with
+this Mac's own certificate (`sender-cert.pem`, `sender-key.pem` readable only by you, in
+`~/Library/Application Support/Luch`, made once; no keychain). The first time, the TV shows a code; the app asks
+for it in a small window (or `luchctl pair`, or any `luchctl` command that connects asks on the terminal); both
+sides then pin each other's certificate (`paired.json`) and later connections need nothing. A paired receiver is
+never reached without TLS again. Over TLS each session's frames are sealed with AES-128-GCM before they are cut
+into datagrams (a 200 KB IDR takes about 25 µs on an M-series Mac), and the receiver hands over its crash and error
+reports (`luchctl reports`, a notification that opens the issue to file). Older receivers keep the plain port and
+are asked about on the TV each time.
+
+```bash
+luchctl pair [r] [code]      # pair now; the code may be given
+luchctl paired               # receivers this Mac is paired with
+luchctl forget <r>           # pair again next time (a receiver reset or reinstalled)
+luchctl reports              # what receivers reported; report <n> [open|dismiss]
+```
 
 ## Not yet
 
-- window capture (`SCContentFilter(desktopIndependentWindow:)`), planned next;
-- virtual display / extend mode — no public API, would need `CGVirtualDisplay`;
-- input back-channel (touch, keyboard) — reserved in PROTOCOL.md §6, not implemented on either side.
+- gamepads from the TV: a virtual one needs a DriverKit HID driver (`com.apple.developer.hid.virtual.device`);
+- a stylus's pressure: the stylus is the pointer, as a finger.
 
 ## Numbers
 
@@ -195,6 +222,62 @@ What plays comes from MediaRemote, the source of Control Center's player. Since 
 own processes and returns nothing to other apps, so a small library (`libLuchNowPlaying.dylib`, in the app's
 Frameworks) is loaded into the system `/usr/bin/perl`, which is one of them, and reports changes as JSON lines; the
 open mediaremote-adapter does the same. If Apple closes that too, the TV simply shows no title.
+
+## Presenting
+
+`luchctl present [r] talk.pptx` (or *Present…* in a TV's menu) shows a PDF or a presentation on the TV and opens the
+presenter view in the browser: the current and next slide, the speaker notes, a timer. The mouse over the slide is
+the TV's laser pointer, dragging draws, a clicker or the arrow keys turn the slides; the TV draws pointer and ink
+itself (PROTOCOL.md 4h). It is luchd's own page (`luchd/src/present.html`, `present.js`; `Tools/sync-present.sh`
+copies them), served on 127.0.0.1 only; slides are drawn with PDFKit. Notes come from the `.pptx`/`.odp` itself, or a
+PDF's `.pdfpc` file or sticky notes. `luchctl blank [r] on|off` (*Black Screen* in the menu) blacks out the TV, also
+while mirroring.
+
+`luchctl quiet ask|on|off` (*Do Not Disturb While Presenting*): macOS has no API for Focus, so the app makes two
+shortcuts with Shortcuts' Set Focus action, *Luch Quiet On* and *Luch Quiet Off*, and Shortcuts asks to add them the
+first time; `ask` asks once while the app runs. A Focus already on is left alone when macOS lets the app read
+`~/Library/DoNotDisturb/DB/Assertions.json` (Full Disk Access on some versions). While mirroring, macOS itself hides
+notifications unless *Allow notifications when mirroring or sharing the display* is on.
+
+## In step, sound modes, the latency lab
+
+Several receivers can play one capture in step (PROTOCOL.md 4k), as luchd's groups: "Play Together…" in the menu,
+or the Linux luchctl's words. One capture and one encode; every member gets the streams of its role on its own
+sockets, with the playout delay D in each packet, chosen from what the members report by the same policy as luchd's
+(the same test vectors, `SyncTests`). The receivers' clock requests are answered on the media sockets.
+
+```sh
+luchctl group watch "Living room TV" Kitchen Den --source audio   # this Mac's sound on three speakers, one delay
+luchctl group interactive "Living room TV" Kitchen=audio          # the picture as fast as alone, the sound waits
+luchctl offset Kitchen 40                  # its own correction (positive = later), kept per output route
+luchctl stats                              # also D and each member's need, route and correction
+luchctl audio "Living room TV" sync        # auto | on | off | sync: the sound of the next session
+luchctl latency on                         # the lab's page opens here, the TV draws its pattern (docs/latency-lab.md)
+luchctl latency analyze clip.mov           # runs luch-latency (cargo install --path luch-latency; brew install ffmpeg)
+```
+
+The TV's menu has the same: its sound mode, a slider for its correction, and the latency lab.
+
+## Finding and waking receivers
+
+When Bonjour finds nothing (hotel Wi-Fi, a VPN, a mesh that drops multicast), the Mac climbs the same ladder as luchd
+(luch-android PROTOCOL.md 1): a sweep of every address of each LAN interface (never utun, ipsec or a VM bridge), then
+Bluetooth LE; on request also the TV saying its address by sound (microphone) and its QR code (camera). Microphone,
+camera and Bluetooth are asked for only when that way is used. The menu has Find Receivers and Add Receiver; TVs
+connected to before stay in it while they are off, with Wake.
+
+```sh
+luchctl find                                # all ways, what is tried as it goes; `find scan,ble` just those
+luchctl add 'luch://connect?host=…&t=…'     # the TV's QR link, or its address: luchctl add 192.168.1.20
+luchctl known                               # receivers talked to before, on or off, and how each wakes
+luchctl wake 'Living room TV'               # Wake-on-LAN; the remote's Bluetooth signal through another Luch device
+luchctl wake 'Living room TV' learn         # with the TV off, press its remote's power key near the Mac
+luchctl info | id | refresh
+```
+
+macOS lets no app advertise manufacturer data (CoreBluetooth sends only a name and service UUIDs, and IOBluetooth's
+HCI calls do nothing since the stack moved into bluetoothd), so the Mac can learn the remote's signal but not send
+it: a Luch receiver or phone that is on and lists `ble_wake` in its welcome sends it for the Mac.
 
 ## TVs without Luch and the web receiver
 
