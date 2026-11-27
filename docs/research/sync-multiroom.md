@@ -1,7 +1,9 @@
 # Sync across devices and multiroom: research and a design for Luch
 
-Status: research, November 2026. Nothing here is implemented yet. The protocol is in `luch-android/PROTOCOL.md`;
-this note refers to its sections.
+Status: November 2026. Research, then the chosen design implemented on branch `sync` (luch-android: receiver,
+simulator, PROTOCOL.md section 4h; luch-linux: luchd groups). Section 9 says what was built, what the simulator and
+two emulators measured, and what changed against this design; the real-device plan (8.2) is refined by it. The
+protocol is in `luch-android/PROTOCOL.md`; this note refers to its sections.
 
 The question: a TV shows the picture while another Luch receiver (a speaker) plays the sound, or one sender plays to
 N TVs and speakers (a restaurant with 20 TVs showing a match, a home with speakers in several rooms), all in sync,
@@ -343,6 +345,11 @@ reply    (sender → receiver, flags bit4, at once, same socket):              u
   (this is inaudible because the audio loop absorbs it like drift), unless it exceeds 5 ms, which counts as a hard
   resync (6.4).
 - `err_us = min_rtt/2 + residual RMS of the fit` (reported in `stats`).
+- *Implemented differently (section 9):* the hard selection above keeps the start's burst for the whole 32 s
+  window under gamma jitter, and 64 exchanges are too short a base for the skew. The estimator has two scales: the
+  skew from the best exchange of each second over four minutes (3 σ test before 10 s), the offset from the last 64
+  moved along it, each weighted by `1 / ((rtt − min)/2 + 50 µs + σ_skew · age)²`; requests 4 a second; a re-burst
+  when the fit's residual (not `err_us`, which on busy 2.4 GHz is over 2 ms by its base delay alone) exceeds 1 ms.
 - `need_ms` (watching mode and audio roles): over the last 10 s, p99 of `(local arrival time of the last shard −
   local(pts))`, plus decode p95, plus the receiver's own output latency (`audio_ms` or `video_ms`), plus 3 ms.
 
@@ -365,6 +372,12 @@ written so far; `C` = this receiver's `offset_ms`.
   `|e| < 0.2 ms` gives `s` from the integral only.
 - One loop handles everything: sender-vs-receiver skew (through `local()`), DAC-vs-system clock (through `r`), and
   clock estimate slews.
+- *Added in the implementation (section 9):* a feed-forward of the drift already known
+  (`1 − (r / (1 + skew)) / rate`), so the PI only cleans up; the track is kept full (a track starts only once its
+  buffer is full); a chunk's D is its own, and a change of D (over 2 ms of error) is taken at once with one hard
+  resync, on the same chunk everywhere; a second of chunks all after their time (D below this receiver's need)
+  starts the playout again on what arrives; concealment lasts the sender's chunk duration; an AudioTimestamp more
+  than 1 ms off its own line (an underrun, a reroute) restarts the fit of r.
 - A chunk that arrives after `T_want − write-ahead`: write silence of its length (with fades), never stretch time.
 - Interactive role `both` with `D = 0` (today's behaviour) skips all of this.
 
@@ -379,6 +392,9 @@ written so far; `C` = this receiver's `offset_ms`.
 - Late frames: interactive: release at once; watching: drop if a newer frame is already decoded.
 - `OnFrameRenderedListener` (API 23+): `video_ms` = median of (render time − local(p)); render later than `T + P`
   counts in `sync_err_ms`.
+- *Implemented:* compressed frames wait in the receive thread and go to the decoder at `T − decode − 3P`, so the
+  decoder never holds more than a few. `out.video_ms` stays the receiver's own path (decoder input to display),
+  `out.video_pts_ms` is pts to display, `out.video_err_ms` presented minus due.
 
 ### 6.6 Choosing D on the sender
 
@@ -389,6 +405,9 @@ written so far; `C` = this receiver's `offset_ms`.
   get `D_a = max(need_audio, video_ms of the TV)`; if `need_audio > video_ms + tolerance`, video gets
   `D_v = need_audio − tolerance` instead (the picture waits only for the excess). Defaults: tolerance 20 ms.
 - Per kind: video packets carry `D_v`, audio packets `D_a`.
+- *Learned on the emulators:* rising "at once" by whatever the need grew makes D creep up by 1–2 ms a second while a
+  receiver's path settles (the emulator's grew from 36 to 120 ms over 12 s), and every step is a hard resync. A
+  headroom on rising (to need + 5 ms) is the likely fix; to be decided after the real-device numbers (8.2, step 4).
 
 ### 6.7 Per-device latency measurement: acoustic calibration and its fallbacks
 
@@ -515,17 +534,86 @@ Pass criteria:
 
 ### 8.2 Real devices (later, by day, with consent: it makes sound)
 
-1. Two-microphone test: a stereo USB audio interface, two identical microphones each about 10 cm from one speaker;
-   luchd plays a click every second; cross-correlate the two channels per click. Expected: < 1 ms between two
-   Luch speakers with timestamps, flat over 30 minutes (without correction: 180 ms after 30 min at 100 ppm).
-2. One phone microphone at the listening place for the whole mix; compare O9-only, slider and calibrated results.
-3. Picture vs sound: film the TV and the speaker at 240 frames/s while luchd shows a white flash with a click;
-   count frames (±4 ms). Expected: sound 0 to tolerance behind the picture.
-4. Wi-Fi reality: log `clock`, `need_ms` on 2.4 and 5 GHz, idle and loaded; this sets the default `D`.
-5. Calibration check: its result against the two-microphone measurement (expected within 0.5 ms), and in the
-   projector room with the fan on (expected: accepted within 0.5 ms or rejected, never wrong).
+Refined by what the implementation showed (section 9). Everything below is silent except steps 5–7.
 
-## 9. Bibliography
+1. **Clock on real Wi-Fi** (silent). `luchctl group watch "Living room TV"=both <phone>=audio`, then
+   `luchctl stats`: per member `clock.err_us` and `rtt_us`, on 5 GHz and 2.4 GHz, idle and with a download running.
+   Expected: `err_us` 0.3–1.5 ms (half the best round trip plus 0.1–0.3 ms), `skew_ppm` steady within 2 ppm after
+   90 s. The emulators gave 0.12–0.17 ms over their virtual network.
+2. **The TV's own numbers** (silent: volume 0, or a muted HDMI sink). `out.audio_src` must be `timestamp` on Android
+   7+; note `out.audio_ms` per route (built-in, HDMI, ARC soundbar, Bluetooth) and `out.route`. Expected 20–60 ms
+   built-in, more on Bluetooth if the delay report reaches the timestamps (then `route_preset_ms` must not add 150).
+3. **Picture release** (silent). On a TV in a watch group, `out.video_err_ms`: expected within ±P/2 (±8.3 ms at
+   60 Hz). The emulator reported −12 to −18 ms (it stamps renders before the time asked for); a TV that also reads
+   about −P means its callback is early too, and only step 6 tells the truth.
+4. **D in practice** (silent). Watch `group.d_audio_ms` in `Stats` for 10 minutes per mode: how often it rises and
+   by how much (the creep of 6.6), and the members' `audio_resyncs` (expected: none after the first 15 s).
+5. **Two speakers, two microphones** (sound, by day). Two Luch receivers with timestamps in a watch group, a stereo
+   USB interface with two identical microphones 10 cm from each speaker, a click a second; cross-correlate the two
+   channels per click. Expected < 1 ms, flat over 30 minutes (the simulator: p99 0.41 ms over 4 h). Without the
+   group the same pair drifts 6 ms a minute at 100 ppm.
+6. **Picture against sound** (sound and a flash, by day). A 240 frames/s phone camera on the TV and the speaker in an
+   interactive group; luchd shows a white flash with a click. Expected: sound 0 to 20 ms behind the picture; with a
+   Bluetooth speaker, the picture held by its excess (`d_video_ms` = `d_audio_ms` − 20).
+7. **Calibration** (sound, by day, only after steps 1–6). Turn on the receiver's dry-run setting, check its dry run,
+   then the real run (the code for playing the sweeps is the next step: section 9). Expected: each device within
+   0.5 ms of step 5's two-microphone figure, and in the projector's room with its fan on: accepted within 0.5 ms or
+   refused, never wrong (the simulator: 0 wrong over 10 000 rooms).
+
+## 9. What was built and measured (branch `sync`)
+
+**Receiver (luch-android).** `ru.toxblh.luch.sync`, plain Java and all tested on the JVM: `ClockEstimator`,
+`AudioClock` (getTimestamp → when a frame is heard, r fitted), `AudioPlayout` (pts + D, PI with feed-forward,
+stuffing, fades, concealment), `VideoScheduler`, `SenderPolicy`, `Wire` (kind 3, D), `Probe` and `Fft` (the
+calibration's detector), `DryRun`. On Android: `SyncSession` (the group, the clock on the media socket, stats),
+`AudioOut`, and `MirrorSession`'s scheduled paths. Phase 0 is in too: without a group, `sync` holds the picture by
+what the sound really takes (`out.audio_ms − out.video_ms`, from timestamps and render callbacks); on the API 34
+emulator that is about 75 ms where the buffer said 20 to 60.
+
+**Sender (luchd).** `sync.rs` (clock replies, the same policy and test vectors, route presets, the calibration's
+arithmetic), groups in `mirror.rs` (one capture, each member's streams by role on its own sockets, D per packet,
+clock answered with the pipeline's running time, the KMS path's pts moved onto it), D-Bus `MirrorGroup` and
+`SetOffset`, `luchctl group` and `offset`. Older receivers get no group and D = 0 (luch-recv's test reads a newer
+sender's packets as before); a receiver gets no clock request from an older sender (on-device test).
+
+**Simulator** (seeded, the receiver's own classes against fake clocks, Wi-Fi and DACs):
+
+| Test | Pass | Measured |
+|---|---|---|
+| Clock, 5 GHz, 40 devices, from 5 s | p99 < 0.5 ms | p99 0.24 ms, max 0.60 ms |
+| Clock, busy 2.4 GHz, from 10 s | p99 < 1.5 ms | p99 0.46 ms |
+| Clock, ±500 ppm crystals | p99 < 0.5 ms | p99 0.22 ms |
+| Clock, 3 s outage | in bound 1 s after | p99 0.14 ms from 1 s after |
+| Skew | < 2 ppm (asked after 60 s) | 1.5 ppm worst after 90 s; p50 1.0, worst 3.2 ppm at 60 s |
+| Audio, 4 devices with timestamps, 4 h | p99 < 1 ms, max < 2 ms, no drift | p99 0.41 ms, max 0.48 ms, drift < 10 µs, 0 resyncs, rate ≤ 188 ppm |
+| Join at 60 s | within 1 ms 3 s after | p99 0.51 ms |
+| D step 300 → 350 ms | one resync, same frame | one each, all on chunk 19800 |
+| Picture, watching, 60 and 50 Hz | ±(P/2 + 2) ms | mean 4.1 ms, 10 of 27 341 frames outside (late packets) |
+| Interactive TV + speaker | sound − picture in [−2, 22] ms | p50 18.7 ms, picture not held |
+| Calibration, 1000 rooms, 0–20 dB | within 0.5 ms | p99 0.04 ms, worst 0.07 ms, 99.6 % accepted |
+| Calibration, 10 000 rooms, −5–20 dB, 15 % clipped | none wrong > 2 ms | 0 wrong, worst accepted 0.72 ms |
+| Calibration, noise in the sweep's band | refuse, never wrong | measures to −10 dB, refuses from −20 dB, 0 wrong |
+| Whole mix, fallback | documents its cost | 80 ms apart at the microphone (the hidden 60/80/30/15 ms) |
+| Whole mix, calibrated | within 2 ms | 0.01 ms apart (mean), every device + 93 ms |
+
+**Two emulators** (API 34 TV, `-no-audio`, through adb and the emulator's UDP redirection; `tools/syncsend.py` as
+the sender, digital silence): watch group, TV `both` + speaker `audio`, D 250 → 300 ms at 25 s: clock `err_us`
+0.16 / 0.17 ms (rtt 0.19 / 0.20 ms), sound `sync_err_ms` median 0.00 / 0.01 ms (−0.02..0.12), the D step one resync
+on both on the same chunk (5011, −50 ms), the picture −12.3 ms (the emulator's early render stamps). Interactive
+group, TV `video` + speaker `audio`: the TV's picture at 12 ms from pts; the emulator's sound path grew to 120 ms, so
+D_a rose to 126 ms and the picture was held to 106 ms (20 ms tolerance); the speaker then steady at 0.02 ms.
+
+**Changed against sections 6 and 8:** the estimator (6.3), the playout's additions (6.4), the skew criterion (90 s,
+not 60), requests 4 a second, a re-burst on the residual. The calibration's detector picks the earliest local
+maximum of a third of the largest within 50 ms before it (a reflection 6 dB louder is then still found after the
+direct sound), and measures the sidelobes as all of the window before the direct sound, where only noise can be.
+
+**Not done yet, and why:** playing the sweeps and recording them (it makes sound: the receiver answers `probe` only
+as a dry run, behind a setting that stays off; luchd has no microphone capture yet; the phone as a microphone needs
+`AudioRecord` with its timestamps); NACK and Opus 20 ms for watching (6.9); media-mode position sync (O11);
+multicast. Nothing here could check a real DAC, panel or Wi-Fi: that is 8.2.
+
+## 10. Bibliography
 
 - Snapcast README and design: https://github.com/badaix/snapcast
 - Snapcast binary protocol (Time message): https://github.com/badaix/snapcast/blob/develop/doc/binary_protocol.md
