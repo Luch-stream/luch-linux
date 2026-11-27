@@ -283,6 +283,23 @@ live), `rate`, `w`/`h`, `tracks` (`audio`, `sub` with `id`, `label`), `sel`, `by
 
 Ends what was cast (media or photos) and stops serving its files.
 
+### `Present(s id, s file) → s`
+
+Shows a PDF or a presentation (`.odp`, `.pptx` and the other documents `Cast` turns into PDF) on the receiver and
+returns the address of its presenter view, `http://127.0.0.1:<port>/<token>/`, to open in a browser on this computer:
+current and next slide, speaker notes, timer, slide counter, laser pointer and ink. See
+[presenting.md](presenting.md). Counts as presenting for `Quiet`.
+
+### `Annotate(s id, s msg)`
+
+Points or draws on what the receiver shows for us: `msg` is a `pointer`, `ink` or `blank` message of PROTOCOL.md 4h
+as JSON (coordinates are fractions of the picture). Cleaned (known fields only, coordinates clamped) and passed on
+as it comes: a caller sending pointer moves keeps them to one a frame itself.
+
+### `AnswerQuiet(b hide)`
+
+The answer to `QuietAsk`: hide notification banners while presenting or mirroring, or not. Kept until `luchd` stops.
+
 ### `Sleep(s id)`
 
 Puts the receiver to standby, as its remote's power key (PROTOCOL.md 4c). Fails with what is missing: the receiver's
@@ -324,6 +341,10 @@ What the discovery ladder is trying, on every change:
 `state`: `waiting`, `running`, `done`, `failed` (the note says why: "Bluetooth is off", "no Bluetooth adapter"),
 `skipped` (a receiver was found before it was needed). The last one has `"running": false`. The GNOME menu shows
 the running rungs instead of "Searching…", and offers "Search harder" (`Find("all")`) when the list is empty.
+### `QuietAsk()`
+
+A presentation or a mirroring session began, `Quiet` is `ask` and nobody has answered yet: ask the person (the GNOME
+extension does, once a login) and call `AnswerQuiet`.
 
 ### `ReceiversChanged()`
 
@@ -339,6 +360,13 @@ sender's sound goes to a null sink (`luch_cast`), `luchd` records its monitor, t
 sender stays silent (no echo with the receiver, no Bluetooth delay or A2DP artefacts). The default sink and the
 streams that were on it are put back when the session ends, and after a crash on the next `luchd` start. It
 applies at once to a running session. Saved in `~/.config/luch/local-audio`. Needs `pactl`; without it nothing changes.
+
+### `Quiet` (`s`, read/write, default `ask`)
+
+Do not disturb while presenting (`Present`) or mirroring (not sound only): `on` turns GNOME's notification banners off
+(`org.gnome.desktop.notifications show-banners`) for the session and back on afterwards, `off` leaves them, `ask`
+signals `QuietAsk`. Banners the person had turned off stay off. A crash mid-session is undone at the next `luchd`
+start (`~/.config/luch/restore-banners`). Saved in `~/.config/luch/quiet`.
 
 ### `SenderId` (`s`, read)
 

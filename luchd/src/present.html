@@ -1,0 +1,85 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Luch</title>
+<style>
+  :root { --bg: #121318; --panel: #1c1e25; --text: #eceef3; --muted: #9aa0ad; --accent: #ffb74d; }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  html, body { height: 100%; margin: 0; }
+  body { background: var(--bg); color: var(--text); font: 15px system-ui, sans-serif; display: grid;
+         grid-template: "bar bar" auto "cur side" 1fr / 1.6fr 1fr; gap: 12px; padding: 12px; overflow: hidden; }
+  header { grid-area: bar; display: flex; align-items: center; gap: 16px; }
+  #title { color: var(--muted); flex: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  #timer { font: 600 32px ui-monospace, monospace; }
+  #timer.paused { color: var(--accent); }
+  #clock, #counter { font: 20px ui-monospace, monospace; color: var(--muted); }
+  #stage { grid-area: cur; position: relative; min-height: 0; background: #000; border-radius: 8px;
+           cursor: crosshair; touch-action: none; user-select: none; }
+  #stage img, #ink { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; }
+  #ink { pointer-events: none; }
+  body.blank #stage img { opacity: .15; }
+  body.blank #stage::after { content: "B"; position: absolute; inset: 0; display: grid; place-items: center;
+                             font: 700 64px system-ui; color: var(--accent); }
+  aside { grid-area: side; display: grid; grid-template-rows: minmax(0, 0.8fr) auto minmax(0, 1.2fr); gap: 12px;
+          min-height: 0; }
+  #nextBox { position: relative; background: #000; border-radius: 8px; min-height: 0; }
+  #next { width: 100%; height: 100%; object-fit: contain; }
+  #last { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); }
+  #notes { background: var(--panel); border-radius: 8px; padding: 14px 18px; overflow: auto; white-space: pre-wrap;
+           line-height: 1.4; }
+  #notes.empty { color: var(--muted); }
+  .tools { display: flex; flex-wrap: wrap; gap: 6px; }
+  button { background: var(--panel); color: var(--text); border: 1px solid #333744; border-radius: 6px;
+           padding: 6px 10px; font: inherit; cursor: pointer; }
+  button.on { border-color: var(--accent); }
+  button[data-pen] { width: 30px; height: 30px; padding: 0; }
+  body.noink [data-pen], body.noink [data-act=undo], body.noink [data-act=clear], body.noink #laser { display: none; }
+  .veil { position: fixed; inset: 0; display: none; place-items: center; background: #000c; font-size: 28px; }
+  body.ended #ended, body.offline #offline { display: grid; }
+  #nopicture { position: absolute; bottom: 8px; left: 8px; color: var(--muted); }
+</style>
+</head>
+<body>
+<header>
+  <span id="timer" title="T: pause, R: reset">0:00</span>
+  <span id="counter"></span>
+  <span id="title"></span>
+  <span id="clock"></span>
+</header>
+<div id="stage">
+  <img id="current" alt="" draggable="false">
+  <canvas id="ink"></canvas>
+  <span id="nopicture" hidden></span>
+</div>
+<aside>
+  <div id="nextBox"><img id="next" alt="" draggable="false"><span id="last" hidden></span></div>
+  <div class="tools">
+    <button data-act="prev" title="PageUp">&#9664;</button>
+    <button data-act="next" title="PageDown">&#9654;</button>
+    <button id="laser" data-act="laser" title="L">&#9679; Laser</button>
+    <button data-pen="red" style="background:#e53935" title="Pen"></button>
+    <button data-pen="yellow" style="background:#fdd835"></button>
+    <button data-pen="green" style="background:#43a047"></button>
+    <button data-pen="blue" style="background:#1e88e5"></button>
+    <button data-pen="white" style="background:#fff"></button>
+    <button data-pen="marker" style="background:#fff17680" title="Marker"></button>
+    <button data-act="undo" title="Ctrl+Z">&#8630;</button>
+    <button data-act="clear" title="C">&#10005;</button>
+    <button data-act="blank" title="B">B</button>
+    <button data-act="reset" title="R">0:00</button>
+    <button data-act="smaller">A&minus;</button>
+    <button data-act="bigger">A+</button>
+  </div>
+  <div id="notes"></div>
+</aside>
+<div class="veil" id="ended"><span id="endedText"></span></div>
+<div class="veil" id="offline"></div>
+<script type="module">
+  import {start} from './present.js';
+  start(window, document);
+</script>
+</body>
+</html>

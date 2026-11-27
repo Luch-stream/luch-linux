@@ -9,7 +9,10 @@ mod find;
 mod limits;
 mod mirror;
 mod mpris;
+mod notes;
 mod pair;
+mod present;
+mod quiet;
 mod reports;
 mod volume;
 mod wake;
@@ -877,6 +880,9 @@ impl Luch {
         if let (Some(srv), Some((_, tv))) = (FILES.get(), addrs) {
             srv.forget(tv);
         }
+        if let Some(p) = PRESENTER.get() {
+            p.end(&id);
+        }
         Ok(())
     }
 
@@ -982,6 +988,112 @@ impl Luch {
         Ok(format!("{}/{pages}", to + 1))
     }
 
+    /// Shows a PDF or a presentation (.odp, .pptx and the other documents `Cast` takes) on a receiver, with a
+    /// presenter view on this computer: current and next slide, speaker notes, timer, laser pointer and ink.
+    /// Returns the view's address (http://127.0.0.1:<port>/<token>/), to open in a browser here.
+    async fn present(
+        &self,
+        id: String,
+        file: String,
+        #[zbus(connection)] conn: &Connection,
+    ) -> fdo::Result<String> {
+        if cast::kind_of(&file) != cast::Kind::Document {
+            return Err(fdo::Error::InvalidArgs(
+                "present takes a PDF or a presentation (.odp, .pptx...)".into(),
+            ));
+        }
+        let original = std::path::PathBuf::from(file.strip_prefix("file://").unwrap_or(&file))
+            .canonicalize()
+            .map_err(|e| fdo::Error::InvalidArgs(format!("{file}: {e}")))?;
+        let name = original
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        // The notes come from the original: a PDF made by LibreOffice has none (notes.rs).
+        let out = std::env::temp_dir().join(format!("luch-doc-{}", std::process::id()));
+        let src = original.clone();
+        let (pdf, notes) = tokio::task::spawn_blocking(move || {
+            cast::to_pdf(&src, &out).map(|pdf| {
+                let notes = notes::speaker_notes(&src, &pdf);
+                (pdf, notes)
+            })
+        })
+        .await
+        .map_err(|e| fdo::Error::Failed(e.to_string()))?
+        .map_err(fdo::Error::Failed)?;
+        let options = json!({ "title": name }).to_string();
+        self.cast(
+            id.clone(),
+            vec![pdf.to_string_lossy().into_owned()],
+            options,
+            conn,
+        )
+        .await?;
+        let (c, welcome, doc, receiver_name) = {
+            let s = self.st.lock().await;
+            (
+                s.conns.get(&id).cloned(),
+                s.welcomes.get(&id).cloned().unwrap_or(Value::Null),
+                s.docs.get(&id).copied().unwrap_or((0, 0)),
+                s.found.get(&id).map(|r| r.name.clone()).unwrap_or_default(),
+            )
+        };
+        let c = c.ok_or_else(|| fdo::Error::Failed("receiver went away".into()))?;
+        let ink = welcome["modes"]
+            .as_array()
+            .is_some_and(|m| m.iter().any(|x| x == "ink"));
+        let srv = PRESENTER
+            .get_or_try_init(present::Server::start)
+            .await
+            .map_err(|e| fdo::Error::Failed(format!("presenter view: {e}")))?;
+        let show = present::Show::new(
+            id,
+            receiver_name,
+            name,
+            pdf,
+            notes,
+            ink,
+            c.cmd,
+            c.events,
+            doc.0,
+            doc.1,
+            Some(quiet_session(conn).await),
+        );
+        Ok(srv.add(show))
+    }
+
+    /// Points or draws on what the receiver shows for us (PROTOCOL.md 4h): `msg` is a `pointer`, `ink` or `blank`
+    /// message as JSON. Passed on as it comes: a caller sending pointer moves keeps them to one a frame itself.
+    async fn annotate(&self, id: String, msg: String) -> fdo::Result<()> {
+        let v: Value =
+            serde_json::from_str(&msg).map_err(|e| fdo::Error::InvalidArgs(e.to_string()))?;
+        let v = present::sanitize(&v)
+            .filter(|v| v["t"] != "doc_page")
+            .ok_or_else(|| fdo::Error::InvalidArgs("not a pointer, ink or blank message".into()))?;
+        self.send_to(&id, v).await
+    }
+
+    /// Do not disturb while presenting or mirroring: "ask" (the GNOME extension asks once a login, see QuietAsk),
+    /// "on" (notification banners hidden) or "off".
+    #[zbus(property)]
+    async fn quiet(&self) -> String {
+        quiet::with(|q| q.mode().as_str().to_string())
+    }
+
+    #[zbus(property)]
+    async fn set_quiet(&self, mode: String) -> fdo::Result<()> {
+        let m = quiet::Mode::parse(&mode)
+            .ok_or_else(|| fdo::Error::InvalidArgs("ask, on or off".into()))?;
+        quiet::save_mode(m);
+        quiet::with(|q| q.set_mode(m));
+        Ok(())
+    }
+
+    /// The person's answer to QuietAsk: hide notifications while presenting (true) or not; kept until logout.
+    async fn answer_quiet(&self, hide: bool) {
+        quiet::with(|q| q.answer(hide));
+    }
+
     /// The receiver's last known volume as JSON, "{}" until it told one.
     async fn get_volume(&self, id: String) -> String {
         let s = self.st.lock().await;
@@ -1063,6 +1175,10 @@ impl Luch {
     /// A receiver's `media_state` changed (JSON); {"state":"stopped"} when it ended.
     #[zbus(signal)]
     async fn media_state_changed(e: &SignalEmitter<'_>, id: &str, state: &str) -> zbus::Result<()>;
+
+    /// A presentation or mirroring began and Quiet is "ask": ask the person, answer with AnswerQuiet.
+    #[zbus(signal)]
+    async fn quiet_ask(e: &SignalEmitter<'_>) -> zbus::Result<()>;
 }
 
 impl Luch {
@@ -1532,7 +1648,7 @@ async fn run_channel(
                         }
                         let _ = events.send(v);
                     }
-                    "ready" | "keyframe" | "stats" | "photo_ready" | "sleeping" | "app_opened" => {
+                    "ready" | "keyframe" | "stats" | "photo_ready" | "sleeping" | "app_opened" | "blank" => {
                         let _ = events.send(v);
                     }
                     "stop" => {
@@ -1605,6 +1721,22 @@ async fn run_channel(
         s.secure.remove(&id);
     }
     changed(&conn).await;
+}
+
+/// The presenter views (present.rs); started when first needed.
+static PRESENTER: tokio::sync::OnceCell<present::Server> = tokio::sync::OnceCell::const_new();
+
+/// Counts a presentation or a mirroring session in for do-not-disturb, and asks the person when it is time to.
+async fn quiet_session(conn: &Connection) -> quiet::Session {
+    let (session, ask) = tokio::task::spawn_blocking(quiet::Session::start)
+        .await
+        .unwrap_or_else(|_| quiet::Session::start());
+    if ask {
+        if let Ok(e) = SignalEmitter::new(conn, p::DBUS_PATH) {
+            let _ = Luch::quiet_ask(&e).await;
+        }
+    }
+    session
 }
 
 /// Serves cast files, relayed links and covers to receivers; started when first needed.
@@ -1830,6 +1962,11 @@ async fn start_mirror(
         });
     }
     tokio::spawn(async move {
+        // The screen is on the TV: notifications are not for everyone in the room (sound only is not a screen).
+        let _quiet = match audio_only {
+            false => Some(quiet_session(&conn).await),
+            true => None,
+        };
         let res = mirror::run(target, cmd, events_rx, stop_rx, stats).await;
         match res {
             Ok(why) => {
@@ -2546,6 +2683,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     gstreamer::init()?;
     mirror::restore_leftovers();
     mirror::restore_audio();
+    // Notification banners back on if a crash left them off (quiet.rs).
+    quiet::with(|_| ());
     let id = sender_id()?;
     let host = short_host();
     let st = Shared::default();

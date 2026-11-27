@@ -164,6 +164,10 @@ subtitles); luchctl and the D-Bus API see the same state. Local files are served
 receiver only; `--relay` passes a link through luchd too, for links only this computer can open (a company VPN, a
 site that needs your login). Android receivers play MP4, MKV, WebM, MPEG-TS and HLS; DASH is not supported yet.
 
+**Presenting.** `luchctl present talk.odp` (or *Present…* in the GNOME menu) shows the slides sharp on the TV and
+opens a presenter view here: the next slide, your speaker notes, a timer; the mouse is a laser pointer drawn by the
+TV, dragging draws, a clicker turns the slides, notifications stay hidden. See [docs/presenting.md](docs/presenting.md).
+
 **From the browser.** The extension in [browser-extension/](browser-extension/README.md) puts a *To TV* button on
 every web video and the TV's controls over the page's player (`luchctl browser install` connects it to luchd).
 

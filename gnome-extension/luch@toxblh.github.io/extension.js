@@ -8,10 +8,12 @@ import St from 'gi://St';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as ModalDialog from 'resource:///org/gnome/shell/ui/modalDialog.js';
+import * as MessageTray from 'resource:///org/gnome/shell/ui/messageTray.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import {QuickMenuToggle, SystemIndicator} from 'resource:///org/gnome/shell/ui/quickSettings.js';
 import VirtualCursor from './cursor.js';
+import QuietAsker from './quiet.js';
 
 const IFACE = `<node>
   <interface name="dev.luch.Luch1">
@@ -27,12 +29,16 @@ const IFACE = `<node>
     <method name="Cast"><arg name="id" type="s" direction="in"/><arg name="items" type="as" direction="in"/><arg name="options" type="s" direction="in"/><arg type="s" direction="out"/></method>
     <method name="StopCast"><arg name="id" type="s" direction="in"/></method>
     <method name="Find"><arg name="mode" type="s" direction="in"/></method>
-    <signal name="FindProgress"><arg name="status" type="s"/></signal>
-    <property name="WebUrl" type="s" access="read"/>
+    <method name="Present"><arg name="id" type="s" direction="in"/><arg name="file" type="s" direction="in"/><arg type="s" direction="out"/></method>
+    <method name="AnswerQuiet"><arg name="hide" type="b" direction="in"/></method>
     <method name="Pair"><arg name="id" type="s" direction="in"/><arg name="code" type="s" direction="in"/><arg type="s" direction="out"/></method>
     <method name="Pairing"><arg name="id" type="s" direction="in"/><arg type="s" direction="out"/></method>
+    <property name="WebUrl" type="s" access="read"/>
+    <property name="Quiet" type="s" access="readwrite"/>
     <signal name="ReceiversChanged"/>
+    <signal name="FindProgress"><arg name="status" type="s"/></signal>
     <signal name="PairChanged"><arg name="id" type="s"/><arg name="state" type="s"/></signal>
+    <signal name="QuietAsk"/>
   </interface>
 </node>`;
 const LuchProxy = Gio.DBusProxy.makeProxyWrapper(IFACE);
@@ -62,6 +68,13 @@ const T = RU ? {
     stopCast: 'Закрыть показанное',
     turnOff: 'Выключить ТВ',
     chooseFiles: 'Что показать на ТВ',
+    present: 'Презентация…',
+    choosePresentation: 'Презентация для показа (PDF, ODP, PPTX)',
+    quiet: mode => `Не беспокоить при показе: ${{ask: 'спросить', on: 'да', off: 'нет'}[mode] ?? mode}`,
+    quietTitle: 'Скрыть уведомления на время показа?',
+    quietBody: 'Их увидят все, кто смотрит на экран. Ответ запомнится до выхода из сеанса.',
+    quietHide: 'Скрыть',
+    quietKeep: 'Оставить',
     failed: name => `${name}: не получилось`,
     allowOnTv: name => `${name}: разрешите подключение на ТВ`,
     codeTitle: name => `Сопряжение с ${name}`,
@@ -94,6 +107,13 @@ const T = RU ? {
     stopCast: 'Close what is shown',
     turnOff: 'Turn the TV off',
     chooseFiles: 'What to show on the TV',
+    present: 'Present…',
+    choosePresentation: 'A presentation to show (PDF, ODP, PPTX)',
+    quiet: mode => `Do not disturb while presenting: ${mode}`,
+    quietTitle: 'Hide notifications while presenting?',
+    quietBody: 'Everyone looking at the screen would see them. The answer holds until you log out.',
+    quietHide: 'Hide them',
+    quietKeep: 'Keep them',
     failed: name => `${name}: that did not work`,
     allowOnTv: name => `${name}: allow the connection on the TV`,
     codeTitle: name => `Pair with ${name}`,
@@ -127,7 +147,6 @@ function findLine(json, t) {
     return now.length > 0 ? t.trying(now.join(', ')) : null;
 }
 
-/** Files picked in a dialog (zenity, or kdialog), or [] when cancelled or there is no dialog to show. */
 // luchd's refusal while a receiver waits for the code on its screen (Connect, Mirror, Cast...).
 function asksForPairing(text) {
     return /asks for pairing/.test(text);
@@ -162,13 +181,14 @@ function askCode(name) {
     });
 }
 
-function chooseFiles(title) {
+/** Files picked in a dialog (zenity, or kdialog), or [] when cancelled or there is no dialog to show. */
+function chooseFiles(title, multiple = true) {
     return new Promise(resolve => {
         let argv = null;
         if (GLib.find_program_in_path('zenity'))
-            argv = ['zenity', '--file-selection', '--multiple', '--separator=\n', `--title=${title}`];
+            argv = ['zenity', '--file-selection', ...(multiple ? ['--multiple'] : []), '--separator=\n', `--title=${title}`];
         else if (GLib.find_program_in_path('kdialog'))
-            argv = ['kdialog', '--getopenfilename', GLib.get_home_dir(), '--multiple', '--separate-output', '--title', title];
+            argv = ['kdialog', '--getopenfilename', GLib.get_home_dir(), ...(multiple ? ['--multiple'] : []), '--separate-output', '--title', title];
         if (!argv) {
             resolve([]);
             return;
@@ -188,6 +208,16 @@ function chooseFiles(title) {
             resolve([]);
         }
     });
+}
+
+/** A notification with buttons, for QuietAsk. */
+function askQuestion(title, body, actions) {
+    const source = MessageTray.getSystemSource();
+    const n = new MessageTray.Notification({source, title, body, gicon: ICON,
+        urgency: MessageTray.Urgency.HIGH, isTransient: true});
+    for (const [label, fn] of actions)
+        n.addAction(label, fn);
+    source.addNotification(n);
 }
 
 const LuchToggle = GObject.registerClass(
@@ -225,6 +255,8 @@ class LuchToggle extends QuickMenuToggle {
                 this._finding = findLine(status, T);
                 this._render(null);
             });
+            this._quiet = new QuietAsker(proxy, askQuestion, T);
+            this._quietId = proxy.connectSignal('QuietAsk', () => this._quiet.onAsk());
             this._ownerId = proxy.connect('notify::g-name-owner', () => this._discover());
             this._propId = proxy.connect('g-properties-changed', () => this._refresh());
             this._discover();
@@ -340,6 +372,13 @@ class LuchToggle extends QuickMenuToggle {
                 if (files.length > 0)
                     await this._proxy.CastAsync(id, files, '');
             });
+            add(T.present, async () => {
+                const [file] = await chooseFiles(T.choosePresentation, false);
+                if (!file)
+                    return;
+                const [url] = await this._proxy.PresentAsync(id, file);
+                Gio.AppInfo.launch_default_for_uri(url, null);
+            });
             if (connected)
                 add(T.stopCast, () => this._proxy.StopCastAsync(id));
             add(T.turnOff, () => this._proxy.SleepAsync(id));
@@ -355,6 +394,17 @@ class LuchToggle extends QuickMenuToggle {
                 waking ? T.waking(name) : T.turnOn(name), 'system-shutdown-symbolic');
             item.setSensitive(!waking);
             item.connect('activate', () => this._wake(id));
+            this._section.addMenuItem(item);
+        }
+
+        // Do not disturb while presenting or mirroring: ask → on → off.
+        const mode = this._proxy?.Quiet;
+        if (mode) {
+            const next = {ask: 'on', on: 'off', off: 'ask'}[mode] ?? 'ask';
+            const item = new PopupMenu.PopupImageMenuItem(T.quiet(mode), 'notifications-disabled-symbolic');
+            item.connect('activate', () => {
+                this._proxy.Quiet = next;
+            });
             this._section.addMenuItem(item);
         }
 
@@ -452,6 +502,8 @@ class LuchToggle extends QuickMenuToggle {
             this._proxy.disconnectSignal(this._pairId);
         if (this._findId)
             this._proxy.disconnectSignal(this._findId);
+        if (this._quietId)
+            this._proxy.disconnectSignal(this._quietId);
         if (this._propId)
             this._proxy.disconnect(this._propId);
         if (this._ownerId)
