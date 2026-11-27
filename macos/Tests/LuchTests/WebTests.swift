@@ -5,6 +5,7 @@
 import Foundation
 import Network
 import XCTest
+@testable import LuchEngine
 @testable import LuchNet
 @testable import LuchProto
 @testable import LuchTV
@@ -245,6 +246,57 @@ final class WebTests: XCTestCase {
         again.send(["t": "hello", "v": 0, "name": "Web", "model": "Chrome/130", "mode": "none"])
         XCTAssertEqual(became.wait(timeout: .now() + 5), .success, "no question for a known browser")
         XCTAssertEqual(web.receivers.count, 1)
+    }
+
+    /// The real Engine (synthetic frames through VideoToolbox, no screen capture) mirrors to a browser: the page gets
+    /// the start it answers, then H.264 key frames whole, with their parameter sets, as WebCodecs wants them.
+    func testTheEngineMirrorsToABrowser() throws {
+        let web = WebReceiver(dir: dir())
+        web.onAsk = { q in web.answer(q.id, allow: true) }
+        let became = DispatchSemaphore(value: 0)
+        var receiver: Receiver?
+        web.onReceiver = { r, _ in
+            receiver = r
+            became.signal()
+        }
+        try web.start(port: 0)
+        defer { web.stop() }
+        let b = try TestBrowser(port: web.port)
+        b.send(["t": "hello", "v": 0, "name": "Web", "model": "Chrome/130", "display": ["width": 1280, "height": 720]])
+        XCTAssertNotNil(b.expect("authorized"))
+        XCTAssertEqual(became.wait(timeout: .now() + 5), .success)
+        var o = MirrorOptions()
+        o.synthetic = true
+        o.audio = false
+        o.fps = 30
+        let engine = Engine(options: o)
+        let r = try XCTUnwrap(receiver)
+        let started = DispatchSemaphore(value: 0)
+        var failure: Error?
+        DispatchQueue.global().async {
+            do { try engine.start(receiver: r) } catch { failure = error }
+            started.signal()
+        }
+        let start = try XCTUnwrap(b.expect("start"), "the Engine's start reaches the page")
+        XCTAssertEqual((start["video"] as? [String: Any])?["codec"] as? String, "video/avc", "H.264 for a browser")
+        b.send(["t": "ready", "video_port": 0, "audio_port": 0])
+        b.send(["t": "keyframe"])
+        XCTAssertEqual(started.wait(timeout: .now() + 10), .success)
+        XCTAssertNil(failure)
+        defer { engine.stop(reason: "test") }
+        var key: Data?
+        let until = Date().addingTimeInterval(10)
+        while key == nil, Date() < until, let m = b.next(timeout: 5) {
+            if let v = m as? [String: Any], v["t"] as? String == "ping" { b.send(["t": "pong", "n": v["n"] ?? 0]) }
+            if let d = m as? Data, d[0] == MediaKind.video.rawValue, d[1] & PacketFlags.idr.rawValue != 0 { key = d }
+        }
+        let frame = try XCTUnwrap(key, "a key frame over the websocket")
+        let len = Int(frame[16]) << 24 | Int(frame[17]) << 16 | Int(frame[18]) << 8 | Int(frame[19])
+        XCTAssertEqual(frame.count, Proto.headerSize + len, "the whole frame in one message")
+        // Annex-B with the SPS in front: what web.html reads its codec string from.
+        let body = Array(frame.dropFirst(Proto.headerSize))
+        XCTAssertEqual(Array(body.prefix(4)), [0, 0, 0, 1])
+        XCTAssertEqual(body[4] & 0x1f, 7, "an SPS first")
     }
 
     func testARefusedBrowserIsToldSo() throws {

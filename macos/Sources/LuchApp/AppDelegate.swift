@@ -449,7 +449,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func startMirror(_ receiver: Receiver, soundOnly: Bool = false, extend: Bool? = nil,
-                             ultra: UltraPriority? = nil) {
+                     ultra: UltraPriority? = nil) {
         // Nothing asked for: the way chosen for this TV in its menu (also for mirror on launch and luchctl).
         let saved = Preferences.shared.screenMode(for: receiver.id)
         let ultra = ultra ?? (extend == nil && !soundOnly ? saved.ultra : nil)
