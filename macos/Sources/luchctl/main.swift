@@ -249,7 +249,10 @@ case "stop-cast":
 
 case "browser":
     guard args.count > 1, args[1] == "install" else { print("usage: luchctl browser install"); exit(2) }
-    let exe = URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath().standardizedFileURL.path
+    // The running binary itself, not argv[0]: run from PATH that is a bare "luchctl", which would be taken as a file
+    // in the current directory and give the browser a host that is not there.
+    let exe = (Bundle.main.executableURL ?? URL(fileURLWithPath: CommandLine.arguments[0]))
+        .resolvingSymlinksInPath().standardizedFileURL.path
     let support = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support")
     do {
         let done = try NativeHost.install(exe: exe, support: support)
