@@ -96,6 +96,8 @@ public struct MirrorOptions {
     public var synthetic = false
     /// The receiver as a speaker (PROTOCOL.md 4d): the Mac's sound and no picture.
     public var soundOnly = false
+    /// Ask the receiver's decoder to run flat out (an experiment of the receiver's; off: it made a MediaTek TV slower).
+    public var operatingRate = false
     /// A screen of its own for the TV, beside this Mac's (a virtual display), instead of a copy of this one.
     public var extend = false
     /// Ultra-low latency: the desktop drawn at exactly one of the TV's own modes (UltraMode), chosen by this.
@@ -314,10 +316,13 @@ public final class Engine {
 
         var start: [String: Any] = ["t": "start", "mode": "mirror",
                                     "video": ["codec": plan.codec.rawValue, "width": plan.width,
-                                              "height": plan.height, "fps": plan.fps,
-                                              // Ask the receiver to run the decoder at full operating rate:
-                                              // without it MediaCodec pipelines ~5 frames at 60 fps.
-                                              "operating_rate": true]]
+                                              "height": plan.height, "fps": plan.fps]]
+        // No "operating_rate": on a Horizon 20 Pro (MediaTek) it made the picture ~100 ms later than luchd's,
+        // which does not send it (measured with the latency lab: 10-11 refreshes against 4).
+        if options.operatingRate, var video = start["video"] as? [String: Any] {
+            video["operating_rate"] = true
+            start["video"] = video
+        }
         if plan.audio {
             start["audio"] = ["codec": "audio/opus", "rate": 48_000, "channels": 2,
                               "frame_ms": options.audioFrameMs]
