@@ -8,11 +8,13 @@ import XCTest
 
 /// A receiver on loopback that plays in a group (PROTOCOL.md 4k): announces sync, reports its need and output route
 /// every 200 ms, keeps what it is sent, and can ask the sender's clock on its media socket as the receiver does.
-private final class FakeSyncReceiver {
+final class FakeSyncReceiver {
     let name: String
     let port: UInt16
     var needMs: Double
     let route: String
+    /// The answer to a message other than start (a calibration's probe), set before the group starts.
+    var answer: (([String: Any]) -> [String: Any]?)?
     private let listener: Int32
     private let videoSock: Int32
     private let audioSock: Int32
@@ -74,6 +76,8 @@ private final class FakeSyncReceiver {
                     Thread.detachNewThread { [weak self] in
                         while self?.report() ?? false { Thread.sleep(forTimeInterval: 0.2) }
                     }
+                } else if let reply = self.answer?(m) {
+                    self.send(reply)
                 }
             }
         }

@@ -32,6 +32,8 @@ public final class GroupSession {
     public var onStopped: ((String) -> Void)?
     /// A member's person is asked to Allow this Mac (PROTOCOL.md 3a).
     public var onWaitingForAllow: ((String) -> Void)?
+    /// A member's other messages, with its receiver id: a calibration's probe_done or error.
+    public var onMessage: ((String, [String: Any]) -> Void)?
 
     /// Picture tolerance and the watching floor, as luchd's.
     static let toleranceMs = 20.0
@@ -187,6 +189,16 @@ public final class GroupSession {
         defer { lock.unlock() }
         return last
     }
+
+    /// The members still playing, with their roles.
+    public var members: [GroupMember] {
+        lock.lock()
+        defer { lock.unlock() }
+        return parts.filter(\.present).map { GroupMember($0.receiver, role: $0.role) }
+    }
+
+    /// The pts clock's zero on the host clock, in seconds: pts µs p is host time clockZero + p / 1e6.
+    public var clockZero: Double { CMTimeGetSeconds(base) }
 
     /// D now, in ms: the picture's and the sound's.
     public var delay: (video: Double, audio: Double) {
@@ -438,7 +450,7 @@ public final class GroupSession {
                 log("group: \(parts[k].receiver.name) left (\(msg["t"] as? String ?? ""))")
             }
         default:
-            break
+            onMessage?(parts[k].receiver.id, msg)
         }
     }
 
