@@ -1,13 +1,19 @@
-//! The UDP packet of PROTOCOL.md section 4 and the reassembly of frames from shards.
+//! The media datagram of PROTOCOL.md section 4: the 24-byte header, cutting a frame into shards, joining shards back
+//! into frames. Pure code without sockets, so every sender and receiver (Linux, Windows) shares one copy.
 
 use std::time::Instant;
 
 pub const HEADER: usize = 24;
+/// Data bytes per datagram: HEADER + SHARD = 1400, safe under a 1500 MTU.
+pub const SHARD: usize = 1376;
+
 pub const KIND_VIDEO: u8 = 1;
+pub const KIND_AUDIO: u8 = 2;
 pub const F_IDR: u8 = 1;
+pub const F_CONFIG: u8 = 2;
 pub const F_PARITY: u8 = 4;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Header {
     pub kind: u8,
     pub flags: u8,
@@ -22,6 +28,21 @@ pub struct Header {
 }
 
 impl Header {
+    /// Big-endian bytes; the reserved field stays 0.
+    pub fn to_bytes(&self) -> [u8; HEADER] {
+        let mut h = [0u8; HEADER];
+        h[0] = self.kind;
+        h[1] = self.flags;
+        h[2..4].copy_from_slice(&self.index.to_be_bytes());
+        h[4..6].copy_from_slice(&self.data_shards.to_be_bytes());
+        h[6..8].copy_from_slice(&self.parity_shards.to_be_bytes());
+        h[8..12].copy_from_slice(&self.seq.to_be_bytes());
+        h[12..16].copy_from_slice(&self.pts_us.to_be_bytes());
+        h[16..20].copy_from_slice(&self.len.to_be_bytes());
+        h[20..22].copy_from_slice(&self.host.to_be_bytes());
+        h
+    }
+
     /// The header and the shard that follows it.
     pub fn parse(b: &[u8]) -> Option<(Header, &[u8])> {
         if b.len() < HEADER {
@@ -44,11 +65,73 @@ impl Header {
     }
 }
 
+/// The header as loose fields, in wire order (no FEC yet, so no parity shards).
+#[allow(clippy::too_many_arguments)]
+pub fn header(
+    kind: u8,
+    flags: u8,
+    index: u16,
+    data_shards: u16,
+    seq: u32,
+    pts_us: u32,
+    len: u32,
+    host: u16,
+) -> [u8; HEADER] {
+    Header {
+        kind,
+        flags,
+        index,
+        data_shards,
+        parity_shards: 0,
+        seq,
+        pts_us,
+        len,
+        host,
+    }
+    .to_bytes()
+}
+
+/// One frame cut into datagram parts: a header for each shard and the shard itself. An empty frame still makes one
+/// (empty) shard so the receiver sees its sequence number. The last shard is not padded; `len` cuts the frame.
+pub fn shards<'a>(
+    kind: u8,
+    flags: u8,
+    seq: u32,
+    pts_us: u32,
+    host: u16,
+    data: &'a [u8],
+) -> impl Iterator<Item = ([u8; HEADER], &'a [u8])> + 'a {
+    let n = data.len().div_ceil(SHARD).max(1);
+    (0..n).map(move |i| {
+        let chunk = &data[(i * SHARD).min(data.len())..((i + 1) * SHARD).min(data.len())];
+        let h = header(
+            kind,
+            flags,
+            i as u16,
+            n as u16,
+            seq,
+            pts_us,
+            data.len() as u32,
+            host,
+        );
+        (h, chunk)
+    })
+}
+
+/// 19-byte OpusHead (RFC 7845) for 48 kHz stereo: the audio codec-config packet, MediaCodec CSD-0.
+pub fn opus_head() -> [u8; 19] {
+    let mut h = [0u8; 19];
+    h[..8].copy_from_slice(b"OpusHead");
+    h[8] = 1; // version
+    h[9] = 2; // channels
+    h[10..12].copy_from_slice(&312u16.to_le_bytes()); // pre-skip (opusenc lookahead)
+    h[12..16].copy_from_slice(&48_000u32.to_le_bytes());
+    h
+}
+
 pub struct Frame {
     pub seq: u32,
-    #[allow(dead_code)] // for the audio sync, later
     pub pts_us: u32,
-    #[allow(dead_code)]
     pub idr: bool,
     pub host: u16,
     pub data: Vec<u8>,
@@ -76,6 +159,12 @@ pub struct Assembler {
     asked: bool,
     asked_at: Option<Instant>,
     pub lost: u32,
+}
+
+impl Default for Assembler {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// `a` is later than `b`, with the counter wrapping.
@@ -192,22 +281,72 @@ mod tests {
     }
 
     #[test]
-    fn parses_the_header() {
-        let mut b = vec![0u8; 24];
-        b[0] = 1;
-        b[1] = 1;
-        b[2..4].copy_from_slice(&3u16.to_be_bytes());
-        b[4..6].copy_from_slice(&5u16.to_be_bytes());
-        b[8..12].copy_from_slice(&7u32.to_be_bytes());
-        b[16..20].copy_from_slice(&6000u32.to_be_bytes());
-        b.extend_from_slice(&[9, 9]);
-        let (h, rest) = Header::parse(&b).unwrap();
-        assert_eq!(
-            (h.kind, h.flags, h.index, h.data_shards, h.seq, h.len),
-            (1, 1, 3, 5, 7, 6000)
-        );
-        assert_eq!(rest, &[9, 9]);
-        assert!(Header::parse(&b[..10]).is_none());
+    fn header_layout() {
+        let h = header(KIND_VIDEO, F_IDR, 2, 5, 0x01020304, 0x0a0b0c0d, 7000, 33);
+        assert_eq!(&h[..8], &[1, 1, 0, 2, 0, 5, 0, 0]);
+        assert_eq!(&h[8..12], &[1, 2, 3, 4]);
+        assert_eq!(&h[12..16], &[0x0a, 0x0b, 0x0c, 0x0d]);
+        assert_eq!(u32::from_be_bytes(h[16..20].try_into().unwrap()), 7000);
+        assert_eq!(u16::from_be_bytes(h[20..22].try_into().unwrap()), 33);
+        assert_eq!(&h[22..], &[0, 0], "reserved");
+    }
+
+    #[test]
+    fn header_round_trips() {
+        let h = Header {
+            kind: KIND_AUDIO,
+            flags: F_CONFIG | F_PARITY,
+            index: 9,
+            data_shards: 10,
+            parity_shards: 2,
+            seq: u32::MAX,
+            pts_us: 123_456,
+            len: 13_000,
+            host: 57,
+        };
+        let mut b = h.to_bytes().to_vec();
+        b.extend_from_slice(&[7, 8]);
+        let (back, rest) = Header::parse(&b).unwrap();
+        assert_eq!(back, h);
+        assert_eq!(rest, &[7, 8]);
+        assert!(Header::parse(&b[..HEADER - 1]).is_none());
+    }
+
+    #[test]
+    fn opus_head_is_rfc7845() {
+        let h = opus_head();
+        assert_eq!(&h[..8], b"OpusHead");
+        assert_eq!((h[8], h[9]), (1, 2));
+        assert_eq!(u32::from_le_bytes(h[12..16].try_into().unwrap()), 48_000);
+    }
+
+    #[test]
+    fn shards_cut_a_frame_and_the_assembler_joins_it() {
+        let frame: Vec<u8> = (0..SHARD * 2 + 100).map(|i| i as u8).collect();
+        let parts: Vec<_> = shards(KIND_VIDEO, F_IDR, 7, 1234, 5, &frame).collect();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[2].1.len(), 100, "the last shard is not padded");
+        let mut a = Assembler::new();
+        // Out of order, the way Wi-Fi sometimes delivers them.
+        let mut out = None;
+        for i in [2, 0, 1] {
+            let mut datagram = parts[i].0.to_vec();
+            datagram.extend_from_slice(parts[i].1);
+            let (h, rest) = Header::parse(&datagram).unwrap();
+            assert_eq!((h.index, h.data_shards, h.seq), (i as u16, 3, 7));
+            out = a.push(&h, rest).frame.or(out);
+        }
+        let f = out.unwrap();
+        assert_eq!((f.seq, f.pts_us, f.idr, f.host), (7, 1234, true, 5));
+        assert_eq!(f.data, frame);
+    }
+
+    #[test]
+    fn an_empty_frame_is_one_empty_shard() {
+        let parts: Vec<_> = shards(KIND_AUDIO, 0, 1, 0, 0, &[]).collect();
+        assert_eq!(parts.len(), 1);
+        assert!(parts[0].1.is_empty());
+        assert_eq!(u16::from_be_bytes([parts[0].0[4], parts[0].0[5]]), 1);
     }
 
     #[test]

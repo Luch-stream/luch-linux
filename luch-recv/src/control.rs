@@ -1,7 +1,8 @@
 //! The control channel (PROTOCOL.md section 3) and the session it starts (section 4): hello and welcome, `start` answered
 //! with the UDP ports, then the video arrives, goes to the player, and the receiver asks for an IDR after a loss.
 
-use crate::{player::Player, wire};
+use crate::player::Player;
+use luch_proto::wire;
 use serde_json::{json, Value};
 use socket2::{Domain, Socket, Type};
 use std::{
