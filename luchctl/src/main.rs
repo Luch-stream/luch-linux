@@ -3,6 +3,7 @@
 use futures_util::StreamExt;
 use luch_proto::ReceiverRow;
 
+mod choice;
 mod native;
 
 #[zbus::proxy(
@@ -143,10 +144,15 @@ async fn find_id(p: &Luch1Proxy<'_>, key: Option<&str>) -> Result<String, String
         return match rows.as_slice() {
             [one] => Ok(one.0.clone()),
             [] => Err("no receivers found (is the receiver app running?)".into()),
-            _ => Err(format!(
-                "{} receivers on the LAN, name one (see `luchctl list`)",
-                rows.len()
-            )),
+            _ => {
+                let all: Vec<_> = rows.iter().map(|r| (r.0.clone(), r.1.clone())).collect();
+                choice::ask(&all).ok_or_else(|| {
+                    format!(
+                        "{} receivers on the LAN, name one (see `luchctl list`)",
+                        rows.len()
+                    )
+                })
+            }
         };
     };
     let hits: Vec<_> = rows
