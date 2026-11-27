@@ -49,6 +49,10 @@ trait Luch1 {
     fn find_status(&self) -> zbus::Result<String>;
     fn discovered(&self) -> zbus::Result<String>;
     fn add_receiver(&self, link: &str) -> zbus::Result<String>;
+    fn direct(&self, key: &str) -> zbus::Result<String>;
+    fn direct_off(&self) -> zbus::Result<String>;
+    #[zbus(signal)]
+    fn direct_changed(&self, status: &str) -> zbus::Result<()>;
     #[zbus(signal)]
     fn find_progress(&self, status: &str) -> zbus::Result<()>;
     fn present(&self, id: &str, file: &str) -> zbus::Result<String>;
@@ -74,7 +78,8 @@ trait Luch1 {
     fn sender_id(&self) -> zbus::Result<String>;
 }
 
-const USAGE: &str = "usage: luchctl [list | refresh | find [auto|all|mdns,scan,ble,sound,qr] | add <link|host[:port]> | connect [r] | disconnect [r] | mirror [r] [fast|monitor|window|virtual] | stop [r] | stats [r] | watch | id
+const USAGE: &str = "usage: luchctl [list | refresh | find [auto|all|mdns,scan,ble,sound,qr,direct] | add <link|host[:port]> | connect [r] | disconnect [r] | mirror [r] [fast|monitor|window|virtual] | stop [r] | stats [r] | watch | id
+                | direct [r] | direct off
                 | info [r] | audio [r] auto|on|off|sync | reports | report <n> [open|dismiss]
                 | known | wake [r] | wake <r> learn | wake <r> mac|ble <value>|off | sleep [r]
                 | cast [r] <file|link>... [--title T] [--start m:ss] [--sub file] [--relay] [--paused]
@@ -87,6 +92,9 @@ const USAGE: &str = "usage: luchctl [list | refresh | find [auto|all|mdns,scan,b
        r = receiver id or name, optional when there is only one; mirror defaults to fast; no arguments: interactive
        find: when the list stays empty (hotel Wi-Fi, a VPN): every address of the LAN, Bluetooth, then the TV's sound
        through the microphone and its QR code through the camera; add: a receiver by its QR link or address
+       direct: when no network joins this computer and the TV (guest Wi-Fi, no common LAN): asked over Bluetooth, the
+       TV makes its own Wi-Fi network; this computer leaves its Wi-Fi for it while showing and comes back when the
+       session ends or on `direct off`; r here is the TV's name or the start of its id, as `find direct` says it
        wake: turns on a receiver luchd has talked to before (Wake-on-LAN, or the remote's Bluetooth signal that
        `wake <r> learn` picks up while you press the remote's power key with the receiver off)
        cast: photos, or a video or sound the receiver plays itself in its own quality; a link is fetched by the
@@ -377,6 +385,10 @@ async fn run(args: &[String]) -> Result<(), String> {
                 }
             }
             print(&p.receivers().await.map_err(e)?, &discovered(&p).await);
+        }
+        ["direct", "off"] => println!("{}", p.direct_off().await.map_err(e)?),
+        ["direct", key @ ..] if key.len() <= 1 => {
+            direct_with(&p, key.first().copied().unwrap_or("")).await?
         }
         ["add", link] => {
             let id = p.add_receiver(link).await.map_err(e)?;
@@ -1193,6 +1205,16 @@ async fn pair_with(p: &Luch1Proxy<'_>, id: &str, code: Option<&str>) -> Result<(
             }
         }
     }
+    type_code(p, id, code).await
+}
+
+/// A receiver asking for pairing under `id` (Pairing): waits for its code on the TV, asks for it unless given, and
+/// hands it to luchd.
+async fn type_code(p: &Luch1Proxy<'_>, id: &str, code: Option<&str>) -> Result<(), String> {
+    let reason = |e: zbus::Error| match e {
+        zbus::Error::MethodError(_, Some(d), _) => d,
+        e => e.to_string(),
+    };
     let mut told = false;
     let until = std::time::Instant::now() + std::time::Duration::from_secs(70);
     let name = loop {
@@ -1232,6 +1254,66 @@ async fn pair_with(p: &Luch1Proxy<'_>, id: &str, code: Option<&str>) -> Result<(
     Ok(())
 }
 
+/// `direct [r]`: the TV over its own Wi-Fi network, followed step by step; the code is asked here when it pairs.
+async fn direct_with(p: &Luch1Proxy<'_>, key: &str) -> Result<(), String> {
+    let reason = |e: zbus::Error| match e {
+        zbus::Error::MethodError(_, Some(d), _) => d,
+        e => e.to_string(),
+    };
+    let mut changes = p.receive_direct_changed().await.map_err(reason)?;
+    let started: serde_json::Value =
+        serde_json::from_str(&p.direct(key).await.map_err(reason)?).unwrap_or_default();
+    println!(
+        "{}",
+        match started["leaves"].as_str() {
+            Some(net) => format!(
+                "this computer leaves '{net}' while showing, and comes back after (`luchctl direct off`)"
+            ),
+            None => "this computer's Wi-Fi joins the TV's network while showing".into(),
+        }
+    );
+    while let Some(c) = changes.next().await {
+        let Ok(a) = c.args() else { continue };
+        let s: serde_json::Value = serde_json::from_str(a.status()).unwrap_or_default();
+        if let Some(line) = direct_line(&s) {
+            println!("{line}");
+        }
+        match s["step"].as_str() {
+            Some("pairing") => type_code(p, s["key"].as_str().unwrap_or_default(), None).await?,
+            Some("on") => return Ok(()),
+            Some("failed") => return Err(s["reason"].as_str().unwrap_or("it did not work").into()),
+            _ => {}
+        }
+    }
+    Err("luchd went away (is it running?)".into())
+}
+
+/// A step of a direct connection (DirectChanged) in words; None for a failure, which is the command's error.
+fn direct_line(s: &serde_json::Value) -> Option<String> {
+    let name = s["name"].as_str().unwrap_or("the TV");
+    let ssid = s["ssid"].as_str().unwrap_or("");
+    Some(match s["step"].as_str()? {
+        "looking" => "listening for TVs nearby over Bluetooth".into(),
+        "opening" => format!("opening the Bluetooth channel of {name}"),
+        "pairing" => format!("{name} asks for pairing"),
+        "asking" => format!("{name} asks its viewers: allow the direct connection on the TV"),
+        "joining" => match s["band"].as_str().filter(|b| !b.is_empty()) {
+            Some(band) => format!("joining the network of {name}, '{ssid}' ({band})"),
+            None => format!("joining the network of {name}, '{ssid}'"),
+        },
+        "connecting" => format!("connecting to {name} over '{ssid}'"),
+        "on" => format!(
+            "connected to {name} directly: `luchctl mirror` shows this screen; `luchctl direct off` goes back{}",
+            s["previous"]
+                .as_str()
+                .map(|p| format!(" to '{p}'"))
+                .unwrap_or_default()
+        ),
+        "back" => s["note"].as_str().unwrap_or("back").into(),
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1243,6 +1325,29 @@ mod tests {
         assert_eq!(pairing_id(msg), Some("0b6f-tv"));
         assert_eq!(pairing_id("Living room TV refused the connection"), None);
         assert!(pair_code("123456") && !pair_code("Living") && !pair_code("12345"));
+    }
+
+    #[test]
+    fn a_direct_connection_says_each_step() {
+        use serde_json::json;
+        assert_eq!(
+            direct_line(&json!({"step": "joining", "name": "Living room TV", "ssid": "DIRECT-xy", "band": "5 GHz"}))
+                .unwrap(),
+            "joining the network of Living room TV, 'DIRECT-xy' (5 GHz)"
+        );
+        assert_eq!(
+            direct_line(&json!({"step": "on", "name": "Living room TV", "previous": "Home"})).unwrap(),
+            "connected to Living room TV directly: `luchctl mirror` shows this screen; `luchctl direct off` goes \
+             back to 'Home'"
+        );
+        assert_eq!(
+            direct_line(&json!({"step": "back", "note": "back on 'Home'"})).unwrap(),
+            "back on 'Home'"
+        );
+        assert_eq!(
+            direct_line(&json!({"step": "failed", "reason": "no"})),
+            None
+        );
     }
 
     #[test]
