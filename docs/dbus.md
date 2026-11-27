@@ -156,6 +156,13 @@ The sound for the next show to a receiver, remembered in `~/.config/luch/audio`:
 | `off` | not sent: the picture only, the lowest latency |
 | `sync` | the receiver holds each picture back by its audio delay, so both come out together |
 
+### `SetInputChoice(s id, s choice)` / `InputChoice(s id) → s`
+
+Whether a receiver's touch screen, keyboard, mouse and gamepads may control this computer without asking
+(PROTOCOL.md 4h, [input.md](input.md)): `ask` (default: a notification asks at its first use in a session, with
+allow once / always / don't allow) or `always` (what "Always allow" saves). Kept in `~/.config/luch/input`;
+`ask` takes an `always` back from the next session.
+
 ### `Reports() → s`, `ReportUrl(s id) → s`, `DismissReport(s id)`
 
 Crash and error reports the receivers handed over (luchd asks for them with `"want": ["reports"]`), as a JSON array,

@@ -15,7 +15,7 @@ futures-util = "0.3"
 gstreamer = "0.25.4"
 gstreamer-app = { version = "0.25.2", features = ["v1_24"] }
 gstreamer-video = "0.25.4"
-ashpd = { version = "0.14.1", default-features = false, features = ["tokio", "screencast"] }
+ashpd = { version = "0.14.1", default-features = false, features = ["tokio", "screencast", "remote_desktop"] }
 socket2 = { version = "0.6.5", features = ["all"] }
 gstreamer-allocators = "0.25.4"
 tokio-tungstenite = "0.27"
