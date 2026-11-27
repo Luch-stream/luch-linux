@@ -26,7 +26,8 @@ public enum WakeRelay {
         if answer["t"] as? String == mode, answer["ok"] as? Bool == true { return nil }
         switch answer["code"] as? String {
         case "no_ble": return "\(name) has no Bluetooth that can advertise"
-        case "not_allowed": return "\(name) must allow this Mac first (pair with it)"
+        // Two causes share the code (this Mac not let in, or no Bluetooth permission there): the detail says which.
+        case "not_allowed": return "\(name): \(answer["detail"] as? String ?? "must allow this Mac first (pair with it)")"
         case "unknown": return "\(name) cannot send it yet: update Luch on it"
         default: return "\(name): \(answer["detail"] as? String ?? answer["code"] as? String ?? "refused")"
         }
