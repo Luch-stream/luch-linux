@@ -7,9 +7,14 @@ import LuchProto
 
 public final class UdpSender {
     public let kind: MediaKind
-    private let fd: Int32
+    /// Also read by ClockResponder (the receiver's clock requests come back on this socket).
+    let fd: Int32
     private let lock = NSLock()
     private var seq: UInt32 = 0
+    /// The playout delay D (0.1 ms) every packet from now on carries; 0 outside a group (PROTOCOL.md 4k).
+    private var delay: UInt16 = 0
+    /// A group's stream: its first frame says its pts start anew.
+    private var timeline = false
     private var bytesSent: UInt64 = 0
     private var framesSent: UInt64 = 0
     private var latencySum: UInt64 = 0
@@ -85,6 +90,8 @@ public final class UdpSender {
         lock.lock()
         let sq = seq
         seq &+= 1
+        let d = delay
+        let flags = sq == 0 && timeline ? flags.union(.timeline) : flags
         lock.unlock()
 
         var packet = [UInt8]()
@@ -97,7 +104,8 @@ public final class UdpSender {
             }
             packet.removeAll(keepingCapacity: true)
             packet.append(contentsOf: Proto.header(kind: kind, flags: flags, shard: UInt16(i), shards: shards,
-                                                   seq: sq, ptsUS: ptsUS, frameLen: UInt32(frame.count), hostLat: hostLat))
+                                                   seq: sq, ptsUS: ptsUS, frameLen: UInt32(frame.count), hostLat: hostLat,
+                                                   delay: d))
             packet.append(contentsOf: chunk)
             let n = packet.withUnsafeBytes { Darwin.send(fd, $0.baseAddress, $0.count, 0) }
             if n < 0 {
@@ -127,6 +135,20 @@ public final class UdpSender {
         // ECONNREFUSED: an ICMP error on the connected socket, the receiver gone for a moment.
         if n < 0 { return errno == ECONNREFUSED || errno == EINTR ? 0 : -1 }
         return n
+    }
+
+    /// Sets D (0.1 ms) for the packets from the next frame on: one step, the same frame everywhere.
+    public func setDelay(_ units: UInt16) {
+        lock.lock()
+        delay = units
+        lock.unlock()
+    }
+
+    /// This stream plays to a group: its first frame carries the new-timeline flag.
+    public func startTimeline() {
+        lock.lock()
+        timeline = true
+        lock.unlock()
     }
 
     public func snapshot() -> Snapshot {

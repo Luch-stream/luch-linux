@@ -173,6 +173,19 @@ case "stats":
         if let thermal = stats["thermal"] as? String, thermal != "none" { line += " · \(thermal)" }
         print(line)
     }
+    printGroup()
+
+case "group":
+    groupCommand(args)
+
+case "offset":
+    offsetCommand(args)
+
+case "audio":
+    audioCommand(args)
+
+case "latency":
+    latencyCommand(args)
 
 case "state":
     let response = call(["cmd": "state"])
@@ -331,6 +344,6 @@ default:
            next slide, notes, timer; the mouse is a laser pointer, dragging draws, a clicker turns the slides)
            quiet: hide notification banners while presenting or mirroring (ask: the app asks once); macOS allows it
            only through Shortcuts, so the app adds two shortcuts the first time
-    """)
+    """ + "\n" + togetherUsage)
     exit(2)
 }

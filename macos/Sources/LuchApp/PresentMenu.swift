@@ -18,7 +18,7 @@ extension AppDelegate {
         caster.presenter.mirrorSend = { id, m in
             let e = Thread.isMainThread ? engine(id) : DispatchQueue.main.sync { engine(id) }
             guard let e, e.streaming, !e.options.soundOnly else { return false }
-            e.send(m)
+            _ = e.send(m)
             return true
         }
     }

@@ -42,6 +42,8 @@ public struct ReceiverCaps {
     public var charging = true
     public var thermal = "none"
     public var powerSave = false
+    /// What works worse on its Android (welcome `limits.limits`, PROTOCOL.md 5), e.g. "audio_lag".
+    public var limits: [String] = []
 
     /// A phone or tablet running off its own battery.
     public var onBattery: Bool { battery >= 0 && !charging }
@@ -87,6 +89,7 @@ public struct ReceiverCaps {
         charging = (device["charging"] as? Bool) ?? true
         thermal = device["thermal"] as? String ?? "none"
         powerSave = (device["power_save"] as? Bool) ?? false
+        limits = (welcome["limits"] as? [String: Any])?["limits"] as? [String] ?? []
 
         var parsed: [String: VideoCapability] = [:]
         for (mime, raw) in (hw["video"] as? [String: Any] ?? [:]) {
