@@ -1,8 +1,14 @@
 [workspace]
-members = ["luch-proto", "luchd", "luchctl", "luch-kms", "luch-recv"]
+members = ["luch-proto", "luchd", "luchctl", "luch-kms", "luch-recv", "luch-latency"]
 resolver = "2"
 
 [workspace.dependencies]
 zbus = { version = "5", default-features = false, features = ["tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "io-std", "sync"] }
 luch-proto = { path = "luch-proto" }
+
+# The latency lab reads and renders video frame by frame: unoptimised, its tests would take minutes.
+[profile.dev.package.luch-latency]
+opt-level = 3
+[profile.dev.package.rxing]
+opt-level = 3

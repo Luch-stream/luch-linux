@@ -221,6 +221,14 @@ Whether a receiver's touch screen, keyboard, mouse and gamepads may control this
 (PROTOCOL.md 4i, [input.md](input.md)): `ask` (default: a notification asks at its first use in a session, with
 allow once / always / don't allow) or `always` (what "Always allow" saves). Kept in `~/.config/luch/input`;
 `ask` takes an `always` back from the next session.
+### `LatencyLab(s id, b on) → s`
+
+The latency lab ([latency-lab.md](latency-lab.md)). `on`: serves a page on `127.0.0.1` (a free port) and returns its
+address; opened full screen, it counts this screen's refreshes in Gray code under a QR code of the stream's setup
+(version, capture mode, codec, bitrate, size, ping, luchd's own figures). The receiver is told
+`{"t":"latency","on":true}` (PROTOCOL.md 4j, now or when mirroring to it starts) and draws its own pattern in the TV's
+bottom right corner. Off: the page's server stops, the receiver takes its pattern away, `""` is returned. `id` may be
+empty while exactly one receiver is mirroring.
 
 ### `Reports() → s`, `ReportUrl(s id) → s`, `DismissReport(s id)`
 

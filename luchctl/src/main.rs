@@ -57,6 +57,7 @@ trait Luch1 {
     fn quiet(&self) -> zbus::Result<String>;
     #[zbus(property)]
     fn set_quiet(&self, mode: &str) -> zbus::Result<()>;
+    fn latency_lab(&self, id: &str, on: bool) -> zbus::Result<String>;
     #[zbus(signal)]
     fn receivers_changed(&self) -> zbus::Result<()>;
     #[zbus(signal)]
@@ -72,7 +73,8 @@ const USAGE: &str = "usage: luchctl [list | refresh | find [auto|all|mdns,scan,b
                 | media [r] [play|pause|toggle|seek m:ss|skip s|rate x|audio id|sub id|sub off|watch]
                 | volume [r] [0..100|+|-|mute|unmute] | page [r] next|prev|<n> | blank [r] on|off
                 | present [r] <file> | quiet [ask|on|off] | browser install
-                | pair [r] [code] | paired | forget <r> | web [allow|deny <code> | forget <n>]]
+                | pair [r] [code] | paired | forget <r> | web [allow|deny <code> | forget <n>]
+                | latency [on|off] [r] | latency analyze <video> [--out prefix] [--fps n] [--readout-ms ms]]
        r = receiver id or name, optional when there is only one; mirror defaults to fast; no arguments: interactive
        find: when the list stays empty (hotel Wi-Fi, a VPN): every address of the LAN, Bluetooth, then the TV's sound
        through the microphone and its QR code through the camera; add: a receiver by its QR link or address
@@ -88,7 +90,15 @@ const USAGE: &str = "usage: luchctl [list | refresh | find [auto|all|mdns,scan,b
        browser install: lets the Luch browser extension reach luchd (Chrome, Chromium, Brave, Edge, Yandex, Firefox)
        pair: the first connection to a receiver shows a code on the TV, typed here (any command that connects asks
        for it too); both then know each other and later connections need nothing. forget: pair again next time
-       web: the browsers allowed to watch this screen (luchd's web receiver), and the one waiting to be allowed";
+       web: the browsers allowed to watch this screen (luchd's web receiver), and the one waiting to be allowed
+       latency: photon-to-photon latency with a phone filming both screens at 240 fps (docs/latency-lab.md)";
+
+const LAB_STEPS: &str =
+    "latency lab on: the page opens in the browser, the TV draws its own pattern in a corner.
+  1. click the page for full screen, mirror in the mode to test (`luchctl mirror fast`)
+  2. film both screens in one shot, 240 fps, 10 s, the phone still (docs/latency-lab.md)
+  3. luchctl latency analyze VIDEO   writes a report to attach to an issue
+  luchctl latency off   when done";
 
 const AUDIO: [&str; 4] = ["auto", "on", "off", "sync"];
 
@@ -751,6 +761,27 @@ async fn run(args: &[String]) -> Result<(), String> {
                 "now add the Luch extension to the browser (browser-extension/ in this repository)"
             );
         }
+        ["latency", rest @ ..] => {
+            let (on, key) = match rest {
+                [] => (true, None),
+                ["on" | "off", key @ ..] if key.len() <= 1 => {
+                    (rest[0] == "on", key.first().copied())
+                }
+                [key] => (true, Some(*key)),
+                _ => return Err(USAGE.into()),
+            };
+            let id = match key {
+                Some(k) => find_id(&p, Some(k)).await?,
+                None => String::new(), // luchd takes the receiver that is mirroring
+            };
+            let url = p.latency_lab(&id, on).await.map_err(e)?;
+            if on {
+                println!("{LAB_STEPS}\n\npage: {url}");
+                let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+            } else {
+                println!("latency lab off");
+            }
+        }
         [] => tui(&p).await.map_err(e)?,
         _ => return Err(USAGE.into()),
     }
@@ -1014,6 +1045,14 @@ async fn main() {
         };
         if let Err(msg) = r.await {
             eprintln!("luchctl native host: {msg}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    // Analysing a video needs no luchd: it may run on any computer the video was copied to.
+    if args.len() >= 2 && args[0] == "latency" && args[1] == "analyze" {
+        if let Err(msg) = luch_latency::cli::analyze(&args[2..]) {
+            eprintln!("luchctl: {msg}");
             std::process::exit(1);
         }
         return;
