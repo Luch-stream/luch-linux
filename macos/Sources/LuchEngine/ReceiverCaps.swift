@@ -35,6 +35,8 @@ public struct ReceiverCaps {
     public var refreshRate: Int
     /// Fastest rate the panel supports: the current one drops to 24 Hz or lower when the screen idles.
     public var maxRefreshRate: Int
+    /// The panel's own modes, as the receiver lists them ("3840x2160@60").
+    public var displayModes: [DisplayMode] = []
     /// Device state from `welcome.hw.device`: a snapshot taken when the sender said hello.
     public var battery: Int = -1
     public var charging = true
@@ -77,6 +79,7 @@ public struct ReceiverCaps {
         var fastest = 0
         for entry in (display["modes"] as? [String] ?? []) {
             if let hz = entry.split(separator: "@").last.flatMap({ Int($0) }) { fastest = max(fastest, hz) }
+            if let m = DisplayMode(entry), !displayModes.contains(m) { displayModes.append(m) }
         }
         maxRefreshRate = max(fastest, refreshRate)
         let device = hw["device"] as? [String: Any] ?? [:]
@@ -136,4 +139,28 @@ public struct ReceiverCaps {
         if let prefer { lines.append("  prefer: \(prefer)  (bench at \(benchRes ?? "?"))") }
         return lines.joined(separator: "\n")
     }
+}
+
+/// One mode of a screen: pixels and refresh rate.
+public struct DisplayMode: Equatable, CustomStringConvertible {
+    public var width: Int
+    public var height: Int
+    public var hz: Int
+
+    public init(width: Int, height: Int, hz: Int) {
+        self.width = width
+        self.height = height
+        self.hz = hz
+    }
+
+    /// "3840x2160@60"; nil for anything else.
+    public init?(_ text: String) {
+        let at = text.split(separator: "@")
+        let size = (at.first ?? "").split(separator: "x")
+        guard at.count == 2, size.count == 2, let w = Int(size[0]), let h = Int(size[1]), let hz = Int(at[1]),
+              w > 0, h > 0, hz > 0 else { return nil }
+        self.init(width: w, height: h, hz: hz)
+    }
+
+    public var description: String { "\(width)x\(height)@\(hz)" }
 }

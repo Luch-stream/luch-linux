@@ -98,6 +98,8 @@ public struct MirrorOptions {
     public var soundOnly = false
     /// A screen of its own for the TV, beside this Mac's (a virtual display), instead of a copy of this one.
     public var extend = false
+    /// Ultra-low latency: the desktop drawn at exactly one of the TV's own modes (UltraMode), chosen by this.
+    public var ultra: UltraPriority?
     /// Tell the receiver what this Mac plays (`now_playing`), whatever the session shows.
     public var nowPlaying = true
     public init() {}
@@ -238,6 +240,9 @@ public final class Engine {
     private var audioFrames: UInt64 = 0
     private var watcher: NowPlayingWatcher?
     private var virtualScreen: VirtualScreen?
+    private var displayMirror: DisplayMirror?
+    /// The TV's mode the ultra-low latency session draws at.
+    public private(set) var ultraMode: DisplayMode?
     private var artLink: (path: String, link: String?)?
 
     public init(options: MirrorOptions) {
@@ -271,16 +276,38 @@ public final class Engine {
         var planned = options
         // A screen of the TV's own takes the TV's shape: nothing to crop or fit.
         if planned.extend { planned.sizeMode = .client }
+        if let priority = options.ultra {
+            let panel = CGDisplayCopyDisplayMode(CGMainDisplayID())?.pixelWidth ?? 1920
+            guard let m = UltraMode.choose(priority, caps: caps, macPixelWidth: panel) else {
+                throw EngineError.noVirtualScreen
+            }
+            ultraMode = m
+            planned.width = m.width
+            planned.height = m.height
+            planned.fps = m.hz
+            planned.explicitSize = true
+            planned.sizeMode = .client
+            log("ultra-low latency (\(priority.rawValue)): the desktop at the TV's \(m)")
+        }
         let plan = CodecPlanner.plan(caps: caps, receiverID: r.id, options: planned)
         self.plan = plan
         deviceOnBattery = caps.onBattery
         log("plan: \(plan.codec.label) \(plan.width)x\(plan.height)@\(plan.fps) audio=\(plan.audio) — \(plan.reason)")
-        if options.extend {
+        if options.extend || options.ultra != nil {
             guard let v = VirtualScreen(name: caps.name, width: plan.width, height: plan.height, fps: plan.fps,
                                         serial: VirtualScreen.serial(for: r.id)) else {
                 throw EngineError.noVirtualScreen
             }
             virtualScreen = v
+            if options.ultra != nil {
+                // This Mac's screen shows a copy of the TV's: macOS draws the desktop once, at the TV's mode.
+                let main = CGMainDisplayID()
+                guard v.waitUntilShown(timeout: 60), let m = DisplayMirror(main, of: v.displayID) else {
+                    virtualScreen = nil
+                    throw EngineError.noVirtualScreen
+                }
+                displayMirror = m
+            }
         }
 
         var start: [String: Any] = ["t": "start", "mode": "mirror",
@@ -392,7 +419,8 @@ public final class Engine {
             done.signal()
         }
         _ = done.wait(timeout: .now() + 2)
-        // Only once nothing captures it: windows on it go back to this Mac's screen.
+        // Only once nothing captures it: this Mac's screen first, then the windows on the TV's go back to it.
+        displayMirror = nil
         virtualScreen = nil
         running = false
         streaming = false

@@ -22,6 +22,7 @@ func usage() -> Never {
                   [--fps N] [--bitrate KBPS] [--size WxH] [--seconds N] [--no-audio]
                   [--codec auto|h264|hevc] [--profile baseline|main|high] [--synthetic]
                   [--extend]   (a screen of its own for the TV, beside this Mac's)
+                  [--ultra quality|mac|speed]   (the desktop drawn at one of the TV's own modes)
       luch sound [<name>] [--ip A.B.C.D] [--port N] [--seconds N] [--synthetic]
     """
     FileHandle.standardError.write(Data((text + "\n").utf8))
@@ -92,6 +93,9 @@ func parse(_ argv: [String]) -> Args {
             a.options.profile = profile
         case "--synthetic": a.options.synthetic = true
         case "--extend": a.options.extend = true
+        case "--ultra":
+            guard let p = UltraPriority(rawValue: next()) else { usage() }
+            a.options.ultra = p
         case "-h", "--help": usage()
         default:
             if flag.hasPrefix("-") { usage() }
