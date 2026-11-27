@@ -29,12 +29,33 @@ public final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate {
     private var frames = 0
     private var audioBuffers = 0
 
-    /// `displayID`: that display (a virtual screen), waited for as it comes up: the first time for a TV, macOS asks
-    /// whether to extend the desktop onto it or mirror this one, and shows it only once that is answered. Else
-    /// `displayIndex`.
-    public func start(displayIndex: Int?, displayID: CGDirectDisplayID? = nil, width: Int, height: Int, fps: Int,
-                      audio: Bool, fit: FitMode = .crop) async throws {
+    /// What the frame shows, for the receiver's input (PROTOCOL.md 4i): a part of the desktop in global points
+    /// (fitted with bars or not), or a window, which may move.
+    public enum Shown {
+        case area(CGRect, letterboxed: Bool)
+        case window(CGWindowID)
+    }
+
+    public private(set) var shown: Shown?
+
+    /// `windowID`: that window alone, fitted into the frame with bars. `displayID`: that display (a virtual screen),
+    /// waited for as it comes up: the first time for a TV, macOS asks whether to extend the desktop onto it or mirror
+    /// this one, and shows it only once that is answered. Else `displayIndex`.
+    public func start(displayIndex: Int?, displayID: CGDirectDisplayID? = nil, windowID: CGWindowID? = nil,
+                      width: Int, height: Int, fps: Int, audio: Bool, fit: FitMode = .crop) async throws {
         var content = try await Self.shareableContent()
+        if let windowID {
+            guard let window = content.windows.first(where: { $0.windowID == windowID }) else {
+                throw CaptureError.noWindow
+            }
+            log("capture: window \(windowID) (\(window.owningApplication?.applicationName ?? "?")) -> \(width)x\(height)@\(fps)")
+            let config = Self.configuration(width: width, height: height, fps: fps, audio: audio)
+            config.scalesToFit = true
+            config.preservesAspectRatio = true
+            try await begin(SCContentFilter(desktopIndependentWindow: window), config, audio: audio)
+            shown = .window(windowID)
+            return
+        }
         if let id = displayID {
             if !content.displays.contains(where: { $0.displayID == id }) {
                 log("capture: waiting for screen \(id) (macOS may ask: Extend or Mirror)")
@@ -59,20 +80,9 @@ public final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         log("capture: display \(display.displayID) \(display.width)x\(display.height) -> \(width)x\(height)@\(fps) audio=\(audio)")
 
-        let config = SCStreamConfiguration()
-        config.width = width
-        config.height = height
-        config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
-        config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
-        config.queueDepth = 2
-        config.showsCursor = true
-        config.capturesAudio = audio
-        if audio {
-            config.sampleRate = 48_000
-            config.channelCount = 2
-            // Do not feed our own playback back into the stream (the receiver may echo).
-            if #available(macOS 13.0, *) { config.excludesCurrentProcessAudio = true }
-        }
+        let config = Self.configuration(width: width, height: height, fps: fps, audio: audio)
+        let bounds = CGDisplayBounds(display.displayID)
+        shown = .area(bounds, letterboxed: fit == .letterbox)
         switch fit {
         case .crop:
             // Crop to the target aspect at the source, then scale: a single uniform transform and
@@ -91,6 +101,7 @@ public final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate {
                 }
                 config.sourceRect = rect
                 config.scalesToFit = false
+                shown = .area(rect.offsetBy(dx: bounds.minX, dy: bounds.minY), letterboxed: false)
                 log(String(format: "capture: crop %.0fx%.0f at (%.0f,%.0f) -> %dx%d",
                            rect.width, rect.height, rect.origin.x, rect.origin.y, width, height))
             }
@@ -100,7 +111,28 @@ public final class ScreenCapture: NSObject, SCStreamOutput, SCStreamDelegate {
             config.scalesToFit = false
         }
 
-        let filter = SCContentFilter(display: display, excludingWindows: [])
+        try await begin(SCContentFilter(display: display, excludingWindows: []), config, audio: audio)
+    }
+
+    private static func configuration(width: Int, height: Int, fps: Int, audio: Bool) -> SCStreamConfiguration {
+        let config = SCStreamConfiguration()
+        config.width = width
+        config.height = height
+        config.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(fps))
+        config.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        config.queueDepth = 2
+        config.showsCursor = true
+        config.capturesAudio = audio
+        if audio {
+            config.sampleRate = 48_000
+            config.channelCount = 2
+            // Do not feed our own playback back into the stream (the receiver may echo).
+            if #available(macOS 13.0, *) { config.excludesCurrentProcessAudio = true }
+        }
+        return config
+    }
+
+    private func begin(_ filter: SCContentFilter, _ config: SCStreamConfiguration, audio: Bool) async throws {
         let stream = SCStream(filter: filter, configuration: config, delegate: self)
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: queue)
         if audio {
@@ -213,10 +245,12 @@ public enum CaptureError: Error, LocalizedError {
     case noDisplays
     case noContent
     case badDisplay(Int, Int)
+    case noWindow
 
     public var errorDescription: String? {
         switch self {
         case .noDisplays: return "no displays to capture"
+        case .noWindow: return "the window is gone (closed or minimized)"
         case .noContent: return "ScreenCaptureKit returned no content (screen recording permission?)"
         case let .badDisplay(index, count): return "display \(index) does not exist (\(count) available)"
         }

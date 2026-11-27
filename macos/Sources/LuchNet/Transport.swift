@@ -8,11 +8,16 @@ import LuchProto
 
 public final class UdpSender {
     public let kind: MediaKind
-    private let fd: Int32
+    /// Also read by ClockResponder (the receiver's clock requests come back on this socket).
+    let fd: Int32
     /// The session's media key (from `ready` over TLS); nil for an older receiver, whose media is plain.
     private let seal: MediaSeal?
     private let lock = NSLock()
     private var seq: UInt32 = 0
+    /// The playout delay D (0.1 ms) every packet from now on carries; 0 outside a group (PROTOCOL.md 4k).
+    private var delay: UInt16 = 0
+    /// A group's stream: its first frame says its pts start anew.
+    private var timeline = false
     private var bytesSent: UInt64 = 0
     private var framesSent: UInt64 = 0
     private var latencySum: UInt64 = 0
@@ -87,6 +92,8 @@ public final class UdpSender {
         lock.lock()
         let sq = seq
         seq &+= 1
+        let d = delay
+        let flags = sq == 0 && timeline ? flags.union(.timeline) : flags
         lock.unlock()
 
         // Sealed, the frame on the wire is the ciphertext and its tag, and every header says that length.
@@ -94,7 +101,7 @@ public final class UdpSender {
         let shards = UInt16((length + Proto.shardSize - 1) / Proto.shardSize)
         func header(_ shard: Int) -> [UInt8] {
             Proto.header(kind: kind, flags: flags, shard: UInt16(shard), shards: shards,
-                         seq: sq, ptsUS: ptsUS, frameLen: UInt32(length), hostLat: hostLat)
+                         seq: sq, ptsUS: ptsUS, frameLen: UInt32(length), hostLat: hostLat, delay: d)
         }
         let body = seal.map { $0.seal(header: header(0), frame: frame) } ?? frame
         let chunks = Proto.shards(body)
@@ -127,6 +134,31 @@ public final class UdpSender {
         latencySum &+= UInt64(hostLat)
         lock.unlock()
         return ok
+    }
+
+    /// A datagram coming back on this flow (the socket is connected: only the receiver's video socket gets in): its
+    /// input (PROTOCOL.md 4i). Waits up to `timeoutMs`; 0 when none came, -1 when the socket is gone.
+    public func receive(into buf: inout [UInt8], timeoutMs: Int32) -> Int {
+        var pfd = pollfd(fd: fd, events: Int16(POLLIN), revents: 0)
+        guard poll(&pfd, 1, timeoutMs) > 0 else { return 0 }
+        let n = buf.withUnsafeMutableBytes { recv(fd, $0.baseAddress, $0.count, 0) }
+        // ECONNREFUSED: an ICMP error on the connected socket, the receiver gone for a moment.
+        if n < 0 { return errno == ECONNREFUSED || errno == EINTR ? 0 : -1 }
+        return n
+    }
+
+    /// Sets D (0.1 ms) for the packets from the next frame on: one step, the same frame everywhere.
+    public func setDelay(_ units: UInt16) {
+        lock.lock()
+        delay = units
+        lock.unlock()
+    }
+
+    /// This stream plays to a group: its first frame carries the new-timeline flag.
+    public func startTimeline() {
+        lock.lock()
+        timeline = true
+        lock.unlock()
     }
 
     public func snapshot() -> Snapshot {

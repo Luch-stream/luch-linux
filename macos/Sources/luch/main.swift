@@ -131,16 +131,15 @@ func runList(seconds: Double) {
 func resolveReceiver(_ a: Args) -> Receiver? {
     if let ip = a.ip {
         let index = a.iface.map { if_nametoindex($0) } ?? lanInterfaceIndex()
-        var r = Receiver(id: "manual", name: ip, model: "", address: ip,
-                         interfaceName: a.iface ?? "", interfaceIndex: index, port: a.port, service: ip)
         // No TXT record to say it: the receiver's id and TLS port from a probe, which shows nothing on the TV.
         let me = senderIdentity()
-        if let w = Connector.probe(r, id: me.id, name: me.name) {
-            r.id = w["id"] as? String ?? r.id
-            r.name = w["name"] as? String ?? r.name
-            r.tlsPort = (w["tls_port"] as? NSNumber)?.uint16Value ?? 0
+        if let a32 = parseIPv4(ip),
+           let w = probe(a32, a.port, ifindex: index, me: ProbeIdentity(id: me.id, name: me.name), connectTimeout: 2),
+           let r = receiverFrom(welcome: w, ip: a32, port: a.port, ifname: a.iface ?? "", ifindex: index) {
+            return r
         }
-        return r
+        return Receiver(id: "manual", name: ip, model: "", address: ip,
+                        interfaceName: a.iface ?? "", interfaceIndex: index, port: a.port, service: ip)
     }
     let discovery = Discovery()
     discovery.start()

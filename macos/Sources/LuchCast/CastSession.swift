@@ -20,6 +20,8 @@ public final class CastSession {
     public var onShowing: (() -> Void)?
     private var shown: String?
     private var volumeNow: [String: Any]?
+    /// Every message from the receiver, and {"t":"stop"} when what it shows for us ends (the presenter view).
+    public var onMessage: (([String: Any]) -> Void)?
 
     /// The receiver's volume as it last said ({"level":N,"muted":B}); nil when it keeps its volume to itself.
     public var currentVolume: [String: Any]? {
@@ -71,6 +73,7 @@ public final class CastSession {
     }
 
     private func event(_ m: [String: Any]) {
+        if m["t"] as? String != "stop" { onMessage?(m) }
         switch m["t"] as? String ?? "" {
         case "media_state":
             lock.lock()
@@ -115,6 +118,7 @@ public final class CastSession {
         shown = nil
         docPages = (0, 0)
         lock.unlock()
+        onMessage?(["t": "stop", "reason": reason])
         if was != nil { onShowing?() }
         if had { onState?(["t": "media_state", "state": "stopped", "reason": reason]) }
     }
@@ -154,6 +158,12 @@ public final class CastSession {
         lock.unlock()
         onShowing?()
         return kind
+    }
+
+    /// Pointer, ink, blank and page turns (PROTOCOL.md 4h): on this channel, as only the sender of what is shown may
+    /// draw on it.
+    public func send(_ m: [String: Any]) {
+        ctl.send(m)
     }
 
     public func command(_ cmd: [String: Any]) {

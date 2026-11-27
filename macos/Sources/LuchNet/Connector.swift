@@ -48,6 +48,9 @@ public final class Connector {
     /// Pairing with a receiver moved on (id, state as in `pairing`): "allow", "code", "paired" or "failed". Called on
     /// any thread; the app shows the code window from it, as GNOME does from luchd's PairChanged.
     public var onPairChanged: ((String, [String: Any]) -> Void)?
+    /// The one-time pairing token a QR code or the TV's sound gave for a receiver id, used up by the hello that takes
+    /// it (PROTOCOL.md 1e; the app's Finder keeps them).
+    public var takeToken: ((String) -> String?)?
 
     init(dir: URL = supportDirectory(), certificate: @escaping () throws -> SenderCertificate = SenderCertificate.shared) {
         self.dir = dir
@@ -107,7 +110,9 @@ public final class Connector {
             // No pin yet: pair even if the receiver knows this Mac (it may have forgotten its key here).
             if pinned == nil { h["pair"] = true }
         }
-        if let token { h["token"] = token }
+        // A token is good for one hello only: on the plain port it stands for the Allow on the TV; over TLS the
+        // receiver uses it up and still asks for its code.
+        if let token = token ?? takeToken?(r.id) { h["token"] = token }
         ctl.send(h)
         guard let first = ctl.waitForAny(["welcome", "pair", "pair_refused"], timeout: timeout) else {
             ctl.closeChannel("no welcome")
@@ -136,17 +141,6 @@ public final class Connector {
             ctl.closeChannel("refused")
             throw ConnectError.refused(Pairing.explain(Pairing.refused(first), tv: r.name))
         }
-    }
-
-    /// Who answers on a receiver's plain port: the welcome of a probe hello (PROTOCOL.md 1b), which shows nothing
-    /// on the TV. Its `tls_port` is the TLS port of a receiver found without its TXT record.
-    public static func probe(_ r: Receiver, id: String, name: String, timeout: TimeInterval = 2) -> [String: Any]? {
-        guard let ctl = ControlChannel.open(ip: r.address, port: r.port, interfaceIndex: r.interfaceIndex,
-                                            timeout: timeout) else { return nil }
-        defer { ctl.bye() }
-        ctl.send(["t": "hello", "v": Int(Proto.version), "id": id, "name": name, "app": Proto.app, "want": [String](),
-                  "probe": true])
-        return ctl.waitFor("welcome", timeout: timeout)
     }
 
     // MARK: - pairing

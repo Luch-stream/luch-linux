@@ -66,6 +66,22 @@ final class PairingFlowTests: XCTestCase {
         c.channel.bye()
     }
 
+    /// A QR code's or the TV's sound's token goes into the next hello, once (PROTOCOL.md 1e).
+    func testTheTokenGoesIntoOneHello() throws {
+        var tokens = ["tv-1": "0badf00d"]
+        connector.takeToken = { tokens.removeValue(forKey: $0) }
+        XCTAssertThrowsError(try connector.open(receiver, hello: hello))
+        XCTAssertEqual(tv.messages.first?["token"] as? String, "0badf00d")
+        XCTAssertTrue(tokens.isEmpty, "used up")
+    }
+
+    /// A receiver found by the sweep, Bluetooth, sound or a QR code is reached over TLS: its welcome names the port.
+    func testAReceiverFoundWithoutTXTKeepsItsTLSPort() throws {
+        let w: [String: Any] = ["t": "welcome", "v": 0, "id": "tv-1", "name": "Living room TV", "tls_port": 47802]
+        let r = try XCTUnwrap(receiverFrom(welcome: w, ip: 0x7f00_0001, port: 47800, ifname: "lo0", ifindex: 1))
+        XCTAssertEqual(r.tlsPort, 47802)
+    }
+
     func testAWrongCodeIsRefusedAndNothingPinned() throws {
         XCTAssertThrowsError(try connector.open(receiver, hello: hello))
         XCTAssertThrowsError(try connector.pair("tv-1", code: "000000")) { e in
