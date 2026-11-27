@@ -30,7 +30,7 @@ const T = RU ? {go:'Смотреть', hint:'Нажмите, чтобы прин
 const $ = id => document.getElementById(id);
 // Luch datagram header, 24 bytes big-endian: kind, flags, idx, shards, parity, seq, pts_us, len, host_lat.
 const head = b => ({kind: b[0], flags: b[1], pts: (b[12]<<24|b[13]<<16|b[14]<<8|b[15])>>>0, len: b[16]<<24|b[17]<<16|b[18]<<8|b[19]});
-let ws, vdec, adec, actx, at = 0, wrap = 0, lastPts = -1, stopping = false, stat = null;
+let ws, vdec, adec, actx, at = 0, wrap = 0, lastPts = -1, stopping = false, stat = null, lastKf = 0;
 
 $('go').textContent = T.go;
 $('hint').textContent = T.hint;
@@ -90,6 +90,16 @@ function setStreaming(active) {
   }
 }
 document.addEventListener('visibilitychange', keepScreenOn);
+// A hidden tab is throttled by the browser (Firefox/Zen): decoding there only builds a
+// backlog that shows up as stutter on return. Skip video while hidden, and on return
+// start over from a keyframe.
+let hidden = document.visibilityState !== 'visible';
+document.addEventListener('visibilitychange', () => {
+  hidden = document.visibilityState !== 'visible';
+  // A throttled tab also leaves its decoder idle: release it and start over on return.
+  if (hidden) dropDecoder();
+  else if (streaming) { needKey = true; lastKf = 0; askKeyframe(); }
+});
 addEventListener('pagehide', () => setStreaming(false));
 
 function start() {
@@ -106,14 +116,15 @@ function start() {
 }
 
 function reset() {
-  vdec = null; adec = null; sps = null; wrap = 0; lastPts = -1; stat = null;
+  dropDecoder(); adec = null; sps = null; wrap = 0; lastPts = -1; stat = null; lastKf = 0;
+  needKey = false;
   at = actx ? actx.currentTime : 0;
   $('msg').style.display = 'none';
   // The daemon waits 5 s for this; without it the socket closes -> "connection lost".
   const ua = /\b(Chrome|Firefox|Safari)\/[\d.]+/.exec(navigator.userAgent);
   send({t: 'hello', v: 0, name: 'Web', model: ua ? ua[0] : navigator.userAgent.slice(0, 30),
         display: {width: Math.round(screen.width * devicePixelRatio), height: Math.round(screen.height * devicePixelRatio)},
-        mode: new URLSearchParams(location.search).get('mode') || 'fast'});
+        mode: new URLSearchParams(location.search).get('mode') || 'monitor'});
 }
 
 function ctrl(m) {
@@ -121,6 +132,7 @@ function ctrl(m) {
     case 'start':
       setStreaming(true);
       send({t: 'ready', video_port: 0, audio_port: 0});
+      lastKf = Date.now();
       send({t: 'keyframe'});                      // begin with a clean IDR
       break;
     case 'ping': send({t: 'pong', n: m.n}); break;
@@ -138,8 +150,11 @@ function media(b) {
   if (h.kind === 1) video(h, d, ts); else if (h.kind === 2) audio(h, d, ts);
 }
 
-// ---- video: H.264 annexb, SPS/PPS in-band in every IDR ----
+// ---- video: H.264 Annex B, exactly as the wire carries it ----
+// W3C AVC WebCodecs registration: without a `description` the bitstream is Annex B, and a
+// key chunk carries the IDR plus its parameter sets. No conversion, no browser sniffing.
 let sps = null;
+let needKey = false;                              // decoder backed up: resume on a keyframe
 function codecOf(d) {                             // find the first SPS NAL, read profile/constraint/level
   for (let i = 0; i < d.length - 7; i++) {
     if (d[i] | d[i+1] | (d[i+2] !== 1 ? 1 : 0)) continue;
@@ -147,17 +162,54 @@ function codecOf(d) {                             // find the first SPS NAL, rea
   }
   return null;
 }
-function bail(e) { console.error(e); vdec = null; sps = null; send({t: 'keyframe'}); }
+// WebCodecs decoders hold hardware resources until closed; dropping the reference only
+// defers that to GC, and some platforms cap open decoders.
+function dropDecoder() {
+  if (!vdec) return;
+  try { vdec.close(); } catch {}
+  vdec = null;
+}
+function bail(e) { console.error(e); dropDecoder(); sps = null; askKeyframe(); }
+// One IDR is a large frame for the whole group: ask at most once per 2 s.
+function askKeyframe() {
+  if (Date.now() - lastKf < 2000) return;
+  lastKf = Date.now();
+  send({t: 'keyframe'});
+}
 function video(h, d, ts) {
-  if (h.flags & 1 && !sps) sps = codecOf(d);
+  if (hidden) return; // no decoding in a throttled background tab; see visibilitychange
+  const key = !!(h.flags & 1);
+  if (key && !sps) sps = codecOf(d);
   if (!vdec && sps) {
-    vdec = new VideoDecoder({output: draw, error: bail});
-    vdec.configure({codec: 'avc1.' + [...sps].map(x => x.toString(16).padStart(2, '0')).join(''),
-                    optimizeForLatency: true});
+    // W3C AVC WebCodecs registration: without a description the stream is Annex B and a key
+    // chunk carries the IDR with its parameter sets — exactly what the wire delivers.
+    const conf = {codec: 'avc1.' + [...sps].map(x => x.toString(16).padStart(2, '0')).join(''),
+                  optimizeForLatency: true};
+    try {
+      vdec = new VideoDecoder({output: draw, error: bail});
+      vdec.configure(conf);
+      // WebCodecs requires a key frame as the first chunk after configure(); a delta here
+      // would throw ("A key frame is required after configure()"). Gate until one arrives.
+      needKey = true;
+    } catch (e) {
+      dropDecoder();
+      askKeyframe();
+    }
   }
-  if (vdec && vdec.state === 'configured')
-    try { vdec.decode(new EncodedVideoChunk({type: h.flags & 1 ? 'key' : 'delta', timestamp: ts, data: d})); }
+  if (!vdec) { askKeyframe(); return; }
+  if (vdec.state === 'configured') {
+    // A decoder that cannot keep up would queue forever and latency would grow without
+    // bound (1080p144 is too much for some software decoders). Recover through the group
+    // keyframe: while backed up, skip deltas entirely and resume only on a keyframe —
+    // resuming mid-GOP would show corrupt macroblocks.
+    if (needKey) {
+      if (!key) { askKeyframe(); return; }
+      needKey = false;
+    }
+    try { vdec.decode(new EncodedVideoChunk({type: key ? 'key' : 'delta', timestamp: ts, data: d})); }
     catch (e) { bail(e); }
+    if (vdec && vdec.decodeQueueSize > 8) { needKey = true; askKeyframe(); }
+  }
 }
 function draw(f) {
   const c = document.querySelector('canvas');
@@ -190,6 +242,7 @@ function play(ad) {
   const src = actx.createBufferSource();
   src.buffer = buf; src.connect(actx.destination);
   if (at < actx.currentTime) at = actx.currentTime + 0.02;  // dropped behind: skip instead of drift
+  else if (at > actx.currentTime + 0.25) at = actx.currentTime + 0.02; // burst ran ahead: resync, don't accumulate
   src.start(at); at += buf.duration;
 }
 

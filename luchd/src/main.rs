@@ -13,16 +13,26 @@ mod volume;
 mod wake;
 mod web_tls;
 
-use std::{collections::HashMap, error::Error, io, net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    error::Error,
+    io,
+    net::SocketAddr,
+    sync::{atomic::Ordering, Arc},
+    time::Duration,
+};
 
 use futures_util::{SinkExt, StreamExt};
 use luch_proto::{self as p, ReceiverRow};
-use mirror::Cmd;
+use mirror::{
+    group::{GroupParams, MirrorGroup, NewReceiver},
+    Cmd,
+};
 use serde_json::{json, Value};
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
     net::{tcp::OwnedWriteHalf, TcpSocket},
-    sync::{broadcast, mpsc, Mutex},
+    sync::{broadcast, mpsc, Mutex, Notify},
     time::{timeout, Instant},
 };
 use tokio_tungstenite::{accept_async, tungstenite::Message, WebSocketStream};
@@ -56,20 +66,30 @@ struct Receiver {
 struct Conn {
     cmd: mpsc::Sender<Cmd>,
     events: broadcast::Sender<Value>,
-    /// Web receiver only: media frames (header + data) to its websocket writer task.
-    media: Option<mpsc::Sender<Vec<u8>>>,
+    /// Web receiver only: media frames (header + data) to its websocket writer task,
+    /// in two bounded queues so sound cannot crowd video out of the shared socket.
+    media: Option<mirror::group::WsMedia>,
     /// This machine's and the receiver's address on the control connection: what a receiver fetches cast files from,
     /// and whom they are served to. None for the web receiver.
     addrs: Option<(std::net::IpAddr, std::net::IpAddr)>,
 }
 
+/// A group owned by the manager. The slot lives in `State.groups` for the group's whole
+/// life; the Option inside is taken out only by whoever stops the group (a D-Bus method
+/// or the group watcher), so a group can never be stopped twice and a stop never races
+/// an in-flight add/remove (they hold the same per-group lock — the global state lock is
+/// never held across a network operation).
+type GroupSlot = Arc<Mutex<Option<MirrorGroup>>>;
+
 #[derive(Default)]
 struct State {
     found: HashMap<String, Receiver>,
     conns: HashMap<String, Conn>,
-    mirrors: HashMap<String, mpsc::Sender<()>>, // id -> stop signal
-    stats: HashMap<String, mirror::Stats>,      // id -> live mirroring stats
-    welcomes: HashMap<String, Value>,           // id -> last welcome (hw passport, decoder bench)
+    groups: HashMap<String, GroupSlot>, // group id -> running group
+    mirrors: HashMap<String, String>,   // receiver id -> group id
+    /// Last encoder counters per receiver, for the per-second deltas of D-Bus `Stats`.
+    stats_snap: HashMap<String, (u64, u64, u64, tokio::time::Instant)>, // receiver id -> (frames, bytes, lat_sum, at)
+    welcomes: HashMap<String, Value>, // id -> last welcome (hw passport, decoder bench)
     codec: HashMap<String, String>, // id -> "auto" | "avc" | "hevc": a person's choice of the video codec
     audio: HashMap<String, String>, // id -> "auto" | "on" | "off" | "sync": a person's choice of the sound
     playing: HashMap<String, Value>, // id -> last media_state of what it plays for us (PROTOCOL.md 4b)
@@ -77,6 +97,9 @@ struct State {
     docs: HashMap<String, (u64, u64)>, // id -> (page, pages) of the document it shows for us (4g)
     /// Receivers we stopped: a report still on its way is no longer news, until the next media_ready.
     stopped: std::collections::HashSet<String>,
+    /// Receiver ids reserved for a group that is being created: the check and the take
+    /// happen under one lock, so two D-Bus calls cannot both start mirroring to them.
+    starting: std::collections::HashSet<String>,
 }
 type Shared = Arc<Mutex<State>>;
 
@@ -228,10 +251,8 @@ impl Luch {
                 "bad size {width}x{height}"
             )));
         }
-        if !self.st.lock().await.conns.contains_key(&id) {
-            self.connect(id.clone(), conn).await?;
-        }
-        start_mirror(&self.st, conn, &id, &source, (width, height)).await
+        ensure_connected(self, &id, conn).await?;
+        start_mirror(&self.st, conn, &id, &source, (width, height), mirror::fps()).await
     }
 
     /// Capture sources usable on this machine, best first (`fast`, `fast169`, `virtual`, `monitor`, `window`).
@@ -251,13 +272,6 @@ impl Luch {
             .welcomes
             .get(&id)
             .map(|w| w.to_string())
-            .unwrap_or_else(|| "{}".into())
-    }
-
-    /// Live mirroring numbers as JSON (sender side + the receiver's last stats), "{}" if idle.
-    async fn stats(&self, id: String) -> String {
-        let s = self.st.lock().await.stats.get(&id).cloned();
-        s.map(|s| s.lock().unwrap().to_string())
             .unwrap_or_else(|| "{}".into())
     }
 
@@ -424,10 +438,232 @@ impl Luch {
         wake::set(&id, &kind, &value).map_err(fdo::Error::InvalidArgs)
     }
 
-    async fn stop_mirror(&self, id: String) -> fdo::Result<()> {
-        let tx = self.st.lock().await.mirrors.get(&id).cloned();
-        let tx = tx.ok_or_else(|| fdo::Error::InvalidArgs(format!("not mirroring: {id}")))?;
-        let _ = tx.send(()).await;
+    /// Live mirroring numbers as JSON (sender side + the receiver's last stats), "{}" if idle.
+    /// Same shape the pre-group daemon produced: {"sender": ..., "receiver": ..., "est_ms": ...};
+    /// sender fps/mbps/host_ms are per-second deltas between calls (the client polls once a second).
+    async fn stats(&self, id: String) -> String {
+        let slot = {
+            let s = self.st.lock().await;
+            s.mirrors.get(&id).and_then(|g| s.groups.get(g).cloned())
+        };
+        let Some(slot) = slot else {
+            return "{}".into();
+        };
+        let mut guard = slot.lock().await;
+        let Some(g) = guard.as_mut() else {
+            return "{}".into();
+        };
+        g.reap();
+        let (frames, bytes, lat) = {
+            let c = g.enc_counters();
+            (
+                c.frames.load(Ordering::Relaxed),
+                c.bytes.load(Ordering::Relaxed),
+                c.lat_sum.load(Ordering::Relaxed),
+            )
+        };
+        let Some(r) = g.receivers().find(|r| r.id == id) else {
+            return "{}".into();
+        };
+        // Per-receiver baselines: two receivers of one group polled in the same second
+        // must each see their own delta, not steal each other's. Rates are divided by the
+        // real time between polls, so a late or first poll cannot report nonsense like
+        // "96011 fps".
+        let now = tokio::time::Instant::now();
+        let last = self
+            .st
+            .lock()
+            .await
+            .stats_snap
+            .insert(id.clone(), (frames, bytes, lat, now));
+        let (df, host_ms, mbps) = match last {
+            Some((pf, pb, pl, at)) => {
+                let secs = now.duration_since(at).as_secs_f64().max(1e-3);
+                let df = frames.saturating_sub(pf);
+                let host_ms = if df > 0 {
+                    lat.saturating_sub(pl) as f64 / df as f64 / 10.0
+                } else {
+                    0.0
+                };
+                (
+                    df as f64 / secs,
+                    host_ms,
+                    bytes.saturating_sub(pb) as f64 * 8.0 / 1e6 / secs,
+                )
+            }
+            None => (0.0, 0.0, 0.0), // first poll: nothing to compare against yet
+        };
+        let rx = r.rx_stats.lock().unwrap().clone();
+        let rtt = r.rtt_ms();
+        // Rough glass-to-glass estimate without the display: capture+encode + one-way network + decode.
+        let est = host_ms + rtt / 2.0 + rx["decode_ms"].as_f64().unwrap_or(0.0);
+        let sender = mirror::stats::sender_stats_json(
+            g.codec() == "video/hevc",
+            g.size(),
+            df,
+            mbps,
+            host_ms,
+            rtt,
+            g.virtual_monitor(),
+        );
+        json!({"sender": sender, "receiver": rx, "est_ms": mirror::round1(est)}).to_string()
+    }
+
+    /// Group numbers as JSON (source, codec, resolution, receivers, encoder counters),
+    /// "{}" for an unknown group.
+    async fn group_stats(&self, group_id: String) -> String {
+        let slot = self.st.lock().await.groups.get(&group_id).cloned();
+        if let Some(slot) = slot {
+            if let Some(g) = slot.lock().await.as_ref() {
+                let mut v = g.stats_json();
+                v["receiver_stats"] = json!(g
+                    .receivers()
+                    .map(mirror::stats::receiver_stats_json)
+                    .collect::<Vec<_>>());
+                return v.to_string();
+            }
+        }
+        "{}".into()
+    }
+
+    /// Stop the whole group the receiver is mirroring from (a plain Mirror is a group of one).
+    async fn stop_mirror(
+        &self,
+        id: String,
+        #[zbus(connection)] conn: &Connection,
+    ) -> fdo::Result<()> {
+        let gid = self.st.lock().await.mirrors.get(&id).cloned();
+        let gid = gid.ok_or_else(|| fdo::Error::InvalidArgs(format!("not mirroring: {id}")))?;
+        self.stop_group(gid, conn).await
+    }
+
+    async fn stop_group(
+        &self,
+        group_id: String,
+        #[zbus(connection)] conn: &Connection,
+    ) -> fdo::Result<()> {
+        let slot = self.st.lock().await.groups.get(&group_id).cloned();
+        let slot =
+            slot.ok_or_else(|| fdo::Error::InvalidArgs(format!("unknown group: {group_id}")))?;
+        let group = slot
+            .lock()
+            .await
+            .take()
+            .ok_or_else(|| fdo::Error::Failed(format!("group already stopping: {group_id}")))?;
+        {
+            let mut s = self.st.lock().await;
+            s.groups.remove(&group_id);
+            s.mirrors.retain(|_, g| *g != group_id);
+            let State {
+                mirrors,
+                stats_snap,
+                ..
+            } = &mut *s;
+            stats_snap.retain(|rid, _| mirrors.contains_key(rid));
+        }
+        group.stop().await;
+        changed(conn).await;
+        Ok(())
+    }
+
+    /// Mirror one source to several receivers at once (connecting them first if needed):
+    /// one capture, one encoder, an independent stream per receiver. Returns the group id.
+    /// Stream rate: `LUCH_FPS` (default 60); use `MirrorGroupFps` to choose per group.
+    async fn mirror_group(
+        &self,
+        receiver_ids: Vec<String>,
+        source: String,
+        #[zbus(connection)] conn: &Connection,
+    ) -> fdo::Result<String> {
+        start_group_shared(self, receiver_ids, source, mirror::fps(), conn).await
+    }
+
+    /// Like `MirrorGroup`, with the stream rate chosen for the group: 0 keeps the
+    /// screen's own rate (game streaming to one capable device), otherwise 30 or 60.
+    /// The profile is fixed at creation (spec §14).
+    async fn mirror_group_fps(
+        &self,
+        receiver_ids: Vec<String>,
+        source: String,
+        fps: u32,
+        #[zbus(connection)] conn: &Connection,
+    ) -> fdo::Result<String> {
+        let fps = check_fps(fps)?;
+        start_group_shared(self, receiver_ids, source, fps, conn).await
+    }
+
+    /// `Mirror` for a single receiver with an explicit stream rate (0 = the screen's rate).
+    async fn mirror_at(
+        &self,
+        id: String,
+        source: String,
+        fps: u32,
+        #[zbus(connection)] conn: &Connection,
+    ) -> fdo::Result<()> {
+        let fps = check_fps(fps)?;
+        ensure_connected(self, &id, conn).await?;
+        start_mirror(&self.st, conn, &id, &source, (0, 0), fps).await
+    }
+
+    /// Add a receiver to a running group (connecting it first if needed). The group's codec
+    /// profile is fixed at creation: a HEVC group rejects a receiver that prefers H.264.
+    async fn add_to_group(
+        &self,
+        group_id: String,
+        receiver_id: String,
+        #[zbus(connection)] conn: &Connection,
+    ) -> fdo::Result<()> {
+        attach_to_group(&self.st, conn, &group_id, &receiver_id).await
+    }
+
+    /// Detach a receiver from its group; the rest keep streaming. A group that loses its
+    /// last receiver stops.
+    async fn remove_from_group(
+        &self,
+        group_id: String,
+        receiver_id: String,
+        #[zbus(connection)] conn: &Connection,
+    ) -> fdo::Result<()> {
+        let slot = self.st.lock().await.groups.get(&group_id).cloned();
+        let slot =
+            slot.ok_or_else(|| fdo::Error::InvalidArgs(format!("unknown group: {group_id}")))?;
+        let mut guard = slot.lock().await;
+        let g = guard
+            .as_mut()
+            .ok_or_else(|| fdo::Error::Failed(format!("group stopped: {group_id}")))?;
+        g.reap();
+        if !g.receivers().any(|r| r.id == receiver_id) {
+            return Err(fdo::Error::InvalidArgs(format!(
+                "not in group {group_id}: {receiver_id}"
+            )));
+        }
+        g.remove(&receiver_id).await.map_err(fdo::Error::Failed)?;
+        let group = if g.receiver_count() == 0 {
+            guard.take()
+        } else {
+            None
+        };
+        drop(guard);
+        {
+            let mut s = self.st.lock().await;
+            s.mirrors.remove(&receiver_id);
+            s.stats_snap.remove(&receiver_id);
+        }
+        if let Some(group) = group {
+            {
+                let mut s = self.st.lock().await;
+                s.groups.remove(&group_id);
+                s.mirrors.retain(|_, gid| *gid != group_id);
+                let State {
+                    mirrors,
+                    stats_snap,
+                    ..
+                } = &mut *s;
+                stats_snap.retain(|rid, _| mirrors.contains_key(rid));
+            }
+            group.stop().await;
+        }
+        changed(conn).await;
         Ok(())
     }
 
@@ -1080,19 +1316,42 @@ async fn media_changed(conn: &Connection, id: &str, state: &Value) {
 
 // ---------- mirroring ----------
 
-/// Body of the D-Bus `Mirror` method and of the web receiver's auto-start: one session to `id`.
-async fn start_mirror(
-    st: &Shared,
-    conn: &Connection,
-    id: &str,
-    source: &str,
-    requested: (u32, u32),
-) -> fdo::Result<()> {
+/// Stream rate argument: 0 = the screen's own rate (no cap), 60 or 30.
+fn check_fps(fps: u32) -> fdo::Result<u32> {
+    if mirror::allowed_fps(fps) {
+        Ok(fps)
+    } else {
+        Err(fdo::Error::InvalidArgs(format!(
+            "fps must be 0 (the screen's own rate), 60 or 30, not {fps}"
+        )))
+    }
+}
+
+/// Open the control channel first when the receiver is not connected yet.
+async fn ensure_connected(luch: &Luch, id: &str, conn: &Connection) -> fdo::Result<()> {
+    if !luch.st.lock().await.conns.contains_key(id) {
+        luch.connect(id.to_string(), conn).await?;
+    }
+    Ok(())
+}
+
+/// Capture parameters of a group from a `source` name ("fast", "fast169", "monitor",
+/// "window", "virtual"), an explicitly requested size ((0, 0) = automatic) and a welcome
+/// to take sizing hints from (`max` caps `LUCH_SIZE`, display modes seed "virtual").
+fn group_params(source: &str, requested: (u32, u32), welcome: &Value) -> fdo::Result<GroupParams> {
     let mirror169 = source == "fast169";
     let audio_only = source == "audio";
     let kms = source == "fast" || mirror169;
     let niri_virtual = source == "virtual" && mirror::niri_virtual_available();
-    let source = match source {
+    // Say what is actually wrong when the host cannot do the requested source (the KMS
+    // helper is a separate binary), instead of failing later with "No such file".
+    if kms && !mirror::available_sources().contains(&source) {
+        return Err(fdo::Error::Failed(format!(
+            "source '{source}' is not available here: luch-kms was not found; available: {}",
+            mirror::available_sources().join(", ")
+        )));
+    }
+    let source_ty = match source {
         "" | "monitor" | "fast" | "fast169" | "audio" => {
             ashpd::desktop::screencast::SourceType::MONITOR
         }
@@ -1104,20 +1363,48 @@ async fn start_mirror(
             )))
         }
     };
-    if st.lock().await.mirrors.contains_key(id) {
-        return Err(fdo::Error::Failed(format!("already mirroring to {id}")));
-    }
-    let (c, r, welcome) = {
-        let s = st.lock().await;
-        (
-            s.conns.get(id).cloned(),
-            s.found.get(id).cloned(),
-            s.welcomes.get(id).cloned().unwrap_or(Value::Null),
-        )
+    let size = if requested != (0, 0) {
+        display::Size {
+            width: requested.0,
+            height: requested.1,
+        }
+    } else if std::env::var("LUCH_SIZE")
+        .ok()
+        .is_some_and(|v| !v.trim().is_empty())
+    {
+        let (width, height) = mirror::session_size(
+            std::env::var("LUCH_SIZE").ok().as_deref(),
+            welcome["max"].as_str(),
+        );
+        display::Size { width, height }
+    } else if source_ty == ashpd::desktop::screencast::SourceType::VIRTUAL {
+        display::native_size(welcome).unwrap_or_default()
+    } else {
+        display::Size::default()
     };
-    let (c, r) = c
-        .zip(r)
+    Ok(GroupParams {
+        source: source_ty,
+        size,
+        kms,
+        mirror169,
+        niri_virtual,
+        fps: mirror::fps(), // per-group override lands in start_group
+        audio_only,
+        audio: None, // start_group fills it from the initiating receiver's sound mode
+    })
+}
+
+/// A receiver ready to join a group, built from the connection layer's state. The
+/// `events` sender clone is dropped when the group consumes it, so the group's task
+/// still sees the channel close when the receiver goes away.
+fn build_receiver(s: &State, id: &str) -> fdo::Result<NewReceiver> {
+    let (c, r) = s
+        .conns
+        .get(id)
+        .cloned()
+        .zip(s.found.get(id).cloned())
         .ok_or_else(|| fdo::Error::Failed("receiver went away".into()))?;
+    let welcome = s.welcomes.get(id).cloned().unwrap_or(Value::Null);
     // HEVC carries the same picture in less data. The receiver's own pick favours H.264 unless HEVC is clearly faster
     // to decode; here HEVC also wins when it decodes about as fast (within 1 ms), as long as the receiver has a decoder
     // for it and its bench ran. A person's choice (SetCodec) beats both.
@@ -1125,7 +1412,7 @@ async fn start_mirror(
     let has_hevc = welcome["decoders"]
         .as_array()
         .is_some_and(|d| d.iter().any(|m| m.as_str() == Some("video/hevc")));
-    let chosen = match st.lock().await.codec.get(id).cloned() {
+    let chosen = match s.codec.get(id).cloned() {
         Some(c) => c,
         None => saved_codecs().get(id).cloned().unwrap_or_default(),
     };
@@ -1142,34 +1429,194 @@ async fn start_mirror(
             .unwrap_or("video/avc")
             .to_string(),
     };
-    let size = if requested != (0, 0) {
-        display::Size {
-            width: requested.0,
-            height: requested.1,
+    let address = r
+        .address
+        .parse()
+        .map_err(|_| fdo::Error::Failed(format!("not IPv4: {}", r.address)))?;
+    Ok(NewReceiver {
+        id: id.to_string(),
+        name: r.name,
+        address,
+        ifname: r.ifname,
+        prefer,
+        ws: c.media,
+        cmd: c.cmd,
+        events: c.events,
+    })
+}
+
+/// Body of D-Bus `AddToGroup` and of the web receiver's auto-join: put an already
+/// connected receiver into a running group (shared capture/encoder, spec §12).
+async fn attach_to_group(
+    st: &Shared,
+    conn: &Connection,
+    group_id: &str,
+    receiver_id: &str,
+) -> fdo::Result<()> {
+    let slot = st.lock().await.groups.get(group_id).cloned();
+    let slot = slot.ok_or_else(|| fdo::Error::InvalidArgs(format!("unknown group: {group_id}")))?;
+    reserve_attach(st, receiver_id).await?;
+    let built = {
+        let s = st.lock().await;
+        build_receiver(&s, receiver_id)
+    };
+    let recv = match built {
+        Ok(r) => r,
+        Err(e) => {
+            st.lock().await.starting.remove(receiver_id);
+            return Err(e);
         }
-    } else if std::env::var("LUCH_SIZE")
-        .ok()
-        .is_some_and(|v| !v.trim().is_empty())
-    {
-        let (width, height) = mirror::session_size(
-            std::env::var("LUCH_SIZE").ok().as_deref(),
-            welcome["max"].as_str(),
-        );
-        display::Size { width, height }
-    } else if source == ashpd::desktop::screencast::SourceType::VIRTUAL {
-        display::native_size(&welcome).unwrap_or_default()
-    } else {
-        display::Size::default()
     };
-    let ws = c.media.clone();
+    // Under the slot guard (slot→state order, the same one the watcher takes): a stop that
+    // took the group while `add` was handshaking can no longer slip in before the mirror
+    // entry and leave it pointing at a group that no longer exists.
+    let res = {
+        let mut guard = slot.lock().await;
+        match guard.as_mut() {
+            Some(g) => {
+                let res = g.add(recv).await;
+                if res.is_ok() {
+                    let mut s = st.lock().await;
+                    s.mirrors
+                        .insert(receiver_id.to_string(), group_id.to_string());
+                    s.starting.remove(receiver_id);
+                }
+                res
+            }
+            None => Err(format!("group stopped: {group_id}")),
+        }
+    };
+    if let Err(e) = res {
+        st.lock().await.starting.remove(receiver_id);
+        return Err(fdo::Error::Failed(e));
+    }
+    changed(conn).await;
+    Ok(())
+}
+
+/// Reserve a connected, idle receiver for one attach. The check and the take share one
+/// state lock, so two AddToGroup calls for the same receiver — or an AddToGroup racing a
+/// MirrorGroup start — cannot both pass and end up in two groups.
+async fn reserve_attach(st: &Shared, receiver_id: &str) -> fdo::Result<()> {
+    let mut s = st.lock().await;
+    if !s.conns.contains_key(receiver_id) {
+        return Err(fdo::Error::Failed(format!("not connected: {receiver_id}")));
+    }
+    if s.mirrors.contains_key(receiver_id) {
+        return Err(fdo::Error::Failed(format!(
+            "already mirroring to {receiver_id}"
+        )));
+    }
+    if s.starting.contains(receiver_id) {
+        return Err(fdo::Error::Failed(format!(
+            "a group with {receiver_id} is starting"
+        )));
+    }
+    s.starting.insert(receiver_id.to_string());
+    Ok(())
+}
+
+/// Shared body of D-Bus `MirrorGroup`/`MirrorGroupFps`: connect missing receivers, create the
+/// group with the chosen stream rate.
+async fn start_group_shared(
+    luch: &Luch,
+    receiver_ids: Vec<String>,
+    source: String,
+    fps: u32,
+    conn: &Connection,
+) -> fdo::Result<String> {
+    if receiver_ids.is_empty() {
+        return Err(fdo::Error::InvalidArgs("no receivers".into()));
+    }
+    for id in &receiver_ids {
+        ensure_connected(luch, id, conn).await?;
+    }
+    let gid = format!("g-{}", uuid::Uuid::new_v4());
+    start_group(&luch.st, conn, &gid, &receiver_ids, &source, (0, 0), fps).await?;
+    Ok(gid)
+}
+
+/// Create a group over `receiver_ids` (all connected, none mirroring yet) and register
+/// it: `groups` + `mirrors` entries, a ReceiversChanged signal, and the watcher that
+/// reaps it when it ends on its own. The capture/encoder/handshake setup runs outside
+/// the state lock; a failure leaves no trace in the maps.
+async fn start_group(
+    st: &Shared,
+    conn: &Connection,
+    gid: &str,
+    receiver_ids: &[String],
+    source: &str,
+    requested: (u32, u32),
+    fps: u32,
+) -> fdo::Result<()> {
+    reserve_receivers(st, receiver_ids).await?;
+    let started = start_reserved_group(st, conn, gid, receiver_ids, source, requested, fps).await;
+    if started.is_err() {
+        release_receivers(st, receiver_ids).await;
+    }
+    started
+}
+
+/// Check and take every receiver id in one lock: a duplicate inside the call, an id that
+/// is already mirroring, and an id another call is starting are all rejected before any
+/// capture is created. `release_receivers` undoes it on failure.
+async fn reserve_receivers(st: &Shared, receiver_ids: &[String]) -> fdo::Result<()> {
+    let mut s = st.lock().await;
+    let mut seen = std::collections::HashSet::new();
+    for id in receiver_ids {
+        if !seen.insert(id.as_str()) {
+            return Err(fdo::Error::InvalidArgs(format!("duplicate receiver: {id}")));
+        }
+        if s.mirrors.contains_key(id) {
+            return Err(fdo::Error::Failed(format!("already mirroring to {id}")));
+        }
+        if s.starting.contains(id) {
+            return Err(fdo::Error::Failed(format!("a group with {id} is starting")));
+        }
+    }
+    for id in receiver_ids {
+        s.starting.insert(id.clone());
+    }
+    Ok(())
+}
+
+async fn release_receivers(st: &Shared, receiver_ids: &[String]) {
+    let mut s = st.lock().await;
+    for id in receiver_ids {
+        s.starting.remove(id);
+    }
+}
+
+/// Body of `start_group` under a held reservation.
+async fn start_reserved_group(
+    st: &Shared,
+    conn: &Connection,
+    gid: &str,
+    receiver_ids: &[String],
+    source: &str,
+    requested: (u32, u32),
+    fps: u32,
+) -> fdo::Result<()> {
+    let (recvs, welcome) = {
+        let s = st.lock().await;
+        let recvs = receiver_ids
+            .iter()
+            .map(|id| build_receiver(&s, id))
+            .collect::<fdo::Result<Vec<_>>>()?;
+        let welcome = s
+            .welcomes
+            .get(&receiver_ids[0])
+            .cloned()
+            .unwrap_or(Value::Null);
+        (recvs, welcome)
+    };
+    // One audio profile per group (spec §14): the sound comes from the shared encoder, so it
+    // is decided once, by the receiver that starts the show. Receivers joining later stream
+    // with it; their own SetAudio applies to shows they start.
+    let mut params = group_params(source, requested, &welcome)?;
+    params.fps = fps;
     // Sound only always carries sound, whatever the person chose for mirroring.
-    let chosen_audio = if audio_only {
-        "on".to_string()
-    } else {
-        audio_choice(st, id).await
-    };
-    let audio = limits::start_audio(&chosen_audio, &welcome, mirror::AUDIO_FRAME_MS);
-    if audio_only
+    if params.audio_only
         && !welcome["modes"]
             .as_array()
             .is_some_and(|m| m.iter().any(|x| x == "audio"))
@@ -1178,71 +1625,139 @@ async fn start_mirror(
             "this receiver version cannot play sound only yet: update it".into(),
         ));
     }
-    let address = r
-        .address
-        .parse()
-        .map_err(|_| fdo::Error::Failed(format!("not IPv4: {}", r.address)))?;
-    let target = mirror::Target {
-        name: r.name.clone(),
-        address,
-        ifname: r.ifname.clone(),
-        source,
-        kms,
-        prefer,
-        ws,
-        size,
-        niri_virtual,
-        mirror169,
-        audio,
-        audio_only,
+    let chosen_audio = if params.audio_only {
+        "on".to_string()
+    } else {
+        audio_choice(st, &receiver_ids[0]).await
     };
-    let (stop_tx, stop_rx) = mpsc::channel(1);
-    let stats = mirror::Stats::default();
+    params.audio = limits::start_audio(&chosen_audio, &welcome, mirror::AUDIO_FRAME_MS);
+    let group = MirrorGroup::start(gid.to_string(), params, recvs)
+        .await
+        .map_err(fdo::Error::Failed)?;
+    let notify = group.stopped_notify();
+    let slot: GroupSlot = Arc::new(Mutex::new(Some(group)));
     {
         let mut s = st.lock().await;
-        s.mirrors.insert(id.to_string(), stop_tx);
-        s.stats.insert(id.to_string(), stats.clone());
+        s.groups.insert(gid.to_string(), slot.clone());
+        for id in receiver_ids {
+            s.mirrors.insert(id.clone(), gid.to_string());
+            s.starting.remove(id);
+        }
     }
     changed(conn).await;
-    let (st, conn, id) = (st.clone(), conn.clone(), id.to_string());
-    // Subscribe here and drop our copy of the sender: the mirror must see the channel close
-    // (receiver gone or restarted) instead of streaming into the void.
-    let Conn { cmd, events, .. } = c;
-    let events_rx = events.subscribe();
-    drop(events);
-    let name = target.name.clone();
-    {
-        let (st, conn, id) = (st.clone(), conn.clone(), id.clone());
+    for rid in receiver_ids {
+        let (st, conn, rid) = (st.clone(), conn.clone(), rid.clone());
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_secs(2)).await; // once the receiver is ready
-            push_now_playing(&st, &conn, Some(&id)).await;
+            push_now_playing(&st, &conn, Some(&rid)).await;
         });
     }
+    spawn_group_watcher(st.clone(), conn.clone(), gid.to_string(), notify, slot);
+    Ok(())
+}
+
+/// Body of the D-Bus `Mirror`/`MirrorSized` methods and of the web receiver's auto-start:
+/// one session to `id`, run as a group of one ("g-<receiver id>").
+async fn start_mirror(
+    st: &Shared,
+    conn: &Connection,
+    id: &str,
+    source: &str,
+    requested: (u32, u32),
+    fps: u32,
+) -> fdo::Result<()> {
+    let gid = format!("g-{id}");
+    start_group(st, conn, &gid, &[id.to_string()], source, requested, fps).await
+}
+
+/// Reaps receivers that left on their own (stop event, dead control channel) and stops
+/// the group when its pipeline dies or its last receiver leaves; then unregisters it and
+/// signals ReceiversChanged. The group's notify fires on every receiver end and on a
+/// fatal pipeline error, so a receiver leaving mid-session is promptly gone from D-Bus.
+fn spawn_group_watcher(
+    st: Shared,
+    conn: Connection,
+    gid: String,
+    notify: Arc<Notify>,
+    slot: GroupSlot,
+) {
     tokio::spawn(async move {
-        let res = mirror::run(target, cmd, events_rx, stop_rx, stats).await;
-        match res {
-            Ok(why) => {
-                eprintln!("[luchd] {name}: mirroring ended ({why})");
-                if why.starts_with("the receiver could not show") {
+        // Register for the next notification *before* inspecting the group: notify_waiters
+        // stores no permit, so a receiver ending between the check and the await would be lost.
+        let notified = notify.notified();
+        tokio::pin!(notified);
+        loop {
+            notified.as_mut().enable();
+            let (stop, dirty, ended) = {
+                let mut guard = slot.lock().await;
+                let Some(g) = guard.as_mut() else {
+                    break; // a D-Bus method stopped the group and took it
+                };
+                let ended = g.reap();
+                let live = g.receiver_ids();
+                let dirty = {
+                    let mut s = st.lock().await;
+                    let before = s.mirrors.len();
+                    s.mirrors.retain(|rid, g2| *g2 != gid || live.contains(rid));
+                    let dirty = s.mirrors.len() != before;
+                    // A receiver that left on its own takes its stats baseline with it.
+                    let State {
+                        mirrors,
+                        stats_snap,
+                        ..
+                    } = &mut *s;
+                    stats_snap.retain(|rid, _| mirrors.contains_key(rid));
+                    dirty
+                };
+                let stop = if g.pipeline_dead() || g.receiver_count() == 0 {
+                    guard.take()
+                } else {
+                    None
+                };
+                (stop, dirty, ended)
+            };
+            // The receiver told why it stopped: the one reason worth a desktop notification is
+            // "the receiver could not show the picture" (draw-over-other-apps not allowed).
+            for e in ended {
+                if let Some(reason) = e
+                    .reason
+                    .filter(|r| r.starts_with("the receiver could not show"))
+                {
                     reports::notify(
                         &conn,
-                        &format!("{name} did not show the picture"),
-                        why,
+                        &format!("{} did not show the picture", e.name),
+                        reason,
                         None,
                     )
                     .await;
                 }
             }
-            Err(e) => eprintln!("[luchd] {name}: mirroring failed: {e}"),
+            let Some(group) = stop else {
+                if dirty {
+                    changed(&conn).await;
+                }
+                notified.as_mut().await;
+                // A completed `Notified` future is terminal: without a fresh one every
+                // later `await` returns Ready at once and this loop spins hot.
+                notified.set(notify.notified());
+                continue;
+            };
+            {
+                let mut s = st.lock().await;
+                s.groups.remove(&gid);
+                s.mirrors.retain(|_, g2| *g2 != gid);
+                let State {
+                    mirrors,
+                    stats_snap,
+                    ..
+                } = &mut *s;
+                stats_snap.retain(|rid, _| mirrors.contains_key(rid));
+            }
+            group.stop().await;
+            changed(&conn).await;
+            break;
         }
-        {
-            let mut s = st.lock().await;
-            s.mirrors.remove(&id);
-            s.stats.remove(&id);
-        }
-        changed(&conn).await;
     });
-    Ok(())
 }
 
 // ---------- web receiver ----------
@@ -1438,7 +1953,13 @@ async fn run_web<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let mode = hello["mode"].as_str().unwrap_or("fast").to_string();
     let (cmd_tx, cmd_rx) = mpsc::channel(8);
     let (events, _) = broadcast::channel(16);
-    let (media_tx, media_rx) = mpsc::channel(16);
+    // A deep media queue is latency: 16 frames at 48 fps is a third of a second before a
+    // slow browser even starts. Four frames bound the lead-in; loss handling is AwaitingIdr.
+    // Video: four frames (a third of a second of lead-in at 48 fps is already too much).
+    // Audio: separate and slightly deeper, so 200 small messages a second never take the
+    // slot a video frame needs; both stay shallow because the socket writer is the limit.
+    let (media_tx, media_rx) = mpsc::channel::<bytes::Bytes>(4);
+    let (audio_tx, audio_rx) = mpsc::channel::<bytes::Bytes>(8);
     // Browsers: H.264 everywhere (WebCodecs HEVC support is not universal).
     let welcome = json!({"t": "welcome", "v": p::VERSION, "id": sender_id, "name": host, "app": p::APP,
                          "bench": {"prefer": "video/avc"}, "hw": {"display": hello["display"]}});
@@ -1463,7 +1984,10 @@ async fn run_web<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
             Conn {
                 cmd: cmd_tx.clone(),
                 events: events.clone(),
-                media: Some(media_tx),
+                media: Some(mirror::group::WsMedia {
+                    video: media_tx,
+                    audio: audio_tx,
+                }),
                 addrs: None,
             },
         );
@@ -1475,7 +1999,7 @@ async fn run_web<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     // Writer: control JSON and media binary share the socket.
     let wname = name.clone();
     tokio::spawn(async move {
-        let (mut cmd_rx, mut media_rx, mut sink) = (cmd_rx, media_rx, sink);
+        let (mut cmd_rx, mut media_rx, mut audio_rx, mut sink) = (cmd_rx, media_rx, audio_rx, sink);
         let why = loop {
             tokio::select! {
                 c = cmd_rx.recv() => match c {
@@ -1484,8 +2008,12 @@ async fn run_web<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
                     None => break "control closed",
                 },
                 m = media_rx.recv() => match m {
-                    Some(b) => { if sink.send(Message::Binary(b.into())).await.is_err() { break "write failed"; } }
+                    Some(b) => { if sink.send(Message::Binary(b)).await.is_err() { break "write failed"; } }
                     None => break "media closed",
+                },
+                m = audio_rx.recv() => match m {
+                    Some(b) => { if sink.send(Message::Binary(b)).await.is_err() { break "write failed"; } }
+                    None => break "audio closed",
                 },
             }
         };
@@ -1515,12 +2043,43 @@ async fn run_web<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     });
 
     // One tap on the TV starts the whole thing; `?mode=none` keeps it manual.
+    // This runs in its own task: the `ready` answer comes through the control loop below,
+    // so awaiting the handshake here would deadlock it ("did not answer start"). When a
+    // single group already runs, the browser joins it and shares its capture/encoder
+    // (spec §12) instead of starting a second session.
     if mode != "none" {
-        if let Err(e) = start_mirror(&st, &dbus, &id, &mode, (0, 0)).await {
-            let _ = cmd_tx
-                .send(Cmd::Send(json!({"t": "error", "msg": e.to_string()})))
-                .await;
-        }
+        let (st2, dbus2, id2, mode2) = (st.clone(), dbus.clone(), id.clone(), mode.clone());
+        let cmd2 = cmd_tx.clone();
+        let name2 = name.clone();
+        tokio::spawn(async move {
+            // Concurrent taps must not each see "no group" and start their own capture:
+            // decide start-vs-join under one lock, and hold it through the start so the
+            // next tap finds exactly one group.
+            static START_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+            let _serial = START_LOCK.lock().await;
+            let single = {
+                let s = st2.lock().await;
+                let mut ids: Vec<String> = s.groups.keys().cloned().collect();
+                (ids.len() == 1).then(|| ids.remove(0))
+            };
+            if let Some(gid) = single {
+                match attach_to_group(&st2, &dbus2, &gid, &id2).await {
+                    Ok(()) => {
+                        eprintln!("[luchd] web {name2}: joined group {gid}");
+                        return;
+                    }
+                    Err(e) => eprintln!(
+                        "[luchd] web {name2}: cannot join {gid} ({e}); starting its own session"
+                    ),
+                }
+            }
+            let fps = mirror::fps();
+            if let Err(e) = start_mirror(&st2, &dbus2, &id2, &mode2, (0, 0), fps).await {
+                let _ = cmd2
+                    .send(Cmd::Send(json!({"t": "error", "msg": e.to_string()})))
+                    .await;
+            }
+        });
     }
 
     let mut last_rx = Instant::now();
@@ -1858,6 +2417,57 @@ async fn main() -> Result<(), Box<dyn Error>> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn receiver_ids_are_reserved_atomically_and_duplicates_are_rejected() {
+        let st: Shared = Arc::new(Mutex::new(State::default()));
+        let twice = vec!["a".to_string(), "a".to_string()];
+        assert!(reserve_receivers(&st, &twice).await.is_err());
+        assert!(!st.lock().await.starting.contains("a"));
+        let one = vec!["a".to_string()];
+        reserve_receivers(&st, &one).await.unwrap();
+        assert!(
+            reserve_receivers(&st, &one).await.is_err(),
+            "a second start must not pass the check while the first is creating its group"
+        );
+        release_receivers(&st, &one).await;
+        reserve_receivers(&st, &one).await.unwrap(); // released on failure, reusable
+    }
+
+    #[tokio::test]
+    async fn attach_and_group_start_reserve_a_receiver_atomically() {
+        let st: Shared = Arc::new(Mutex::new(State::default()));
+        let id = "r1".to_string();
+        {
+            let (cmd, _cmd_rx) = mpsc::channel(1);
+            let (events, _events_rx) = broadcast::channel(1);
+            st.lock().await.conns.insert(
+                id.clone(),
+                Conn {
+                    cmd,
+                    events,
+                    media: None,
+                    addrs: None,
+                },
+            );
+        }
+        // Two simultaneous AddToGroup calls: exactly one may hold the receiver, otherwise
+        // both groups would add it and leave one of them with a member the maps deny.
+        let (a, b) = tokio::join!(reserve_attach(&st, &id), reserve_attach(&st, &id));
+        assert_ne!(
+            a.is_ok(),
+            b.is_ok(),
+            "only one attach may reserve the receiver"
+        );
+        // While an attach handshakes, a MirrorGroup start must not take the same receiver...
+        assert!(reserve_receivers(&st, &[id.clone()]).await.is_err());
+        release_receivers(&st, &[id.clone()]).await;
+        // ...and a running start blocks the attach the same way.
+        reserve_receivers(&st, &[id.clone()]).await.unwrap();
+        assert!(reserve_attach(&st, &id).await.is_err());
+        release_receivers(&st, &[id]).await;
+        reserve_attach(&st, &"r1".to_string()).await.unwrap(); // released, reusable
+    }
+
     /// A receiver that has reports gets them taken over the control channel: answered with `reports_taken`, kept on
     /// disk. Needs a session bus (the channel signals changes on it); skipped without one.
     #[tokio::test]
@@ -2092,5 +2702,15 @@ mod tests {
         let mut rd = BufReader::new(rd);
         assert_eq!(read_msg(&mut rd).await.unwrap().unwrap()["t"], "pong");
         assert!(read_msg(&mut rd).await.is_err());
+    }
+
+    #[test]
+    fn stream_rate_is_limited_to_native_60_or_30() {
+        for ok in [0u32, 30, 60] {
+            assert_eq!(check_fps(ok).unwrap(), ok);
+        }
+        for bad in [1u32, 25, 72, 120, 240] {
+            assert!(check_fps(bad).is_err(), "{bad}");
+        }
     }
 }

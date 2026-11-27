@@ -994,6 +994,7 @@ name = "luchd"
 version = "0.4.0"
 dependencies = [
  "ashpd",
+ "bytes",
  "cc",
  "futures-util",
  "gstreamer",

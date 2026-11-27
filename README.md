@@ -59,6 +59,27 @@ no B-frames, one reference frame, infinite GOP with IDR on request, a one-frame 
 encoder preset, and packets leave the moment the encoder returns them. Sockets are bound to the LAN
 interface, so a full-tunnel VPN never carries the stream.
 
+## Group Engine: one stream, many receivers
+
+One session can serve a whole room: the screen is captured once and encoded once, and every receiver
+gets the same encoded stream over its own transport (UDP for TVs, WebSocket for browsers), with its
+own queue and statistics. A receiver that falls behind is skipped to the next keyframe instead of
+stalling the others; a new receiver joins the running group and starts from a keyframe, without a
+second capture. `Mirror`/`MirrorSized` are a group of one, and the web receiver joins the single
+running group instead of capturing again.
+
+D-Bus: `MirrorGroup(as ids, s source) → s group_id`, `AddToGroup`, `RemoveFromGroup`, `StopGroup`,
+`GroupStats` — see `docs/dbus.md`. `GroupStats` reports per-receiver delivery (`state`, `frames`,
+`dropped`, `skipped`, `idr_requests`, `rate_mbps`, `rtt_ms`) and group-level proof of one capture and
+one encoder (`capture_instances`, `encoder.live_instances`) plus the real frame spacing
+(`encoder.pacing_ms`).
+
+`LUCH_FPS` sets the default stream rate: only `0` (the screen's own rate), `60` (default) and `30`
+are meaningful. On a 144 Hz screen 60 becomes a uniform 48 fps (144 is not a multiple of 60). For a
+single capable device, `MirrorAt`/`MirrorGroupFps` choose the rate per group at creation with the
+same three values; `0` forwards every captured frame, so a 120 fps game is not reduced. Traffic is
+unicast: roughly receivers × bitrate.
+
 ## Requirements
 
 - Linux with a VA-API encoder (Intel iHD tested; AMD radeonsi should work) and Mesa EGL.
@@ -186,6 +207,9 @@ tries every one it knows for that receiver:
 - `luchctl list` is empty: the receiver app must be running, `avahi-daemon` active, and both devices
   on the same LAN segment (mDNS does not cross routers).
 - `fast` fails with «needs CAP_SYS_ADMIN»: run the `setcap` line again (reinstalling drops it).
+  File capabilities are ignored on `nosuid` mounts (many `/home` setups): install `luch-kms` to
+  `/usr/local/bin` and point `LUCH_KMS` at it, or run `luch-kms --serve /run/luch-kms.sock` as root
+  and give `luchd` `LUCH_KMS_SOCKET`.
 - Logs: `journalctl --user -u luchd -f`. `LUCH_PROBE=1` in the service environment prints
   per-stage latency.
 

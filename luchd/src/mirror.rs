@@ -4,10 +4,9 @@
 //! one-frame CPB, IDR only on request, packets sent straight from the encoder thread.
 
 use std::{
-    net::{Ipv4Addr, SocketAddrV4, UdpSocket},
-    os::fd::{AsRawFd, OwnedFd},
+    os::fd::OwnedFd,
     sync::{
-        atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering},
+        atomic::{AtomicBool, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -17,20 +16,80 @@ use ashpd::desktop::{
     screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType, StartCastOptions},
     PersistMode,
 };
+
+pub mod capture;
+pub mod encoder;
+pub mod frame;
+pub mod frame_bus;
+pub mod group;
+pub mod stats;
+pub mod transport;
+
 use futures_util::StreamExt;
 use gstreamer::{self as gst, prelude::*};
 use gstreamer_app as gst_app;
-use serde_json::{json, Value};
-use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{broadcast, mpsc};
+use serde_json::Value;
 
-use crate::display::{Layout, Size};
+use crate::display::Size;
 
-static VIRTUAL_SETUP: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+pub(crate) static VIRTUAL_SETUP: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 const UHD: (u32, u32) = (3840, 2160);
 pub const WIDTH: u32 = 1920;
 pub const HEIGHT: u32 = 1080;
 pub const FPS: u32 = 60;
+
+/// Stream frame-rate target for new groups. Only three rates are meaningful: the screen's
+/// own rate (`LUCH_FPS=0`, no cap), 60 (default: bandwidth and decoder headroom) and 30.
+/// Anything else falls back to 60 — other values cannot be produced from a fixed-refresh
+/// source without duplicating frames. Read once.
+pub fn fps() -> u32 {
+    static FPS_ENV: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+        std::env::var("LUCH_FPS")
+            .ok()
+            .and_then(|v| v.trim().parse::<u32>().ok())
+            .filter(|v| allowed_fps(*v))
+            .unwrap_or(FPS)
+    });
+    *FPS_ENV
+}
+
+/// The three rates a fixed-refresh source can actually deliver: its own (`0`), 60 and 30.
+pub(crate) fn allowed_fps(v: u32) -> bool {
+    matches!(v, 0 | 30 | 60)
+}
+/// Phase-locked frame-rate gate: accepts at most one frame per 1/fps of stream time and
+/// keeps the grid aligned to the accepted frame (144 Hz -> every 3rd frame at 60). Forced
+/// frames (IDRs) always pass, and a far clock jump (capture restart) re-phases the grid.
+pub(crate) struct FpsGate {
+    slice: u64,
+    due: Option<u64>,
+}
+
+impl FpsGate {
+    pub(crate) fn new(fps: u32) -> Self {
+        FpsGate {
+            slice: if fps > 0 { 1_000_000 / fps as u64 } else { 0 },
+            due: None,
+        }
+    }
+
+    /// `pts_us` is the capture timestamp; `force` marks a frame that must not be dropped.
+    pub(crate) fn accept(&mut self, pts_us: u64, force: bool) -> bool {
+        if self.slice == 0 {
+            return true;
+        }
+        let take = match self.due {
+            None => true,
+            Some(d) => pts_us + self.slice / 10 >= d || d.saturating_sub(pts_us) >= 5 * self.slice,
+        };
+        if !take && !force {
+            return false;
+        }
+        self.due = Some(pts_us.saturating_add(self.slice));
+        true
+    }
+}
+
 pub const VIDEO_KBPS: u32 = 20_000; // at 1920x1080; other sizes scale, see `kbps_for`
 
 /// Video bitrate for a frame size: grows with the square root of the pixel count (4K gets twice
@@ -49,30 +108,6 @@ pub const KIND_VIDEO: u8 = 1;
 pub const KIND_AUDIO: u8 = 2;
 pub const F_IDR: u8 = 1;
 pub const F_CONFIG: u8 = 2;
-
-/// Latest numbers for one mirroring session, shared with D-Bus `Stats`.
-pub type Stats = Arc<Mutex<Value>>;
-
-/// Where and what to mirror.
-pub struct Target {
-    pub name: String,
-    pub address: Ipv4Addr,
-    pub ifname: String,
-    pub source: SourceType,
-    pub size: Size,
-    /// Full screen straight from KMS scanout via the privileged luch-kms helper (lowest latency).
-    pub kms: bool,
-    /// Receiver's preferred decoder from its welcome bench ("video/hevc" or "video/avc").
-    pub prefer: String,
-    /// Web receiver: browsers take no UDP, media goes over its websocket instead.
-    pub niri_virtual: bool,
-    pub mirror169: bool,
-    pub ws: Option<mpsc::Sender<Vec<u8>>>,
-    /// The `audio` part of `start` (limits::start_audio), or None for the picture only.
-    pub audio: Option<Value>,
-    /// Sound only, like a speaker (PROTOCOL.md 4d): no capture of the screen, no video stream.
-    pub audio_only: bool,
-}
 
 fn parse_size(s: &str) -> Option<(u32, u32)> {
     let (w, h) = s.trim().split_once(['x', 'X'])?;
@@ -415,7 +450,7 @@ pub fn available_sources() -> Vec<&'static str> {
     if !niri || niri_virtual_available() {
         v.push("virtual");
     }
-    v.extend(["monitor", "window"]);
+    v.extend(["monitor", "window", "audio"]);
     v
 }
 
@@ -548,6 +583,7 @@ impl Drop for ScreenAwake {
 }
 
 /// Messages to the control-channel task.
+#[derive(Debug)]
 pub enum Cmd {
     Bye,
     Send(Value),
@@ -577,120 +613,10 @@ pub fn header(
     h
 }
 
-/// One UDP socket per media kind, pinned to the LAN interface — or a websocket for the web receiver.
-struct Tx {
-    out: Out,
-    kind: u8,
-    seq: AtomicU32,
-    warned: AtomicBool,
-    bytes: AtomicU64,
-    lat_sum: AtomicU64, // host latency, 0.1 ms units, summed over frames
-}
-
-enum Out {
-    Udp(UdpSocket),
-    /// Whole frame per message (websocket framing is reliable and ordered); on a full channel
-    /// drop the frame and ask for an IDR — the browser lags, the stream must not.
-    Ws(mpsc::Sender<Vec<u8>>, Arc<AtomicBool>),
-}
-
 /// Shards per burst before a short pause, so a big IDR doesn't overflow the Wi-Fi queue.
-const BURST: usize = 16;
-const BURST_GAP: Duration = Duration::from_micros(250);
-
-impl Tx {
-    fn open(kind: u8, ifname: &str, to: SocketAddrV4, dscp: u32) -> std::io::Result<Self> {
-        use socket2::{Domain, Protocol, Socket, Type};
-        let s = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-        s.bind_device(Some(ifname.as_bytes()))?;
-        s.set_tos_v4(dscp << 2)?; // CS5 video / CS6 audio -> Wi-Fi WMM video/voice queues
-        s.set_send_buffer_size(1 << 20)?;
-        s.connect(&to.into())?;
-        Ok(Tx {
-            out: Out::Udp(s.into()),
-            kind,
-            seq: AtomicU32::new(0),
-            warned: AtomicBool::new(false),
-            bytes: AtomicU64::new(0),
-            lat_sum: AtomicU64::new(0),
-        })
-    }
-
-    fn ws(kind: u8, tx: mpsc::Sender<Vec<u8>>, want_idr: Arc<AtomicBool>) -> Self {
-        Tx {
-            out: Out::Ws(tx, want_idr),
-            kind,
-            seq: AtomicU32::new(0),
-            warned: AtomicBool::new(false),
-            bytes: AtomicU64::new(0),
-            lat_sum: AtomicU64::new(0),
-        }
-    }
-
-    // ponytail: one send() per shard; sendmmsg/UDP_SEGMENT if the syscall count ever shows up in profiles.
-    fn send_frame(&self, data: &[u8], flags: u8, pts_us: u64, host_lat: u16) {
-        let seq = self.seq.fetch_add(1, Ordering::Relaxed);
-        self.bytes.fetch_add(data.len() as u64, Ordering::Relaxed);
-        self.lat_sum.fetch_add(host_lat as u64, Ordering::Relaxed);
-        if seq == 0 {
-            eprintln!(
-                "[luchd] first {} frame: {} bytes",
-                if self.kind == KIND_VIDEO {
-                    "video"
-                } else {
-                    "audio"
-                },
-                data.len()
-            );
-        }
-        let shards = data.len().div_ceil(SHARD).max(1);
-        match &self.out {
-            Out::Udp(sock) => {
-                let mut pkt = Vec::with_capacity(HEADER + SHARD);
-                for (i, chunk) in data.chunks(SHARD).enumerate() {
-                    if i > 0 && i % BURST == 0 {
-                        std::thread::sleep(BURST_GAP); // ponytail: fixed pacing, ~3 ms for a 200 KB IDR
-                    }
-                    pkt.clear();
-                    pkt.extend_from_slice(&header(
-                        self.kind,
-                        flags,
-                        i as u16,
-                        shards as u16,
-                        seq,
-                        pts_us as u32,
-                        data.len() as u32,
-                        host_lat,
-                    ));
-                    pkt.extend_from_slice(chunk); // last shard is not padded; receiver uses frame_len
-                                                  // A lost datagram is recovered by the receiver's keyframe request; just report the first failure.
-                    if let Err(e) = sock.send(&pkt) {
-                        if !self.warned.swap(true, Ordering::Relaxed) {
-                            eprintln!("[luchd] udp send (kind {}): {e}", self.kind);
-                        }
-                    }
-                }
-            }
-            Out::Ws(tx, want_idr) => {
-                let mut msg = Vec::with_capacity(HEADER + data.len());
-                msg.extend_from_slice(&header(
-                    self.kind,
-                    flags,
-                    0,
-                    1,
-                    seq,
-                    pts_us as u32,
-                    data.len() as u32,
-                    host_lat,
-                ));
-                msg.extend_from_slice(data);
-                if let Err(TrySendError::Full(_) | TrySendError::Closed(_)) = tx.try_send(msg) {
-                    want_idr.store(true, Ordering::Relaxed);
-                }
-            }
-        }
-    }
-}
+/// The pause itself lives in the per-receiver sender task (transport.rs), never here.
+pub(crate) const BURST: usize = 16;
+pub(crate) const BURST_GAP: Duration = Duration::from_micros(250);
 
 /// 19-byte OpusHead (RFC 7845) for 48 kHz stereo: MediaCodec CSD-0.
 pub fn opus_head() -> [u8; 19] {
@@ -772,16 +698,44 @@ async fn portal(
     Err("portal returned a different source type".into())
 }
 
+/// The `format=DMA_DRM` values `vapostproc`'s src pad offers right now, formatted as the
+/// `drm-format={...}` list the pipeline needs. `None` when the element (or its caps)
+/// is unavailable — then the caller keeps its fallback list.
+fn offered_drm_formats() -> Option<String> {
+    use gstreamer::prelude::*;
+    let e = gst::ElementFactory::make("vapostproc").build().ok()?;
+    let tpl = e.pad_template("src")?;
+    let caps = tpl.caps();
+    let mut formats: Vec<String> = Vec::new();
+    for s in caps.iter() {
+        let is_dma = s.get::<&str>("format").is_ok_and(|f| f == "DMA_DRM");
+        if !is_dma {
+            continue;
+        }
+        if let Ok(list) = s.get::<gstreamer::List>("drm-format") {
+            for v in list.iter() {
+                // The VA-API encoder takes NV12 zero-copy only; keep the driver's modifiers.
+                if let Ok(f) = v.get::<&str>() {
+                    if f.starts_with("NV12") {
+                        formats.push(format!("\"{f}\""));
+                    }
+                }
+            }
+        }
+    }
+    (!formats.is_empty()).then(|| format!("{{{}}}", formats.join(",")))
+}
+
 /// Video from the portal (`Some((fd, node))`) plus audio, or audio only when luch-kms does video.
 fn pipeline(
     portal: Option<(Option<i32>, u32)>,
     size: Size,
     virtual_source: bool,
 ) -> Result<gst::Pipeline, String> {
-    let keepalive = 2000 / FPS; // resend the last frame at fps/2 when the screen is static
-                                // ponytail: the Intel tiled NV12 modifier is what vapostproc offers here; make it a negotiated
-                                // list when other GPUs matter.
-                                // Newer gst-plugins-bad dropped vapostproc's `scale-method`; only pass it where it exists.
+    let keepalive = 2000 / fps().max(1); // resend the last frame at fps/2 when the screen is static
+                                         // ponytail: the Intel tiled NV12 modifier is what vapostproc offers here; make it a negotiated
+                                         // list when other GPUs matter.
+                                         // Newer gst-plugins-bad dropped vapostproc's `scale-method`; only pass it where it exists.
     let has_scale = gst::ElementFactory::make("vapostproc")
         .build()
         .is_ok_and(|e| e.find_property("scale-method").is_some());
@@ -793,12 +747,14 @@ fn pipeline(
     } else {
         String::new()
     };
-    // NV12 modifiers vapostproc may offer: Intel Y-tiled, AMD DCC, AMD 64KB tiled, linear.
-    // LUCH_DRM_FORMAT overrides.
+    // DRM modifiers vapostproc actually offers on this GPU (it differs per driver: the
+    // Intel tiled list does not negotiate on AMD and vice versa). LUCH_DRM_FORMAT overrides.
     let drm = std::env::var("LUCH_DRM_FORMAT")
         .map(|d| format!("\"{d}\""))
         .unwrap_or_else(|_| {
-            "{\"NV12:0x0100000000000009\",\"NV12:0x0200000010401b04\",\"NV12:0x0200000000082305\",\"NV12:0x0\"}".into()
+            offered_drm_formats().unwrap_or_else(|| {
+                "{\"NV12:0x0100000000000009\",\"NV12:0x0200000010401b04\",\"NV12:0x0200000000082305\",\"NV12:0x0\"}".into()
+            })
         });
     // Zero copy: compositor DMA-BUF -> GPU conversion -> DMA-BUF -> VA-API encoder.
     let (width, height) = (size.width, size.height);
@@ -876,44 +832,23 @@ fn dmabuf_of(sample: &gst::Sample) -> Result<crate::enc::Nv12Dmabuf, String> {
     })
 }
 
-fn render_node() -> String {
-    let mut nodes: Vec<_> = std::fs::read_dir("/dev/dri")
-        .into_iter()
-        .flatten()
-        .flatten()
-        .map(|e| e.path().to_string_lossy().into_owned())
-        .filter(|p| p.contains("renderD"))
-        .collect();
-    nodes.sort();
-    nodes
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| "/dev/dri/renderD128".into())
-}
-
-/// Hooks the appsinks to the senders; returns the "resend OpusHead" flag (set on every video IDR).
-/// `want_idr` is shared with a websocket sink, which sets it when it drops a frame.
-/// Without a "v" sink only audio is wired.
-fn wire(
-    p: &gst::Pipeline,
-    video: Arc<Tx>,
-    audio: Arc<Tx>,
-    want_idr: Arc<AtomicBool>,
-    size: Size,
-) -> Arc<AtomicBool> {
-    let need_head = Arc::new(AtomicBool::new(true));
-    let encoder: Arc<Mutex<Option<crate::enc::Encoder>>> = Arc::default();
+/// Hooks the appsinks to the group's EncoderSession: capture -> encode -> FrameBus,
+/// right on the capture thread. IDR requests and OpusHead resends live inside the
+/// EncoderSession. Without a "v" sink only audio is wired.
+pub(crate) fn wire(p: &gst::Pipeline, enc: encoder::EncSession, fps: u32) {
     let warned = AtomicBool::new(false);
     let dbg = Mutex::new((0f64, 0f64, 0u32));
+    // Screen refresh can be 120/144 Hz while the stream targets the group rate: forwarding
+    // every captured frame multiplies encoder and decoder load and browser decoders fall
+    // behind indefinitely.
+    let gate = Mutex::new(FpsGate::new(fps));
     let asink = p
         .by_name("a")
         .unwrap()
         .downcast::<gst_app::AppSink>()
         .unwrap();
-    let nh_audio = need_head.clone();
 
-    let nh = need_head.clone();
-    let wi = want_idr.clone();
+    let enc_v = enc.clone();
     if let Some(vsink) = p
         .by_name("v")
         .and_then(|v| v.downcast::<gst_app::AppSink>().ok())
@@ -926,7 +861,7 @@ fn wire(
                     true
                 })
                 .new_sample(move |s| {
-                    // Runs on the capture thread: encode and send right here, no queue in between.
+                    // Runs on the capture thread: encode and publish right here, no queue in between.
                     let sample = s.pull_sample().map_err(|_| gst::FlowError::Eos)?;
                     let report = |e: String| {
                         if !warned.swap(true, Ordering::Relaxed) {
@@ -941,46 +876,26 @@ fn wire(
                         }
                     };
                     let pts_rt = sample.buffer().and_then(|b| b.pts());
-                    let at_sink = timing(s, pts_rt).1;
-                    let mut enc = encoder.lock().unwrap();
-                    if enc.is_none() {
-                        match crate::enc::Encoder::open(
-                            &render_node(),
-                            size.width,
-                            size.height,
-                            FPS,
-                            kbps_for(size.width, size.height),
-                        ) {
-                            Ok(e) => *enc = Some(e),
-                            Err(e) => {
-                                report(e);
-                                return Err(gst::FlowError::Error);
-                            }
-                        }
-                    }
-                    let force = wi.swap(false, Ordering::Relaxed);
+                    let probe = std::env::var_os("LUCH_PROBE").is_some();
+                    let at_sink = if probe { timing(s, pts_rt).1 } else { 0 };
                     let (pts, _) = timing(s, pts_rt);
-                    let r =
-                        enc.as_mut()
-                            .unwrap()
-                            .encode(&frame, pts as i64, force, |bytes, idr| {
-                                if idr {
-                                    nh.store(true, Ordering::Relaxed); // receiver may have (re)started its audio decoder
-                                }
-                                let (_, lat) = timing(s, pts_rt); // capture -> encoded, measured after encode
-                                video.send_frame(bytes, if idr { F_IDR } else { 0 }, pts, lat);
-                            });
-                    if let Err(e) = r {
-                        report(e);
+                    if !gate.lock().unwrap().accept(pts, enc_v.idr_pending()) {
+                        return Ok(gst::FlowSuccess::Ok);
                     }
-                    if std::env::var_os("LUCH_PROBE").is_some() {
+                    if let Err(e) = enc_v.encode_video(&frame, pts as i64, || timing(s, pts_rt).1) {
+                        // Encoder open/encode failure: stop the pipeline like the old
+                        // FlowError::Error path, so the run loop reports and cleans up.
+                        report(e);
+                        return Err(gst::FlowError::Error);
+                    }
+                    if probe {
                         let mut a = dbg.lock().unwrap();
                         a.0 += at_sink as f64 / 10.0;
                         a.1 += timing(s, pts_rt).1 as f64 / 10.0;
                         a.2 += 1;
                         if a.2 == 60 {
                             eprintln!(
-                                "[probe] appsink entry {:.1} ms, after encode+send {:.1} ms",
+                                "[probe] appsink entry {:.1} ms, after encode {:.1} ms",
                                 a.0 / 60.0,
                                 a.1 / 60.0
                             );
@@ -992,6 +907,7 @@ fn wire(
                 .build(),
         );
     }
+    let enc_a = enc.clone();
     asink.set_callbacks(
         gst_app::AppSinkCallbacks::builder()
             .new_sample(move |s| {
@@ -999,15 +915,11 @@ fn wire(
                 let buf = sample.buffer().ok_or(gst::FlowError::Error)?;
                 let map = buf.map_readable().map_err(|_| gst::FlowError::Error)?;
                 let (pts, lat) = timing(s, buf.pts());
-                if nh_audio.swap(false, Ordering::Relaxed) {
-                    audio.send_frame(&opus_head(), F_CONFIG, pts, 0);
-                }
-                audio.send_frame(&map, 0, pts, lat);
+                enc_a.publish_audio(&map, pts as u32, lat);
                 Ok(gst::FlowSuccess::Ok)
             })
             .build(),
     );
-    need_head
 }
 
 /// Where a privileged `luch-kms --serve` listens, when there is one (env `LUCH_KMS_SOCKET`, else
@@ -1022,8 +934,17 @@ pub fn kms_socket() -> Option<std::path::PathBuf> {
     p.exists().then_some(p)
 }
 
-/// The KMS grabber: a child process, or a connection to a `luch-kms --serve`.
-enum Grabber {
+/// The KMS grabber: a child process (or a `luch-kms --serve` connection) and the thread
+/// that reads its encoded stream. The thread is owned here, so a group stop kills the
+/// helper, wakes the reader and joins it — no frame can be published after teardown.
+pub(crate) struct Grabber {
+    kind: GrabberKind,
+    reader: Option<std::thread::JoinHandle<()>>,
+    /// Set before an intentional stop, so an EOF is not reported as a dead helper.
+    stopping: Arc<std::sync::atomic::AtomicBool>,
+}
+
+enum GrabberKind {
     Child(std::process::Child),
     Socket(std::os::unix::net::UnixStream),
 }
@@ -1032,57 +953,75 @@ impl Grabber {
     /// Ask for an IDR.
     fn idr(&mut self) {
         use std::io::Write;
-        let _ = match self {
-            Grabber::Child(c) => c
+        let _ = match &mut self.kind {
+            GrabberKind::Child(c) => c
                 .stdin
                 .as_mut()
                 .map(|s| s.write_all(b"k"))
                 .unwrap_or(Ok(())),
-            Grabber::Socket(s) => s.write_all(b"k"),
+            GrabberKind::Socket(s) => s.write_all(b"k"),
         };
     }
 
-    fn stop(self) {
-        match self {
-            Grabber::Child(mut c) => {
+    fn stop(mut self) {
+        self.stopping
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        match &mut self.kind {
+            GrabberKind::Child(c) => {
                 let _ = c.kill();
                 let _ = c.wait();
             }
-            Grabber::Socket(s) => {
+            GrabberKind::Socket(s) => {
                 let _ = s.shutdown(std::net::Shutdown::Both);
             }
+        }
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
         }
     }
 }
 
 /// Lowest-latency video: luch-kms (KMS scanout -> EGL NV12 -> h264_vaapi) as a child, or through its
-/// socket, forwarding its packets as they come. `k` on its input forces an IDR.
-fn spawn_kms(
-    video: Arc<Tx>,
-    need_head: Arc<AtomicBool>,
+/// socket, publishing its packets into the group's EncoderSession as they come. `k` on its
+/// input forces an IDR.
+pub(crate) fn spawn_kms(
+    enc: encoder::EncSession,
     hevc: bool,
     size: Size,
+    fps: u32,
+    on_dead: impl Fn() + Send + 'static,
 ) -> Result<Grabber, String> {
     use std::io::{Read, Write};
     use std::process::{Command, Stdio};
     let kbps = kbps_for(size.width, size.height);
+    // `--fps` is the helper's keepalive pace (it republishes a static screen at fps/2) and
+    // must be nonzero; the grab loop itself sends every scanout flip. The group's rate is
+    // applied below by `FpsGate`, so fps=0 really forwards every captured frame here.
+    let kms_fps = if fps == 0 { FPS } else { fps };
     let opts = format!(
-        "--size {}x{} --fps {FPS} --kbps {kbps} --codec {}",
+        "--size {}x{} --fps {kms_fps} --kbps {kbps} --codec {}",
         size.width,
         size.height,
         if hevc { "hevc" } else { "h264" }
     );
-    let (grabber, mut out): (Grabber, Box<dyn Read + Send>) =
+    let (kind, mut out): (GrabberKind, Box<dyn Read + Send>) =
         match kms_socket().and_then(|p| std::os::unix::net::UnixStream::connect(p).ok()) {
             Some(mut s) => {
                 writeln!(s, "{opts}").map_err(|e| format!("luch-kms socket: {e}"))?;
                 let out = s.try_clone().map_err(|e| format!("luch-kms socket: {e}"))?;
-                (Grabber::Socket(s), Box::new(out))
+                (GrabberKind::Socket(s), Box::new(out))
             }
             None => {
-                let exe = std::env::current_exe()
-                    .ok()
-                    .and_then(|p| p.parent().map(|d| d.join("luch-kms")));
+                // LUCH_KMS points at a helper outside the checkout: file capabilities do not
+                // work on a nosuid mount (many /home setups), so it is often installed to
+                // /usr/local/bin with setcap instead of living next to luchd.
+                let exe = std::env::var_os("LUCH_KMS")
+                    .map(std::path::PathBuf::from)
+                    .or_else(|| {
+                        std::env::current_exe()
+                            .ok()
+                            .and_then(|p| p.parent().map(|d| d.join("luch-kms")))
+                    });
                 let exe = exe
                     .filter(|p| p.exists())
                     .unwrap_or_else(|| "luch-kms".into());
@@ -1093,13 +1032,18 @@ fn spawn_kms(
                     .spawn()
                     .map_err(|e| format!("{}: {e}", exe.display()))?;
                 let out = child.stdout.take().unwrap();
-                (Grabber::Child(child), Box::new(out))
+                (GrabberKind::Child(child), Box::new(out))
             }
         };
-    std::thread::spawn(move || {
+    let stopping = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_flag = stopping.clone();
+    let reader = std::thread::spawn(move || {
         let mut hdr = [0u8; 13];
         let mut buf = Vec::new();
         let mut base: Option<u64> = None;
+        // Same gate as the portal path: a 144 Hz scanout must not send 140 fps when the
+        // group asked for 60. IDRs always pass (they carry SPS/PPS).
+        let mut gate = FpsGate::new(fps);
         while out.read_exact(&mut hdr).is_ok() {
             let len = u32::from_be_bytes(hdr[0..4].try_into().unwrap()) as usize;
             let idr = hdr[4] & 1 != 0;
@@ -1108,16 +1052,33 @@ fn spawn_kms(
             if out.read_exact(&mut buf).is_err() {
                 break;
             }
+            if !gate.accept(cap, idr) {
+                continue;
+            }
             let now = mono_us();
             let base = *base.get_or_insert(cap);
             let lat = (now.saturating_sub(cap) / 100).min(u16::MAX as u64) as u16; // scanout flip -> encoded
-            if idr {
-                need_head.store(true, Ordering::Relaxed);
-            }
-            video.send_frame(&buf, if idr { F_IDR } else { 0 }, cap - base, lat);
+                                                                                   // luch-kms output is the group's encoded stream: the EncoderSession assigns
+                                                                                   // the group-wide seq and sets the OpusHead flag on IDR via publish().
+            enc.publish(
+                KIND_VIDEO,
+                if idr { F_IDR } else { 0 },
+                (cap - base) as u32,
+                lat,
+                &buf,
+            );
+        }
+        // EOF or a broken pipe. An intentional stop is flagged before the helper is
+        // killed, so only a helper that died on its own reaches the group.
+        if !stop_flag.load(std::sync::atomic::Ordering::SeqCst) {
+            on_dead();
         }
     });
-    Ok(grabber)
+    Ok(Grabber {
+        kind,
+        reader: Some(reader),
+        stopping,
+    })
 }
 
 fn mono_us() -> u64 {
@@ -1131,7 +1092,7 @@ fn mono_us() -> u64 {
 }
 
 /// Debug: average (running time - capture pts) at the src pad of each video element, printed every second.
-fn probe_stages(p: &gst::Pipeline) {
+pub(crate) fn probe_stages(p: &gst::Pipeline) {
     const ENC_OFFSET: gst::ClockTime = gst::ClockTime::from_seconds(1000 * 3600);
     let mut it = p.iterate_recurse();
     while let Ok(Some(el)) = it.next() {
@@ -1181,241 +1142,54 @@ fn probe_stages(p: &gst::Pipeline) {
     }
 }
 
-fn round1(x: f64) -> f64 {
+pub(crate) fn round1(x: f64) -> f64 {
     (x * 10.0).round() / 10.0
-}
-
-/// Runs one mirroring session until stopped (by us, the receiver, or an error).
-pub async fn run(
-    t: Target,
-    cmd: mpsc::Sender<Cmd>,
-    mut events: broadcast::Receiver<Value>,
-    mut stop: mpsc::Receiver<()>,
-    stats: Stats,
-) -> Result<&'static str, String> {
-    let _awake = ScreenAwake::start().await;
-    let _mute = MuteSession::start();
-    let size = t.size;
-    let virtual_source = t.source == SourceType::VIRTUAL && !t.niri_virtual;
-    let virtual_setup = if virtual_source {
-        Some(VIRTUAL_SETUP.lock().await)
-    } else {
-        None
-    };
-    let layout = if virtual_source {
-        Some(Layout::capture().await?)
-    } else {
-        None
-    };
-    let portal = if t.kms || t.niri_virtual || t.audio_only {
-        None
-    } else {
-        Some(portal(t.source).await?)
-    };
-    let _mode = if t.kms && t.mirror169 {
-        switch_to_16x9(size.width).await
-    } else {
-        None
-    };
-    let nv = if t.niri_virtual {
-        Some(
-            niri_virtual(
-                &format!("LUCH-{}", t.address.to_string().replace('.', "-")),
-                (size.width, size.height),
-            )
-            .await?,
-        )
-    } else {
-        None
-    };
-
-    // HEVC only on the KMS path (luch-kms); the portal path's encoder is H.264.
-    let hevc = t.kms && t.prefer == "video/hevc";
-    let mut start = if t.audio_only {
-        json!({"t": "start", "mode": "audio"})
-    } else {
-        json!({"t": "start", "mode": "mirror",
-            "video": {"codec": if hevc { "video/hevc" } else { "video/avc" }, "width": size.width, "height": size.height, "fps": FPS}})
-    };
-    if let Some(a) = &t.audio {
-        start["audio"] = a.clone();
-    }
-    cmd.send(Cmd::Send(start))
-        .await
-        .map_err(|_| "control channel closed")?;
-    let ready = tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            match events.recv().await {
-                Ok(v) if v["t"] == "ready" => return Ok(v),
-                Ok(v) if v["t"] == "error" || v["t"] == "stop" => {
-                    return Err(format!("receiver: {v}"))
-                }
-                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                Err(_) => return Err("control channel closed".to_string()),
-            }
-        }
-    })
-    .await
-    .map_err(|_| "receiver did not answer start".to_string())??;
-
-    let port = |k: &str| {
-        ready[k]
-            .as_u64()
-            .filter(|p| *p > 0 && *p < 65536)
-            .map(|p| p as u16)
-    };
-    // Web receivers take media over their websocket; everything else gets UDP sockets.
-    let want_idr = Arc::new(AtomicBool::new(false));
-    let (video, audio) = if let Some(ws) = t.ws.clone() {
-        (
-            Arc::new(Tx::ws(KIND_VIDEO, ws.clone(), want_idr.clone())),
-            Arc::new(Tx::ws(KIND_AUDIO, ws, want_idr.clone())),
-        )
-    } else {
-        let (vp, ap) = port("video_port")
-            .zip(port("audio_port"))
-            .ok_or(format!("bad ready: {ready}"))?;
-        let io = |e: std::io::Error| format!("udp: {e}");
-        (
-            Arc::new(
-                Tx::open(KIND_VIDEO, &t.ifname, SocketAddrV4::new(t.address, vp), 40)
-                    .map_err(io)?,
-            ),
-            Arc::new(
-                Tx::open(KIND_AUDIO, &t.ifname, SocketAddrV4::new(t.address, ap), 48)
-                    .map_err(io)?,
-            ),
-        )
-    };
-
-    let p = pipeline(
-        portal
-            .as_ref()
-            .map(|(_, _, fd, node)| (Some(fd.as_raw_fd()), *node))
-            .or(nv.as_ref().map(|n| (None, n.node))),
-        size,
-        virtual_source,
-    )?;
-    let need_head = wire(&p, video.clone(), audio, want_idr.clone(), size);
-    let mut kms = if t.kms {
-        Some(spawn_kms(video.clone(), need_head, hevc, size)?)
-    } else {
-        None
-    };
-    if std::env::var_os("LUCH_PROBE").is_some() {
-        probe_stages(&p);
-    }
-    if let Err(e) = p.set_state(gst::State::Playing) {
-        let detail = p.bus().and_then(|b| {
-            b.timed_pop_filtered(
-                gst::ClockTime::from_mseconds(500),
-                &[gst::MessageType::Error],
-            )
-        });
-        let _ = p.set_state(gst::State::Null);
-        let _ = cmd.send(Cmd::Send(json!({"t": "stop"}))).await;
-        return Err(match detail.as_ref().map(|m| m.view()) {
-            Some(gst::MessageView::Error(err)) => {
-                format!("pipeline: {} ({:?})", err.error(), err.debug())
-            }
-            _ => format!("pipeline: {e}"),
-        });
-    }
-    let virtual_monitor = if let Some(layout) = &layout {
-        match layout.place_new_right(size).await {
-            Ok(connector) => Some(connector),
-            Err(e) => {
-                let _ = p.set_state(gst::State::Null);
-                let _ = cmd.send(Cmd::Send(json!({"t": "stop"}))).await;
-                if let Some((_, session, _, _)) = &portal {
-                    let _ = session.close().await;
-                }
-                return Err(e);
-            }
-        }
-    } else {
-        None
-    };
-    drop(virtual_setup);
-    eprintln!("[luchd] mirroring to {} ({})", t.name, t.address);
-
-    let mut bus = p.bus().unwrap().stream();
-    let mut second = tokio::time::interval(Duration::from_secs(1));
-    let (mut rtt, mut rx_stats) = (Value::Null, Value::Null);
-    let (mut last_frames, mut last_bytes, mut last_lat) = (0u64, 0u64, 0u64);
-    let why = loop {
-        tokio::select! {
-            _ = second.tick() => {
-                // Sender-side numbers, once a second: to the receiver (for its on-screen overlay) and to D-Bus.
-                let frames = video.seq.load(Ordering::Relaxed) as u64;
-                let bytes = video.bytes.load(Ordering::Relaxed);
-                let lat = video.lat_sum.load(Ordering::Relaxed);
-                let df = frames - last_frames;
-                let host_ms = if df > 0 { (lat - last_lat) as f64 / df as f64 / 10.0 } else { 0.0 };
-                let mbps = (bytes - last_bytes) as f64 * 8.0 / 1e6;
-                (last_frames, last_bytes, last_lat) = (frames, bytes, lat);
-                let sender = json!({"t": "sender_stats", "rtt_ms": rtt, "host_ms": round1(host_ms),
-                                    "fps": df, "mbps": round1(mbps), "virtual_monitor": virtual_monitor, "encoder": if hevc { "hevc_vaapi" } else { "h264_vaapi" }, "res": format!("{}x{}", size.width, size.height)});
-                let _ = cmd.send(Cmd::Send(sender.clone())).await;
-                // Rough glass-to-glass estimate without the display: capture+encode + one-way network + decode.
-                let decode = rx_stats["decode_ms"].as_f64().unwrap_or(0.0);
-                let est = host_ms + rtt.as_f64().unwrap_or(0.0) / 2.0 + decode;
-                *stats.lock().unwrap() = json!({"sender": sender, "receiver": rx_stats, "est_ms": round1(est)});
-            }
-            _ = stop.recv() => {
-                let _ = cmd.send(Cmd::Send(json!({"t": "stop"}))).await;
-                break Ok("stopped");
-            }
-            ev = events.recv() => match ev {
-                Ok(v) if v["t"] == "keyframe" => {
-                    want_idr.store(true, Ordering::Relaxed);
-                    if let Some(k) = kms.as_mut() {
-                        k.idr();
-                    }
-                }
-                Ok(v) if v["t"] == "stats" => rx_stats = v,
-                Ok(v) if v["t"] == "_rtt" => rtt = json!(round1(v["ms"].as_f64().unwrap_or(0.0))),
-                Ok(v) if v["t"] == "stop" => {
-                    eprintln!("[luchd] {}: receiver sent {v}", t.name);
-                    break Ok(crate::limits::stop_reason(&v));
-                }
-                Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                Err(_) => break Ok("control channel closed"),
-            },
-            msg = bus.next() => match msg.as_ref().map(|m| m.view()) {
-                Some(gst::MessageView::Error(err)) => {
-                    let _ = cmd.send(Cmd::Send(json!({"t": "stop"}))).await;
-                    break Err(format!("pipeline: {} ({:?})", err.error(), err.debug()));
-                }
-                Some(gst::MessageView::Eos(_)) | None => break Ok("capture ended"),
-                _ => {}
-            },
-        }
-    };
-    let _ = p.set_state(gst::State::Null);
-    if let Some(k) = kms {
-        k.stop();
-    }
-    if let Some(n) = nv {
-        let _ = n.session.call::<_, _, ()>("Stop", &()).await;
-    }
-    if let Some((_sc, session, fd, _)) = portal {
-        let _ = session.close().await;
-        drop(fd);
-    }
-    // Removing the virtual monitor must not disturb the physical ones: restore the layout that
-    // was active before extend, once Mutter has dropped the virtual connector.
-    if let (Some(layout), Some(connector)) = (&layout, &virtual_monitor) {
-        if let Err(e) = layout.restore(connector).await {
-            eprintln!("[luchd] restore display layout: {e}");
-        }
-    }
-    why
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A helper that publishes one key frame and exits: what a crash or a lost KMS looks
+    /// like from luchd. Its socket path is pointed at a nonexistent file so the child
+    /// branch is taken even on a machine that runs `luch-kms --serve`.
+    #[test]
+    fn an_unexpected_kms_eof_reaches_the_group_and_the_reader_is_joined() {
+        let dir = std::env::temp_dir().join(format!("luch-kms-eof-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&1u32.to_be_bytes()); // payload length
+        frame.push(1); // key frame
+        frame.extend_from_slice(&0u64.to_be_bytes()); // capture timestamp
+        frame.push(7); // payload
+        std::fs::write(dir.join("frame.bin"), frame).unwrap();
+        let helper = dir.join("luch-kms");
+        std::fs::write(&helper, "#!/bin/sh\ncat \"$(dirname \"$0\")/frame.bin\"\n").unwrap();
+        std::fs::set_permissions(&helper, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        std::env::set_var("LUCH_KMS", &helper);
+        std::env::set_var("LUCH_KMS_SOCKET", dir.join("no-socket"));
+        let dead = Arc::new(AtomicBool::new(false));
+        let flag = dead.clone();
+        let bus = frame_bus::FrameBus::new();
+        let enc = encoder::create_with_fps(bus, crate::display::Size::default(), 60);
+        let g = spawn_kms(enc, false, crate::display::Size::default(), 60, move || {
+            flag.store(true, Ordering::SeqCst)
+        })
+        .unwrap();
+        for _ in 0..200 {
+            if dead.load(Ordering::SeqCst) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::env::remove_var("LUCH_KMS");
+        std::env::remove_var("LUCH_KMS_SOCKET");
+        assert!(dead.load(Ordering::SeqCst), "EOF must be reported as death");
+        // `stop` kills the (already gone) helper and joins the reader: it must not block.
+        g.stop();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn session_size_defaults_to_full_hd() {
@@ -1451,6 +1225,17 @@ mod tests {
     }
 
     #[test]
+    fn offered_drm_formats_are_nv12_and_driver_specific() {
+        // vapostproc may be absent (headless CI): then the pipeline falls back to its list.
+        if gst::init().is_ok() && gst::ElementFactory::find("vapostproc").is_some() {
+            if let Some(list) = offered_drm_formats() {
+                assert!(list.starts_with("{\"NV12:"), "{list}");
+                assert!(list.ends_with("\"}"), "{list}");
+            }
+        }
+    }
+
+    #[test]
     fn bitrate_scales_with_pixels_but_not_below_1080p() {
         assert_eq!(kbps_for(1920, 1080), VIDEO_KBPS);
         assert_eq!(kbps_for(1280, 720), VIDEO_KBPS);
@@ -1475,42 +1260,8 @@ mod tests {
         assert_eq!(u32::from_le_bytes(h[12..16].try_into().unwrap()), 48_000);
     }
 
-    #[test]
-    fn frame_is_sharded_and_reassembles() {
-        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let to = match rx.local_addr().unwrap() {
-            std::net::SocketAddr::V4(a) => a,
-            _ => unreachable!(),
-        };
-        let tx = Tx {
-            out: Out::Udp(UdpSocket::bind("127.0.0.1:0").unwrap()),
-            kind: KIND_VIDEO,
-            seq: AtomicU32::new(7),
-            warned: AtomicBool::new(false),
-            bytes: AtomicU64::new(0),
-            lat_sum: AtomicU64::new(0),
-        };
-        let sock = match &tx.out {
-            Out::Udp(s) => s,
-            _ => unreachable!(),
-        };
-        sock.connect(to).unwrap();
-        let frame: Vec<u8> = (0..SHARD * 2 + 100).map(|i| i as u8).collect();
-        tx.send_frame(&frame, F_IDR, 1234, 5);
-        let mut got = Vec::new();
-        let mut buf = [0u8; 2000];
-        for i in 0..3u16 {
-            let n = rx.recv(&mut buf).unwrap();
-            assert_eq!(u16::from_be_bytes([buf[2], buf[3]]), i);
-            assert_eq!(u16::from_be_bytes([buf[4], buf[5]]), 3);
-            assert_eq!(u32::from_be_bytes(buf[8..12].try_into().unwrap()), 7);
-            got.extend_from_slice(&buf[HEADER..n]);
-        }
-        assert_eq!(got, frame);
-    }
-
     #[tokio::test]
-    async fn kms_idr_resends_opus_head_without_requesting_video_idr() {
+    async fn wired_audio_prepends_opus_head_and_publishes_to_the_bus() {
         gst::init().unwrap();
         let pipeline =
             gst::parse::launch("appsrc name=src format=time ! appsink name=a sync=false")
@@ -1522,48 +1273,67 @@ mod tests {
             .unwrap()
             .downcast::<gst_app::AppSrc>()
             .unwrap();
-        let (tx, mut rx) = mpsc::channel(8);
-        let want_idr = Arc::new(AtomicBool::new(false));
-        let video = Arc::new(Tx::ws(KIND_VIDEO, tx.clone(), want_idr.clone()));
-        let audio = Arc::new(Tx::ws(KIND_AUDIO, tx, want_idr.clone()));
-        let need_head = wire(&pipeline, video, audio, want_idr.clone(), Size::default());
+        let bus = frame_bus::FrameBus::new();
+        let enc = encoder::create(bus.clone(), Size::default());
+        let mut rx = bus.subscribe_audio();
+        wire(&pipeline, enc, FPS);
         pipeline.set_state(gst::State::Playing).unwrap();
-        for _ in 0..2 {
-            // The KMS forwarding thread sets this on every IDR.
-            need_head.store(true, Ordering::Relaxed);
-            src.push_buffer(gst::Buffer::from_mut_slice(vec![0xf8, 0xff, 0xfe]))
-                .unwrap();
-            let config = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
-            let data = tokio::time::timeout(Duration::from_secs(2), rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(config[1], F_CONFIG);
-            assert_eq!(&config[HEADER..], &opus_head());
-            assert_eq!(data[1], 0);
-            assert!(!want_idr.load(Ordering::Relaxed));
-        }
+        src.push_buffer(gst::Buffer::from_mut_slice(vec![0xf8, 0xff, 0xfe]))
+            .unwrap();
+        // First audio frame carries the OpusHead config (the old need_head behaviour)...
+        let config = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(config.kind, KIND_AUDIO);
+        assert!(config.flags & F_CONFIG != 0);
+        assert_eq!(&config.data[..], &opus_head());
+        // ...followed by the Opus payload itself.
+        let data = tokio::time::timeout(Duration::from_secs(2), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(data.flags, 0);
+        assert_eq!(&*data.data, &[0xf8, 0xff, 0xfe]);
         pipeline.set_state(gst::State::Null).unwrap();
     }
 
-    #[tokio::test]
-    async fn ws_frame_is_one_whole_message() {
-        let (tx, mut rx) = mpsc::channel(1);
-        let want_idr = Arc::new(AtomicBool::new(false));
-        let t = Tx::ws(KIND_AUDIO, tx, want_idr.clone());
-        let frame: Vec<u8> = (0..SHARD * 2 + 100).map(|i| i as u8).collect();
-        t.send_frame(&frame, F_CONFIG, 42, 3); // fills the channel
-        t.send_frame(&frame, 0, 43, 3); // full: dropped, an IDR is requested instead of stalling
-        let msg = rx.recv().await.unwrap();
-        assert!(rx.try_recv().is_err());
-        assert_eq!(
-            &msg[..HEADER],
-            &header(KIND_AUDIO, F_CONFIG, 0, 1, 0, 42, frame.len() as u32, 3)
-        );
-        assert_eq!(&msg[HEADER..], &frame[..]);
-        assert!(want_idr.load(Ordering::Relaxed));
+    #[test]
+    fn fps_gate_phase_locks_to_the_source_grid() {
+        // 144 Hz source at 60: every third frame (48 fps), not "16.7 ms after the last".
+        let mut g = FpsGate::new(60);
+        let mut n = 0;
+        for i in 0..144 {
+            if g.accept(i * 1_000_000 / 144, false) {
+                n += 1;
+            }
+        }
+        assert!((47..=49).contains(&n), "{n}");
+
+        let mut g = FpsGate::new(30);
+        let mut n = 0;
+        for i in 0..144 {
+            if g.accept(i * 1_000_000 / 144, false) {
+                n += 1;
+            }
+        }
+        assert!((28..=30).contains(&n), "{n}");
+
+        let mut g = FpsGate::new(0);
+        for i in 0..144 {
+            assert!(g.accept(i, false));
+        }
+    }
+
+    #[test]
+    fn fps_gate_lets_keyframes_through_and_rephases() {
+        let mut g = FpsGate::new(60);
+        assert!(g.accept(0, false));
+        assert!(!g.accept(6_944, false)); // inside the slice
+        assert!(g.accept(6_944, true)); // forced IDR passes early and moves the grid
+        assert!(!g.accept(13_000, false));
+        // A capture restart (clock jumps far back) re-phases instead of stalling.
+        assert!(g.accept(10_000_000, false));
+        assert!(g.accept(0, false));
     }
 }
