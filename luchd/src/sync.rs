@@ -78,9 +78,12 @@ impl Mode {
     }
 }
 
-/// How D is chosen for a group (docs: sync, 6.6). Watching: the slowest need plus 2 ms, at least the floor, up at once
-/// and down by 1 ms a second after 30 s well below. Interactive: the picture at once, the sound at the later of its
+/// How D is chosen for a group (docs: sync, 6.6). Watching: 10 ms above the slowest need, at least the floor, up at
+/// once and down in one step after 30 s well below. Interactive: the picture at once, the sound at the later of its
 /// own need and the picture; the picture waits only for a speaker beyond the tolerance, by the excess.
+/// Watching: D is set this far above the slowest need, so that its small changes leave D where it is.
+pub const HEADROOM_MS: f64 = 10.0;
+
 pub struct Policy {
     mode: Mode,
     tolerance_ms: f64,
@@ -119,14 +122,16 @@ impl Policy {
         let (need, video) = (max(need_ms), max(video_pts_ms));
         match self.mode {
             Mode::Watching => {
-                let target = need.map_or(self.floor_ms, |n| self.floor_ms.max(n + 2.0));
-                let d = self.smooth(now_s, self.da, target, 1.0, 30.0, 10.0);
+                let least = need.map_or(self.floor_ms, |n| self.floor_ms.max(n + 2.0));
+                let set = need.map_or(self.floor_ms, |n| self.floor_ms.max(n + HEADROOM_MS));
+                let d = self.step(now_s, self.da, least, set, 0.0, 30.0, 10.0);
                 self.dv = d;
                 self.da = d;
             }
             Mode::Interactive => {
                 let (need, video) = (need.unwrap_or(0.0), video.unwrap_or(0.0));
-                let d = self.smooth(now_s, self.da, need.max(video), 1.0, 10.0, 5.0);
+                let least = need.max(video);
+                let d = self.step(now_s, self.da, least, least, 1.0, 10.0, 5.0);
                 self.dv = if d > video + self.tolerance_ms {
                     d - self.tolerance_ms
                 } else {
@@ -140,15 +145,30 @@ impl Policy {
         (r(self.dv), r(self.da))
     }
 
-    fn smooth(&mut self, now: f64, d: f64, target: f64, rise: f64, wait_s: f64, below: f64) -> f64 {
-        if self.first || target > d + rise || (target > d && d == 0.0) {
+    /// D moves seldom and in one step, since every change is a resync heard on every device at once: up to `set` as
+    /// soon as `least` is beyond it (by more than `rise`); down to `set` once it has been more than `below` under D for
+    /// `wait_s`. Falling by 1 ms a second instead made a resync every few seconds for minutes (the receivers slew at
+    /// 0.1 %, no faster).
+    #[allow(clippy::too_many_arguments)]
+    fn step(
+        &mut self,
+        now: f64,
+        d: f64,
+        least: f64,
+        set: f64,
+        rise: f64,
+        wait_s: f64,
+        below: f64,
+    ) -> f64 {
+        if self.first || least > d + rise || (least > d && d == 0.0) {
             self.low_since = None;
-            return target;
+            return set;
         }
-        if target < d - below {
+        if set < d - below {
             let since = *self.low_since.get_or_insert(now);
             if now - since >= wait_s {
-                return target.max(d - 1.0);
+                self.low_since = None;
+                return set;
             }
         } else {
             self.low_since = None;
@@ -317,21 +337,21 @@ mod tests {
     const WATCHING: [[f64; 5]; 10] = [
         [0.0, N, N, 150.0, 150.0],
         [1.0, 40.0, 120.0, 150.0, 150.0],
-        [2.0, 40.0, 210.0, 212.0, 212.0],
-        [3.0, 40.0, 230.5, 232.5, 232.5],
-        [4.0, 40.0, 200.0, 232.5, 232.5],
-        [33.0, 40.0, 200.0, 232.5, 232.5],
-        [34.0, 40.0, 200.0, 231.5, 231.5],
-        [35.0, 40.0, 200.0, 230.5, 230.5],
-        [36.0, 40.0, 229.0, 230.5, 230.5],
-        [37.0, 40.0, 240.0, 242.0, 242.0],
+        [2.0, 40.0, 210.0, 220.0, 220.0],
+        [3.0, 40.0, 230.5, 240.5, 240.5],
+        [4.0, 40.0, 200.0, 240.5, 240.5],
+        [33.0, 40.0, 200.0, 240.5, 240.5],
+        [34.0, 40.0, 200.0, 210.0, 210.0],
+        [35.0, 40.0, 200.0, 210.0, 210.0],
+        [36.0, 40.0, 229.0, 239.0, 239.0],
+        [37.0, 40.0, 240.0, 250.0, 250.0],
     ];
     const INTERACTIVE: [[f64; 5]; 7] = [
         [0.0, 30.0, 15.0, 0.0, 30.0],
         [1.0, 31.0, 15.0, 0.0, 30.0],
         [2.0, 33.0, 15.0, 0.0, 33.0],
         [3.0, 25.0, 15.0, 0.0, 33.0],
-        [13.0, 25.0, 15.0, 0.0, 32.0],
+        [13.0, 25.0, 15.0, 0.0, 25.0],
         [14.0, 25.0, 70.0, 50.0, 70.0],
         [15.0, 25.0, 40.0, 50.0, 70.0],
     ];

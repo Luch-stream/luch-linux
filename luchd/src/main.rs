@@ -1992,6 +1992,10 @@ async fn files() -> io::Result<&'static cast::Server> {
     FILES.get_or_try_init(cast::Server::start).await
 }
 
+/// The cover's token per (receiver, cover): the same link while the cover stays.
+static ART_LINKS: std::sync::LazyLock<std::sync::Mutex<HashMap<(String, String), String>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
 /// What the player on this computer plays, to every receiver that has a session with us (or only `only`):
 /// `now_playing` (PROTOCOL.md 4d), its cover shared with each receiver.
 async fn push_now_playing(st: &Shared, conn: &Connection, only: Option<&str>) {
@@ -2028,7 +2032,25 @@ async fn push_now_playing(st: &Shared, conn: &Connection, only: Option<&str>) {
                     None
                 };
                 if let Some(item) = item {
-                    let t = srv.share(item, tv, "image/jpeg");
+                    // One link per cover and TV while it stays: a new token at every update (position, pause) was a
+                    // new address, which the receiver loaded again, and the cover blinked.
+                    let key = (tv.to_string(), a.clone());
+                    let known = ART_LINKS
+                        .lock()
+                        .ok()
+                        .and_then(|m| m.get(&key).cloned())
+                        .filter(|t| srv.has(t));
+                    let t = match known {
+                        Some(t) => t,
+                        None => {
+                            let t = srv.share(item, tv, "image/jpeg");
+                            if let Ok(mut m) = ART_LINKS.lock() {
+                                m.retain(|(who, _), _| who != &key.0);
+                                m.insert(key, t.clone());
+                            }
+                            t
+                        }
+                    };
                     msg["art"] = json!(srv.url(me, &t, "cover.jpg"));
                 }
             }
