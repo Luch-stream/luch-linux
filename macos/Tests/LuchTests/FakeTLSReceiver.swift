@@ -17,6 +17,8 @@ final class FakeTLSReceiver {
     /// The answer to {"t":"direct"}; with one, the welcome's modes offer "direct".
     var directAnswer: [String: Any]?
     var id = "tv-1"
+    /// Its own log, handed over on {"t":"logs"} in gzip slices (the welcome then lists "logs"); nil: an older one.
+    var log: String?
 
     private let listener: NWListener
     private let queue = DispatchQueue(label: "fake.tls.receiver")
@@ -78,18 +80,30 @@ final class FakeTLSReceiver {
                 link.send(["t": "paired"])
             }
             link.send(["t": "welcome", "v": 1, "id": id, "name": "Living room TV", "decoders": ["video/avc"],
-                       "modes": ["mirror", "audio"] + (directAnswer == nil ? [] : ["direct"]), "hw": ["audio": ["audio/opus"]]])
+                       "modes": ["mirror", "audio"] + (directAnswer == nil ? [] : ["direct"]) + (log == nil ? [] : ["logs"]),
+                       "hw": ["audio": ["audio/opus"]], "sdk": 34])
             if !reports.isEmpty, (hello["want"] as? [String])?.contains("reports") == true {
                 link.send(["t": "reports", "items": reports])
             }
             while let m = read(link) {
                 // A session's media goes to `mediaPort`, sealed with `mediaKey` (PROTOCOL.md 4).
                 if m["t"] as? String == "direct", let a = directAnswer { link.send(a) }
+                if m["t"] as? String == "logs", let log { logSlices(log).forEach(link.send) }
                 if m["t"] as? String == "start" {
                     link.send(["t": "ready", "video_port": Int(mediaPort), "audio_port": Int(mediaPort),
                                "crypt": "aes-128-gcm", "key": Data(mediaKey).base64EncodedString()])
                 }
             }
+        }
+    }
+
+    /// 36 KB of gzip a line: 48 KB of base64, as the receiver cuts it.
+    func logSlices(_ text: String) -> [[String: Any]] {
+        let gz = gzip(Data(text.utf8))
+        let n = (gz.count + 36 * 1024 - 1) / (36 * 1024)
+        return (0..<n).map { i in
+            let slice = gz.subdata(in: (i * 36 * 1024)..<min(gz.count, (i + 1) * 36 * 1024))
+            return ["t": "logs", "part": i, "parts": n, "gz": slice.base64EncodedString()]
         }
     }
 

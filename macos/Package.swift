@@ -27,11 +27,13 @@ let package = Package(
         .target(name: "LuchCast", dependencies: ["LuchProto", "LuchNet", "LuchEngine"], path: "Sources/LuchCast"),
         .target(name: "LuchTV", dependencies: ["LuchProto", "LuchNet", "LuchCast"], path: "Sources/LuchTV"),
         .target(name: "LuchWeb", dependencies: ["LuchProto", "LuchNet", "LuchTV"], path: "Sources/LuchWeb"),
+        // "Report a Problem…": logs of this Mac and its receivers in one zip (ProblemReport.swift).
+        .target(name: "LuchReport", dependencies: ["LuchProto", "LuchNet"], path: "Sources/LuchReport"),
         .target(name: "LuchPresent", dependencies: ["LuchProto"], path: "Sources/LuchPresent",
                 linkerSettings: [.linkedFramework("PDFKit"), .linkedFramework("AppKit")]),
         .executableTarget(name: "luch", dependencies: ["LuchProto", "LuchNet", "LuchMedia", "LuchEngine"], path: "Sources/luch"),
-        .executableTarget(name: "LuchApp", dependencies: ["LuchProto", "LuchNet", "LuchMedia", "LuchEngine", "LuchLocal", "LuchCast", "LuchPresent", "LuchFind", "LuchTV", "LuchWeb"], path: "Sources/LuchApp"),
+        .executableTarget(name: "LuchApp", dependencies: ["LuchProto", "LuchNet", "LuchMedia", "LuchEngine", "LuchLocal", "LuchCast", "LuchPresent", "LuchFind", "LuchTV", "LuchWeb", "LuchReport"], path: "Sources/LuchApp"),
         .executableTarget(name: "luchctl", dependencies: ["LuchLocal"], path: "Sources/luchctl"),
-        .testTarget(name: "LuchTests", dependencies: ["LuchProto", "LuchNet", "LuchMedia", "LuchEngine", "LuchCast", "LuchLocal", "LuchPresent", "LuchFind", "LuchTV", "LuchWeb"], path: "Tests/LuchTests"),
+        .testTarget(name: "LuchTests", dependencies: ["LuchProto", "LuchNet", "LuchMedia", "LuchEngine", "LuchCast", "LuchLocal", "LuchPresent", "LuchFind", "LuchTV", "LuchWeb", "LuchReport"], path: "Tests/LuchTests"),
     ]
 )

@@ -104,7 +104,7 @@ public enum Reports {
     }
 
     /// Percent-encoding for a URL query value.
-    static func encode(_ s: String) -> String {
+    public static func encode(_ s: String) -> String {
         s.utf8.map { b -> String in
             let c = Character(UnicodeScalar(b))
             return b < 128 && (c.isLetter || c.isNumber || "-_.~".contains(c)) ? String(c) : String(format: "%%%02X", b)

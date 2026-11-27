@@ -175,6 +175,18 @@ luchctl forget <r>           # pair again next time (a receiver reset or reinsta
 luchctl reports              # what receivers reported; report <n> [open|dismiss]
 ```
 
+## Report a problem
+
+"Report a Problem…" in the menu (or `luchctl report [--keep-names] [what happened…]`) asks what happened and makes
+one zip in Downloads, shown in Finder: this Mac's log (the app keeps it in `~/Library/Logs/Luch/luch.log`, two
+files of 1 MB, where Console.app shows it too), the logs of the paired receivers on now that can hand theirs over
+(`{"t":"logs"}`; one not paired is not asked, as that would ask on its TV), `about.txt` (versions, this Mac, each
+receiver's welcome, the last session's plan and stats, what you wrote) and the receivers' crash reports. "Hide
+addresses and names" (on unless `--keep-names`) turns IPv4 addresses into 192.0.2.N, IPv6 into 2001:db8::N, MACs
+into 02:00:00:00:00:NN and the names of this Mac, its user and the receivers into Computer, User, Receiver 1….
+Nothing is sent anywhere: Copy Description gives a few lines for a chat, Open an Issue a filled-in issue to attach
+the file to.
+
 ## Not yet
 
 - gamepads from the TV: a virtual one needs a DriverKit HID driver (`com.apple.developer.hid.virtual.device`);

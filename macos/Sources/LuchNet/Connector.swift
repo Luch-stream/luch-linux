@@ -59,7 +59,10 @@ public final class Connector {
 
     /// Connects and says `hello` (built by the caller: v0, id, name, app, want); over TLS it becomes the v1 hello.
     /// `token`: the one-time pairing token from the receiver's QR code or sound (PROTOCOL.md 1e).
-    public func open(_ r: Receiver, hello: [String: Any], token: String? = nil, timeout: TimeInterval = 5) throws -> Connection {
+    /// `mayPair` false: a receiver that asks for pairing is left at once, nothing waits for its code (a problem
+    /// report must not leave a code on a TV).
+    public func open(_ r: Receiver, hello: [String: Any], token: String? = nil, timeout: TimeInterval = 5,
+                     mayPair: Bool = true) throws -> Connection {
         lock.lock()
         let pending = waiting[r.id] != nil
         let step = states[r.id]?["step"] as? String
@@ -112,7 +115,7 @@ public final class Connector {
         }
         // A token is good for one hello only: on the plain port it stands for the Allow on the TV; over TLS the
         // receiver uses it up and still asks for its code.
-        if let token = token ?? takeToken?(r.id) { h["token"] = token }
+        if let token = token ?? (mayPair ? takeToken?(r.id) : nil) { h["token"] = token }
         ctl.send(h)
         guard let first = ctl.waitForAny(["welcome", "pair", "pair_refused"], timeout: timeout) else {
             ctl.closeChannel("no welcome")
@@ -125,6 +128,9 @@ public final class Connector {
         case "welcome":
             log("connected to \(r.name) (\(r.address) via \(r.interfaceName)\(ctl.secure ? ", TLS" : ", not encrypted"))")
             return Connection(channel: ctl, welcome: first)
+        case "pair" where !mayPair:
+            ctl.closeChannel("pairing not asked for")
+            throw ConnectError.pairingNeeded(id: r.id, name: r.name, allowFirst: first["step"] as? String == "allow")
         case "pair":
             guard let me, let theirs else { throw ConnectError.failed("pairing asked for without TLS") }
             let slot = CodeSlot()

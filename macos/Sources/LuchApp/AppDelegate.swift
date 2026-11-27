@@ -83,14 +83,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let menu = NSMenu()
     private let discovery = Discovery()
     /// Receivers past mDNS, the ones talked to before, waking them (Finding.swift).
-    private lazy var finding = Finding(discovery: discovery)
+    private(set) lazy var finding = Finding(discovery: discovery)
     /// Do-not-disturb follows a mirroring session (sound only does not count).
     private(set) var engine: Engine? { didSet { caster.presenter.mirroring(engine.map { !$0.options.soundOnly } ?? false) } }
     private var state = "Idle"
     private var statsLine = "Not streaming"
     private var statsItem: NSMenuItem?
     private var timer: Timer?
-    private var receivers: [Receiver] = []
+    private(set) var receivers: [Receiver] = []
     private var pendingMenuRefresh = false
     private var menuOpen = false
     private var server: LocalServer?
@@ -107,8 +107,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var presetOverride: QualityPreset?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        logFile = Bundle.main.bundleURL.deletingLastPathComponent()
-            .appendingPathComponent("luch-app.log").path
+        logFile = defaultLogFile()
+        // Where it went before, unbounded.
+        try? FileManager.default.removeItem(at: Bundle.main.bundleURL.deletingLastPathComponent()
+            .appendingPathComponent("luch-app.log"))
         log("app: launched, bundle \(Bundle.main.bundleURL.lastPathComponent)")
         // A write to a socket the other side has closed (a receiver restarted mid-session, luchctl gone before its
         // answer) must be an error, not SIGPIPE: that ends the whole app silently, with no crash report.
@@ -174,6 +176,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return PairingCommands.handle(request, receivers: known)
             }
             if let answer = self.together.intercept(request) { return answer }
+            if Self.reportCommands.contains(request["cmd"] as? String ?? "") { return self.handleReport(request) }
             // What waits for a receiver's answer runs here, on the socket's thread, not on the main one.
             if WebReceiver.commands.contains(request["cmd"] as? String ?? "") { return webReceiver.handle(request) }
             if Caster.commands.contains(request["cmd"] as? String ?? "") {
@@ -455,6 +458,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(login)
 
         menu.addItem(.separator())
+        menu.addItem(reportMenuItem())
         let quit = NSMenuItem(title: "Quit Luch", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         menu.addItem(quit)
     }
