@@ -18,8 +18,18 @@ public final class FileServer {
     private struct Entry {
         let item: CastItem
         let client: String
-        let mime: String
+        var mime: String
+        /// Sent with every answer for it (a DLNA TV's `CaptionInfo.sec`).
+        var headers: [(String, String)] = []
+        /// A SubRip file served as WebVTT, the only text a Chromecast reads.
+        var vtt = false
     }
+
+    /// `contentFeatures.dlna.org` for what plays (DLNA 7.4.1.3.17): byte seeks work (OP=01), streaming transfer, DLNA
+    /// 1.5. Many TVs will not play a link whose server does not say so when asked.
+    public static let dlnaStream = "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000"
+    /// The same for a picture: interactive transfer, no seeking.
+    public static let dlnaPhoto = "DLNA.ORG_OP=00;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=00D00000000000000000000000000000"
 
     public private(set) var port: UInt16 = 0
     private var listenFD: Int32 = -1
@@ -89,6 +99,31 @@ public final class FileServer {
         lock.unlock()
     }
 
+    /// The token of one of our links.
+    private static func token(of url: String) -> String? {
+        url.components(separatedBy: "://").dropFirst().first?.split(separator: "/", omittingEmptySubsequences: false)
+            .dropFirst().first.map(String.init)
+    }
+
+    /// Adds a header to every answer for the shared link `url` (one of ours).
+    public func addHeader(url: String, name: String, value: String) {
+        guard let t = Self.token(of: url) else { return }
+        lock.lock()
+        shared[t]?.headers.append((name, value))
+        lock.unlock()
+    }
+
+    /// Serves the shared SubRip file `url` as WebVTT from now on; false when it is no local SubRip file of ours.
+    public func asVTT(url: String) -> Bool {
+        guard let t = Self.token(of: url) else { return false }
+        lock.lock()
+        defer { lock.unlock() }
+        guard let e = shared[t], case .file(let f) = e.item, f.pathExtension.lowercased() == "srt" else { return false }
+        shared[t]?.vtt = true
+        shared[t]?.mime = "text/vtt"
+        return true
+    }
+
     public var sharedCount: Int {
         lock.lock()
         defer { lock.unlock() }
@@ -120,8 +155,42 @@ public final class FileServer {
     struct Request {
         var path = ""
         var head = false
+        var options = false
         var range: String?
         var close = false
+        /// A DLNA TV asked `getcontentFeatures.dlna.org: 1`.
+        var dlnaFeatures = false
+        /// A DLNA TV's `transferMode.dlna.org`, echoed back.
+        var transferMode: String?
+        /// A Chromecast's page fetches with an `Origin`: the answer needs CORS headers.
+        var origin = false
+    }
+
+    /// What a Chromecast's page may ask before fetching (everything here is behind a token and one client anyway).
+    static let corsPreflight = [("Access-Control-Allow-Origin", "*"), ("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS"),
+                                ("Access-Control-Allow-Headers", "Range, Content-Type, Origin, Accept"),
+                                ("Access-Control-Max-Age", "600")]
+
+    /// The headers an answer for `e` adds: the entry's own, DLNA's when asked, CORS for a page.
+    private static func extraHeaders(_ e: Entry, _ req: Request) -> [(String, String)] {
+        var h = e.headers
+        if req.dlnaFeatures { h.append(("contentFeatures.dlna.org", e.mime.hasPrefix("image/") ? dlnaPhoto : dlnaStream)) }
+        if let m = req.transferMode { h.append(("transferMode.dlna.org", m)) }
+        if req.origin {
+            h.append(("Access-Control-Allow-Origin", "*"))
+            h.append(("Access-Control-Expose-Headers", "Content-Length, Content-Range, Accept-Ranges"))
+        }
+        return h
+    }
+
+    /// SubRip as WebVTT: a header, and the decimal comma of the times made a point.
+    public static func srtToVTT(_ srt: String) -> String {
+        var out = "WEBVTT\n\n"
+        let text = srt.hasPrefix("\u{feff}") ? String(srt.dropFirst()) : srt
+        text.enumerateLines { line, _ in
+            out += (line.contains("-->") ? line.replacingOccurrences(of: ",", with: ".") : line) + "\n"
+        }
+        return out
     }
 
     /// Reads one request head; nil at the end of the connection.
@@ -142,14 +211,18 @@ public final class FileServer {
         let method = first.first.map(String.init) ?? ""
         r.path = first.count > 1 ? String(first[1]) : "/"
         r.head = method == "HEAD"
+        r.options = method == "OPTIONS"
         if first.count > 2 && first[2] == "HTTP/1.0" { r.close = true }
-        if method != "GET" && method != "HEAD" { r.path = "" }
+        if method != "GET" && method != "HEAD" && !r.options { r.path = "" }
         for l in lines {
             guard let colon = l.firstIndex(of: ":") else { continue }
             let k = l[..<colon].trimmingCharacters(in: .whitespaces).lowercased()
             let v = l[l.index(after: colon)...].trimmingCharacters(in: .whitespaces)
             if k == "range" { r.range = v }
             if k == "connection" && v.lowercased() == "close" { r.close = true }
+            if k == "getcontentfeatures.dlna.org" && v == "1" { r.dlnaFeatures = true }
+            if k == "transfermode.dlna.org" { r.transferMode = v }
+            if k == "origin" { r.origin = true }
         }
         return r
     }
@@ -157,6 +230,11 @@ public final class FileServer {
     private func serve(fd: Int32, peer: String) {
         var carry = Data()
         while let req = FileServer.readRequest(fd, carry: &carry) {
+            if req.options {
+                // A Chromecast's page asks first whether it may fetch with a Range header (CORS preflight).
+                if !FileServer.respond(fd, 204, headers: FileServer.corsPreflight) || req.close { return }
+                continue
+            }
             let token = req.path.split(separator: "/").first.map(String.init) ?? ""
             lock.lock()
             let entry = shared[token]
@@ -169,10 +247,16 @@ public final class FileServer {
                 if !FileServer.respond(fd, 403) || req.close { return }
                 continue
             }
+            let extra = FileServer.extraHeaders(entry, req)
             let keep: Bool
             switch entry.item {
-            case .file(let url): keep = FileServer.sendFile(fd, url: url, mime: entry.mime, req: req)
-            case .relay(let url, let headers): keep = relay(fd, url: url, headers: headers, req: req, client: entry.client)
+            case .file(let url) where entry.vtt:
+                let text = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
+                keep = FileServer.respond(fd, 200, headers: [("Content-Type", "text/vtt; charset=utf-8")] + extra,
+                                          body: req.head ? Data() : Data(FileServer.srtToVTT(text).utf8))
+            case .file(let url): keep = FileServer.sendFile(fd, url: url, mime: entry.mime, req: req, extra: extra)
+            case .relay(let url, let headers):
+                keep = relay(fd, url: url, headers: headers, req: req, client: entry.client, extra: extra)
             }
             if !keep || req.close { return }
         }
@@ -181,6 +265,7 @@ public final class FileServer {
     static func reason(_ code: Int) -> String {
         switch code {
         case 200: return "OK"
+        case 204: return "No Content"
         case 206: return "Partial Content"
         case 403: return "Forbidden"
         case 404: return "Not Found"
@@ -230,7 +315,7 @@ public final class FileServer {
         return start <= end && start < size ? (start, end) : nil
     }
 
-    static func sendFile(_ fd: Int32, url: URL, mime: String, req: Request) -> Bool {
+    static func sendFile(_ fd: Int32, url: URL, mime: String, req: Request, extra: [(String, String)] = []) -> Bool {
         guard let h = try? FileHandle(forReadingFrom: url),
               let size = (try? FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.uint64Value else {
             return respond(fd, 404)
@@ -248,6 +333,7 @@ public final class FileServer {
         let length = size == 0 ? 0 : end - start + 1
         var head = "HTTP/1.1 \(code) \(reason(code))\r\nContent-Type: \(mime)\r\nAccept-Ranges: bytes\r\nContent-Length: \(length)\r\n"
         if code == 206 { head += "Content-Range: bytes \(start)-\(end)/\(size)\r\n" }
+        for (k, v) in extra { head += "\(k): \(v)\r\n" }
         head += "\r\n"
         guard write(fd, Data(head.utf8)) else { return false }
         if req.head || length == 0 { return true }
@@ -273,12 +359,13 @@ public final class FileServer {
         return String(cString: buf)
     }
 
-    private func relay(_ fd: Int32, url: String, headers: [String: String], req: Request, client: String) -> Bool {
+    private func relay(_ fd: Int32, url: String, headers: [String: String], req: Request, client: String,
+                       extra: [(String, String)]) -> Bool {
         guard let u = URL(string: url) else { return FileServer.respond(fd, 502) }
         var r = URLRequest(url: u)
         for (k, v) in headers { r.setValue(v, forHTTPHeaderField: k) }
         if let range = req.range { r.setValue(range, forHTTPHeaderField: "Range") }
-        let pipe = RelayPipe(fd: fd, head: req.head)
+        let pipe = RelayPipe(fd: fd, head: req.head, extra: extra)
         let task = session.dataTask(with: r)
         task.delegate = pipe
         task.resume()
@@ -292,7 +379,7 @@ public final class FileServer {
                 let t = self.share(.relay(url: abs, headers: headers), client: client, mime: "")
                 return self.url(host: me, token: t, name: Playlist.lastSegment(abs))
             }
-            return FileServer.respond(fd, 200, headers: [("Content-Type", "application/vnd.apple.mpegurl")],
+            return FileServer.respond(fd, 200, headers: [("Content-Type", "application/vnd.apple.mpegurl")] + extra,
                                       body: req.head ? Data() : Data(out.utf8))
         }
         return pipe.keepAlive && !pipe.failed
@@ -303,6 +390,7 @@ public final class FileServer {
 final class RelayPipe: NSObject, URLSessionDataDelegate {
     let fd: Int32
     let head: Bool
+    let extra: [(String, String)]
     let done = DispatchSemaphore(value: 0)
     var wroteHead = false
     var failed = false
@@ -310,9 +398,10 @@ final class RelayPipe: NSObject, URLSessionDataDelegate {
     var playlist: Data?
     var finalURL: String?
 
-    init(fd: Int32, head: Bool) {
+    init(fd: Int32, head: Bool, extra: [(String, String)]) {
         self.fd = fd
         self.head = head
+        self.extra = extra
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive response: URLResponse,
@@ -330,6 +419,7 @@ final class RelayPipe: NSObject, URLSessionDataDelegate {
         for k in ["Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "Last-Modified", "ETag"] {
             if let v = http?.value(forHTTPHeaderField: k) { h += "\(k): \(v)\r\n" }
         }
+        for (k, v) in extra { h += "\(k): \(v)\r\n" }
         if http?.value(forHTTPHeaderField: "Content-Length") == nil {
             h += "Connection: close\r\n"
             keepAlive = false

@@ -23,9 +23,10 @@ let package = Package(
         .target(name: "LuchNowPlaying", path: "Sources/LuchNowPlaying", linkerSettings: [.linkedFramework("AppKit")]),
         .target(name: "LuchLocal", dependencies: ["LuchProto"], path: "Sources/LuchLocal"),
         .target(name: "LuchCast", dependencies: ["LuchProto", "LuchNet", "LuchEngine"], path: "Sources/LuchCast"),
+        .target(name: "LuchTV", dependencies: ["LuchProto", "LuchCast"], path: "Sources/LuchTV"),
         .executableTarget(name: "luch", dependencies: ["LuchProto", "LuchNet", "LuchMedia", "LuchEngine"], path: "Sources/luch"),
-        .executableTarget(name: "LuchApp", dependencies: ["LuchProto", "LuchNet", "LuchMedia", "LuchEngine", "LuchLocal", "LuchCast"], path: "Sources/LuchApp"),
+        .executableTarget(name: "LuchApp", dependencies: ["LuchProto", "LuchNet", "LuchMedia", "LuchEngine", "LuchLocal", "LuchCast", "LuchTV"], path: "Sources/LuchApp"),
         .executableTarget(name: "luchctl", dependencies: ["LuchLocal"], path: "Sources/luchctl"),
-        .testTarget(name: "LuchTests", dependencies: ["LuchProto", "LuchNet", "LuchMedia", "LuchEngine", "LuchCast", "LuchLocal"], path: "Tests/LuchTests"),
+        .testTarget(name: "LuchTests", dependencies: ["LuchProto", "LuchNet", "LuchMedia", "LuchEngine", "LuchCast", "LuchLocal", "LuchTV"], path: "Tests/LuchTests"),
     ]
 )
