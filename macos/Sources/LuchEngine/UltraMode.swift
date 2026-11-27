@@ -27,11 +27,15 @@ public enum UltraMode {
     public static func choose(_ priority: UltraPriority, caps: ReceiverCaps, macPixelWidth: Int) -> DisplayMode? {
         let maxW = caps.video.values.map(\.maxWidth).max() ?? 0
         let maxH = caps.video.values.map(\.maxHeight).max() ?? 0
-        var modes = caps.displayModes.filter { m in
-            (maxW == 0 || m.width <= maxW) && (maxH == 0 || m.height <= maxH) && m.width >= 1280
+        // The panel's modes and the one Android draws in now (a 4K projector often lists only 3840x2160 and draws its
+        // UI at 1920x1080, which it scales by exactly two).
+        var all = caps.displayModes
+        if caps.renderWidth > 0, caps.renderHeight > 0 {
+            let current = DisplayMode(width: caps.renderWidth, height: caps.renderHeight, hz: max(30, caps.refreshRate))
+            if !all.contains(current) { all.append(current) }
         }
-        if modes.isEmpty, caps.renderWidth > 0, caps.renderHeight > 0 {
-            modes = [DisplayMode(width: caps.renderWidth, height: caps.renderHeight, hz: max(30, caps.refreshRate))]
+        let modes = all.filter { m in
+            (maxW == 0 || m.width <= maxW) && (maxH == 0 || m.height <= maxH) && m.width >= 1280
         }
         guard !modes.isEmpty else { return nil }
         // Of one size the fastest rate; then the size by priority.
