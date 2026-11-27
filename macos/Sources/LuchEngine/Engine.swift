@@ -82,6 +82,8 @@ public struct MirrorOptions {
     // 20 ms measured best on a real Android receiver: 5 ms and 10 ms crackled because the
     // receiver's AudioTrack buffer (~4 frames) underruns on Wi-Fi jitter.
     public var audioFrameMs = 20
+    /// How the sound goes with the picture (PROTOCOL.md 4, "Audio modes"); `audio` false still means none at all.
+    public var audioMode = AudioMode.auto
     public var codec: CodecChoice = .auto
     public var fit: FitMode = .crop
     public var profile: VideoProfile?
@@ -372,9 +374,8 @@ public final class Engine {
             video["operating_rate"] = true
             start["video"] = video
         }
-        if plan.audio {
-            start["audio"] = ["codec": "audio/opus", "rate": 48_000, "channels": 2,
-                              "frame_ms": options.audioFrameMs]
+        if plan.audio, let audio = options.audioMode.startBlock(limits: caps.limits, frameMs: options.audioFrameMs) {
+            start["audio"] = audio
         }
         let ready = try startWhenAllowed(ctl, start)
         guard let videoPort = (ready["video_port"] as? NSNumber)?.uint16Value, videoPort > 0 else {
@@ -510,6 +511,13 @@ public final class Engine {
         onStopped?(reason)
         if terminateOnStop { exit(0) }
         if ownsRunLoop { CFRunLoopStop(CFRunLoopGetMain()) }
+    }
+
+    /// A control message to the receiver of the running session (the latency lab's flag, an offset).
+    @discardableResult
+    public func send(_ message: [String: Any]) -> Bool {
+        guard running, !stopping, let control else { return false }
+        return control.send(message)
     }
 
     // MARK: - wiring

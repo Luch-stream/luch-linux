@@ -31,9 +31,10 @@ public enum Proto {
     public static let audioFrameMs = 5
     public static let app = "luch/0.1 (macos)"
 
-    /// 24-byte big-endian datagram header.
+    /// 24-byte big-endian datagram header. `delay`: the playout delay D in 0.1 ms (PROTOCOL.md 4k), 0 = at once.
     public static func header(kind: MediaKind, flags: PacketFlags, shard: UInt16, shards: UInt16,
-                              seq: UInt32, ptsUS: UInt32, frameLen: UInt32, hostLat: UInt16) -> [UInt8] {
+                              seq: UInt32, ptsUS: UInt32, frameLen: UInt32, hostLat: UInt16,
+                              delay: UInt16 = 0) -> [UInt8] {
         var h = [UInt8](repeating: 0, count: headerSize)
         h[0] = kind.rawValue
         h[1] = flags.rawValue
@@ -44,7 +45,7 @@ public enum Proto {
         h.putBE32(12, ptsUS)
         h.putBE32(16, frameLen)
         h.putBE16(20, hostLat)
-        h.putBE16(22, 0)
+        h.putBE16(22, delay)
         return h
     }
 
