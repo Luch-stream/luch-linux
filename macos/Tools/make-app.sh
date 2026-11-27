@@ -51,6 +51,10 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <string>Luch listens for a TV saying its address by sound, only while you ask it to find receivers that way.</string>
     <key>NSCameraUsageDescription</key>
     <string>Luch reads the QR code on a TV's screen, only while you ask it to find receivers that way.</string>
+    <key>NSLocationUsageDescription</key>
+    <string>Luch reads the name of your Wi-Fi network only when you connect directly to a TV, to come back to it after.</string>
+    <key>NSLocationWhenInUseUsageDescription</key>
+    <string>Luch reads the name of your Wi-Fi network only when you connect directly to a TV, to come back to it after.</string>
     <key>NSBonjourServices</key>
     <array>
         <string>_luch._tcp</string>

@@ -46,7 +46,7 @@ enum FindCommands {
             _ = try ask(["cmd": "set_wake", "id": r["id"] as? String ?? "", "kind": rest[1],
                          "value": rest[2] == "off" ? "" : rest[2]])
         default:
-            throw Refusal("usage: luchctl find [auto|all|mdns,scan,ble,sound,qr] | add <link|host[:port]> | refresh | id"
+            throw Refusal("usage: luchctl find [auto|all|mdns,scan,ble,sound,qr,direct] | add <link|host[:port]> | refresh | id"
                 + " | info [r] | known | wake [r] | wake <r> learn | wake <r> mac|ble <value>|off")
         }
     }
@@ -91,6 +91,13 @@ enum FindCommands {
             print([r["name"] as? String ?? "?", "\(r["address"] as? String ?? "?"):\(r["port"] as? NSNumber ?? 0)",
                    r["iface"] as? String ?? "-", r["model"] as? String ?? "", how.isEmpty ? "-" : how]
                 .joined(separator: "\t"))
+        }
+        // Heard over Bluetooth but not on this network: reachable only by connecting directly.
+        let nearby = (try? ask(["cmd": "direct_status"])["status"] as? [String: Any])??["nearby"] as? [[String: Any]] ?? []
+        for n in nearby where n["listed"] as? Bool != true {
+            let id = n["id"] as? String ?? "?"
+            let rssi = (n["rssi"] as? NSNumber).map { " \($0) dBm" } ?? ""
+            print("\(n["name"] as? String ?? id)\t-\t-\t\tble\(rssi), direct possible: `luchctl direct \(id)`")
         }
     }
 

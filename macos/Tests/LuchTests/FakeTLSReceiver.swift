@@ -14,6 +14,9 @@ final class FakeTLSReceiver {
     var askFirst = false
     /// Sent right after the welcome to a sender that wants them.
     var reports: [[String: Any]] = []
+    /// The answer to {"t":"direct"}; with one, the welcome's modes offer "direct".
+    var directAnswer: [String: Any]?
+    var id = "tv-1"
 
     private let listener: NWListener
     private let queue = DispatchQueue(label: "fake.tls.receiver")
@@ -74,13 +77,14 @@ final class FakeTLSReceiver {
                 lock.unlock()
                 link.send(["t": "paired"])
             }
-            link.send(["t": "welcome", "v": 1, "id": "tv-1", "name": "Living room TV", "decoders": ["video/avc"],
-                       "modes": ["mirror", "audio"], "hw": ["audio": ["audio/opus"]]])
+            link.send(["t": "welcome", "v": 1, "id": id, "name": "Living room TV", "decoders": ["video/avc"],
+                       "modes": ["mirror", "audio"] + (directAnswer == nil ? [] : ["direct"]), "hw": ["audio": ["audio/opus"]]])
             if !reports.isEmpty, (hello["want"] as? [String])?.contains("reports") == true {
                 link.send(["t": "reports", "items": reports])
             }
             while let m = read(link) {
                 // A session's media goes to `mediaPort`, sealed with `mediaKey` (PROTOCOL.md 4).
+                if m["t"] as? String == "direct", let a = directAnswer { link.send(a) }
                 if m["t"] as? String == "start" {
                     link.send(["t": "ready", "video_port": Int(mediaPort), "audio_port": Int(mediaPort),
                                "crypt": "aes-128-gcm", "key": Data(mediaKey).base64EncodedString()])

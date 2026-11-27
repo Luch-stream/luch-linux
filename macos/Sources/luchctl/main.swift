@@ -63,6 +63,7 @@ func chooseReceiver() -> String? {
 }
 
 if FindCommands.handles(args) { exit(FindCommands.run(args)) }
+if DirectCommands.handles(args) { exit(DirectCommands.run(args)) }
 
 switch command {
 case "list":
