@@ -9,6 +9,8 @@ import LuchLocal
 import LuchMedia
 import LuchNet
 import LuchProto
+import LuchTV
+import LuchWeb
 import ServiceManagement
 
 final class Preferences {
@@ -134,6 +136,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ReportNotices.shared.start()
         setUpPresenting { [weak self] id in self?.currentReceiverID == id ? self?.engine : nil }
         wireTogether()
+        caster.tvs.onChange = { [weak self] in DispatchQueue.main.async { self?.refreshReceivers() } }
+        caster.tvs.start()
+        startWebReceiver()
 
         rebuildMenu()
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.tick() }
@@ -164,6 +169,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             if let answer = self.together.intercept(request) { return answer }
             // What waits for a receiver's answer runs here, on the socket's thread, not on the main one.
+            if WebReceiver.commands.contains(request["cmd"] as? String ?? "") { return webReceiver.handle(request) }
             if Caster.commands.contains(request["cmd"] as? String ?? "") {
                 var known: [Receiver] = []
                 var mirroring: String?
@@ -200,7 +206,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return ["receivers": receivers.map { receiver in
                 ["id": receiver.id, "name": receiver.name, "model": receiver.model,
                  "address": receiver.address, "iface": receiver.interfaceName,
-                 "port": Int(receiver.port),
+                 "port": Int(receiver.port), "kind": TVKind.of(receiver.id).rawValue,
                  "mirroring": engine != nil && currentReceiverID == receiver.id]
             }]
         case "state":
@@ -225,6 +231,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let match = receivers.first { $0.id == wanted || $0.name == wanted }
                 ?? (receivers.count == 1 ? receivers[0] : nil)
             guard let receiver = match else { return ["error": "receiver not found"] }
+            if TVKind.of(receiver.id) != .luch {
+                return ["error": "\(receiver.name) has no Luch app: it plays files and links (luchctl cast), not this screen"]
+            }
             if let word = request["source"] as? String {
                 guard let source = MirrorSource.parse(word, which: request["which"] as? String) else {
                     return ["error": "mirror: fast|monitor|window|virtual|audio or asis|extend|speed|quality|mac"]
@@ -276,8 +285,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - menu
 
-    private func refreshReceivers() {
-        receivers = finding.finder.list()
+    func refreshReceivers() {
+        receivers = caster.rows(finding.finder.list()) + webReceiver.receivers
         rebuildMenu()
     }
 
@@ -296,8 +305,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         for (index, receiver) in receivers.enumerated() {
             let item = NSMenuItem(title: receiver.name, action: nil, keyEquivalent: "")
-            item.submenu = receiverMenu(receiver)
-            if caster.existing(receiver.id)?.showing != nil || currentReceiverID == receiver.id { item.state = .on }
+            let luch = TVKind.of(receiver.id) == .luch
+            item.submenu = receiver.service == "web" ? webBrowserMenu(receiver) : luch ? receiverMenu(receiver) : tvMenu(receiver)
+            if caster.existing(receiver.id)?.showing != nil || currentReceiverID == receiver.id
+                || caster.tvs.session(receiver.id) != nil { item.state = .on }
             if index == 0 { item.image = NSImage(systemSymbolName: "tv", accessibilityDescription: nil) }
             menu.addItem(item)
         }
@@ -422,6 +433,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         display.submenu = displayMenu
         menu.addItem(display)
 
+        menu.addItem(webMenuItem())
         menu.addItem(.separator())
 
         menu.addItem(quietItem())
@@ -471,7 +483,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - actions
 
     @objc private func mirrorIfSingle() {
-        guard engine == nil, receivers.count == 1 else { return }
+        guard engine == nil, receivers.count == 1, TVKind.of(receivers[0].id) == .luch else { return }
         startMirror(receivers[0])
     }
 
@@ -629,7 +641,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statsItem?.title = line
     }
 
-    @objc private func stopMirror() {
+    @objc func stopMirror() {
         guard let engine else { return }
         self.engine = nil
         currentReceiverID = nil
@@ -897,7 +909,7 @@ extension AppDelegate {
         }
     }
 
-    private func chooseFiles(for r: Receiver) {
+    func chooseFiles(for r: Receiver) {
         let panel = NSOpenPanel()
         panel.title = "Show on \(r.name)"
         panel.prompt = "Show"

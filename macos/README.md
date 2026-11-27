@@ -278,3 +278,17 @@ luchctl info | id | refresh
 macOS lets no app advertise manufacturer data (CoreBluetooth sends only a name and service UUIDs, and IOBluetooth's
 HCI calls do nothing since the stack moved into bluetoothd), so the Mac can learn the remote's signal but not send
 it: a Luch receiver or phone that is on and lists `ble_wake` in its welcome sends it for the Mac.
+
+## TVs without Luch and the web receiver
+
+Chromecasts and Google TVs (mDNS `_googlecast._tcp`, Google Cast on port 8009) and DLNA/UPnP renderers (SSDP, on
+nearly every smart TV) are listed next to the Luch receivers, one row per TV (a TV with Luch keeps its Luch row), and
+`luchctl list` shows how each is reached (luch, cast, dlna). `cast`, `media`, `volume` and `stop-cast` work for them
+as in luch-linux's docs/other-tvs.md; they play files and links, not this screen. The file server answers what they
+ask for: DLNA's content features, CORS for a Chromecast's page, SubRip as WebVTT.
+
+Any browser with WebCodecs (a TV's will do) can watch this screen: open `https://<this Mac>:47801/` (Web Receiver in
+the menu has the address; the certificate is this Mac's own, so the browser asks once). A new browser shows a 4-digit
+code and the Mac asks whether to let it in, showing the same code; an allowed one keeps a cookie and is not asked
+again. `luchctl web` lists the allowed browsers and the one waiting, `luchctl web allow|deny <code>` answers it,
+`luchctl web forget <n>` forgets one.

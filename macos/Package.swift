@@ -25,11 +25,13 @@ let package = Package(
         // Finding receivers past mDNS and waking them (PROTOCOL.md 1, luchd's find/ and wake.rs).
         .target(name: "LuchFind", dependencies: ["LuchProto", "LuchNet"], path: "Sources/LuchFind"),
         .target(name: "LuchCast", dependencies: ["LuchProto", "LuchNet", "LuchEngine"], path: "Sources/LuchCast"),
+        .target(name: "LuchTV", dependencies: ["LuchProto", "LuchNet", "LuchCast"], path: "Sources/LuchTV"),
+        .target(name: "LuchWeb", dependencies: ["LuchProto", "LuchNet", "LuchTV"], path: "Sources/LuchWeb"),
         .target(name: "LuchPresent", dependencies: ["LuchProto"], path: "Sources/LuchPresent",
                 linkerSettings: [.linkedFramework("PDFKit"), .linkedFramework("AppKit")]),
         .executableTarget(name: "luch", dependencies: ["LuchProto", "LuchNet", "LuchMedia", "LuchEngine"], path: "Sources/luch"),
-        .executableTarget(name: "LuchApp", dependencies: ["LuchProto", "LuchNet", "LuchMedia", "LuchEngine", "LuchLocal", "LuchCast", "LuchPresent", "LuchFind"], path: "Sources/LuchApp"),
+        .executableTarget(name: "LuchApp", dependencies: ["LuchProto", "LuchNet", "LuchMedia", "LuchEngine", "LuchLocal", "LuchCast", "LuchPresent", "LuchFind", "LuchTV", "LuchWeb"], path: "Sources/LuchApp"),
         .executableTarget(name: "luchctl", dependencies: ["LuchLocal"], path: "Sources/luchctl"),
-        .testTarget(name: "LuchTests", dependencies: ["LuchProto", "LuchNet", "LuchMedia", "LuchEngine", "LuchCast", "LuchLocal", "LuchPresent", "LuchFind"], path: "Tests/LuchTests"),
+        .testTarget(name: "LuchTests", dependencies: ["LuchProto", "LuchNet", "LuchMedia", "LuchEngine", "LuchCast", "LuchLocal", "LuchPresent", "LuchFind", "LuchTV", "LuchWeb"], path: "Tests/LuchTests"),
     ]
 )

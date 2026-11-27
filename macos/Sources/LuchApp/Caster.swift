@@ -5,6 +5,7 @@ import Foundation
 import LuchCast
 import LuchNet
 import LuchProto
+import LuchTV
 
 final class Caster {
     static let commands: Set<String> = ["cast", "media_cmd", "media_state", "stop_cast", "sleep", "volume", "page", "receiver_modes",
@@ -13,6 +14,8 @@ final class Caster {
     private let lock = NSLock()
     private var sessions: [String: CastSession] = [:]
     private var server: FileServer?
+    /// Chromecasts and DLNA TVs: found, and what plays on them (Caster+TV.swift).
+    let tvs = TVs()
 
     /// `mirroring`: the receiver the app mirrors or plays sound to, which counts as being shown on.
     private func find(_ request: [String: Any], in receivers: [Receiver], mirroring: String?) -> Receiver? {
@@ -21,7 +24,7 @@ final class Caster {
         if receivers.count == 1 { return receivers[0] }
         // Unnamed with several around: the one something is being shown on, when that is only one.
         lock.lock()
-        let showing = receivers.filter { sessions[$0.id]?.isOpen == true || $0.id == mirroring }
+        let showing = receivers.filter { sessions[$0.id]?.isOpen == true || $0.id == mirroring || tvs.session($0.id) != nil }
         lock.unlock()
         return showing.count == 1 ? showing[0] : nil
     }
@@ -95,6 +98,7 @@ final class Caster {
             }
             return ["error": receivers.isEmpty ? "no receivers found" : "receiver not found; there are \(names)"]
         }
+        if let answer = tvCommand(request, row: r, receivers: receivers) { return answer }
         do {
             switch request["cmd"] as? String ?? "" {
             case "cast":

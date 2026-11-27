@@ -78,7 +78,9 @@ case "list":
         let port = (receiver["port"] as? NSNumber)?.intValue ?? 0
         let iface = receiver["iface"] as? String ?? "-"
         let model = receiver["model"] as? String ?? ""
-        print("\(name)\(mirroring)\t\(address):\(port)\t\(iface.isEmpty ? "-" : iface)\t\(model)")
+        // luch, cast or dlna: how the TV is reached (a TV without the Luch app plays files and links only).
+        let kind = receiver["kind"] as? String ?? "luch"
+        print("\(name)\(mirroring)\t\(address):\(port)\t\(iface.isEmpty ? "-" : iface)\t\(kind)\t\(model)")
     }
 
 case "mirror":
@@ -331,6 +333,39 @@ case "browser":
         exit(1)
     }
 
+case "web":
+    // The browsers allowed to watch this screen (the web receiver), and the one waiting to be allowed.
+    let words = Array(args.dropFirst())
+    let r = call(["cmd": "web_clients"])
+    fail(r)
+    let all = r["clients"] as? [[String: Any]] ?? []
+    switch (words.first, words.count) {
+    case (nil, _):
+        if all.isEmpty {
+            let url = call(["cmd": "web_url"])["url"] as? String ?? "https://<this Mac>:47801/"
+            print("(no browser allowed yet: open \(url) in a browser and confirm the code here)")
+        }
+        for (n, b) in all.enumerated() {
+            let wait = b["waiting"] as? Bool == true ? " waiting, code \(b["code"] as? String ?? "?")" : ""
+            print("\(n + 1). \(b["name"] as? String ?? "?") \(b["address"] as? String ?? "")\(wait)")
+        }
+    case (let answer?, 2) where answer == "allow" || answer == "deny":
+        guard let b = all.first(where: { $0["waiting"] as? Bool == true && $0["code"] as? String == words[1] }) else {
+            print("error: no browser waiting with the code \(words[1])")
+            exit(1)
+        }
+        fail(call(["cmd": "approve_web", "request": b["id"] as? String ?? "", "allow": answer == "allow"]))
+    case ("forget"?, 2):
+        guard let n = Int(words[1]), n >= 1, n <= all.count else {
+            print("error: no browser \(words[1]) (see `luchctl web`)")
+            exit(1)
+        }
+        fail(call(["cmd": "forget_web", "id": all[n - 1]["id"] as? String ?? ""]))
+    default:
+        print("usage: luchctl web [allow|deny <code> | forget <n>]")
+        exit(2)
+    }
+
 case "pair":
     let words = Array(args.dropFirst())
     guard words.count <= 2 else { print("usage: luchctl pair [r] [code]"); exit(2) }
@@ -370,6 +405,7 @@ default:
                    | find [auto|all|mdns,scan,ble,sound,qr] | add <link|host[:port]> | refresh | id | info [r]
                    | known | wake [r] | wake <r> learn | wake <r> mac|ble <value>|off
                    | pair [r] [code] | paired | forget <r> | reports | report <n> [open|dismiss]
+                   | web [allow|deny <code> | forget <n>]
            present: shows a PDF or a presentation on the receiver and opens the presenter view here (current and
            next slide, notes, timer; the mouse is a laser pointer, dragging draws, a clicker turns the slides)
            quiet: hide notification banners while presenting or mirroring (ask: the app asks once); macOS allows it

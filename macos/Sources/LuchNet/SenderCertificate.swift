@@ -151,9 +151,9 @@ public final class SenderCertificate {
     }
 }
 
-/// Just enough DER for one certificate.
-enum DER {
-    static func tlv(_ tag: UInt8, _ body: [UInt8]) -> [UInt8] {
+/// Just enough DER for a certificate (this one, and the web receiver's HTTPS one in LuchTV).
+public enum DER {
+    public static func tlv(_ tag: UInt8, _ body: [UInt8]) -> [UInt8] {
         var len: [UInt8] = []
         if body.count < 0x80 {
             len = [UInt8(body.count)]
@@ -165,9 +165,9 @@ enum DER {
         return [tag] + len + body
     }
 
-    static func seq(_ parts: [UInt8]...) -> [UInt8] { tlv(0x30, parts.flatMap { $0 }) }
+    public static func seq(_ parts: [UInt8]...) -> [UInt8] { tlv(0x30, parts.flatMap { $0 }) }
 
-    static func oid(_ dotted: String) -> [UInt8] {
+    public static func oid(_ dotted: String) -> [UInt8] {
         let arcs = dotted.split(separator: ".").compactMap { UInt64($0) }
         var out: [UInt8] = [UInt8(arcs[0] * 40 + arcs[1])]
         for arc in arcs.dropFirst(2) {
@@ -180,15 +180,16 @@ enum DER {
     }
 
     /// A non-negative INTEGER: no extra leading zeros, one when the top bit is set.
-    static func int(_ bytes: [UInt8]) -> [UInt8] {
+    public static func int(_ bytes: [UInt8]) -> [UInt8] {
         var b = bytes
         while b.count > 1 && b[0] == 0 && b[1] & 0x80 == 0 { b.removeFirst() }
         if b[0] & 0x80 != 0 { b.insert(0, at: 0) }
         return tlv(0x02, b)
     }
 
-    static func bits(_ b: [UInt8]) -> [UInt8] { tlv(0x03, [0] + b) }
-    static func utf8(_ s: String) -> [UInt8] { tlv(0x0c, Array(s.utf8)) }
+    public static func bits(_ b: [UInt8]) -> [UInt8] { tlv(0x03, [0] + b) }
+    public static func octets(_ b: [UInt8]) -> [UInt8] { tlv(0x04, b) }
+    public static func utf8(_ s: String) -> [UInt8] { tlv(0x0c, Array(s.utf8)) }
     /// UTCTime (YYMMDDhhmmssZ) or, from 2050, GeneralizedTime (YYYYMMDDhhmmssZ).
-    static func time(_ s: String) -> [UInt8] { tlv(s.count == 13 ? 0x17 : 0x18, Array(s.utf8)) }
+    public static func time(_ s: String) -> [UInt8] { tlv(s.count == 13 ? 0x17 : 0x18, Array(s.utf8)) }
 }
