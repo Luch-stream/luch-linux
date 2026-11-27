@@ -28,6 +28,13 @@ pub const MAX_PHOTOS: usize = 200;
 /// Headers a page may hand on, as in PROTOCOL.md 4b.
 pub const PASSED_HEADERS: [&str; 5] =
     ["Referer", "User-Agent", "Origin", "Cookie", "Authorization"];
+/// `contentFeatures.dlna.org` for what plays (DLNA 7.4.1.3.17): byte seeks work (OP=01), streaming transfer, DLNA
+/// 1.5. Many TVs will not play a link whose server does not say so when asked.
+pub const DLNA_STREAM: &str =
+    "DLNA.ORG_OP=01;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=01700000000000000000000000000000";
+/// The same for a picture: interactive transfer, no seeking.
+pub const DLNA_PHOTO: &str =
+    "DLNA.ORG_OP=00;DLNA.ORG_CI=0;DLNA.ORG_FLAGS=00D00000000000000000000000000000";
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Item {
@@ -43,6 +50,10 @@ struct Entry {
     item: Item,
     client: IpAddr,
     mime: String,
+    /// Sent with every answer for it (a DLNA TV's `CaptionInfo.sec`).
+    headers: Vec<(String, String)>,
+    /// A SubRip file served as WebVTT, the only text a Chromecast reads.
+    vtt: bool,
 }
 
 #[derive(Clone)]
@@ -103,6 +114,8 @@ impl Server {
                 item,
                 client,
                 mime: mime.to_string(),
+                headers: Vec::new(),
+                vtt: false,
             },
         );
         token
@@ -114,6 +127,36 @@ impl Server {
             SocketAddr::new(host, self.port),
             encode(name)
         )
+    }
+
+    /// The token of one of our links.
+    fn token_of(url: &str) -> Option<&str> {
+        url.split("://").nth(1)?.split('/').nth(1)
+    }
+
+    /// Adds a header to every answer for the shared link `url` (one of ours).
+    pub fn add_header(&self, url: &str, name: &str, value: &str) {
+        let Some(t) = Self::token_of(url) else { return };
+        if let Some(e) = self.shared.lock().unwrap().get_mut(t) {
+            e.headers.push((name.to_string(), value.to_string()));
+        }
+    }
+
+    /// Serves the shared SubRip file `url` as WebVTT from now on; false when it is no local SubRip file of ours.
+    pub fn as_vtt(&self, url: &str) -> bool {
+        let Some(t) = Self::token_of(url) else {
+            return false;
+        };
+        let mut all = self.shared.lock().unwrap();
+        match all.get_mut(t) {
+            Some(e) if matches!(&e.item, Item::File(p) if extension(&p.to_string_lossy()) == "srt") =>
+            {
+                e.vtt = true;
+                e.mime = "text/vtt".into();
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Everything shared with `client` stops being served (its session ended).
@@ -143,6 +186,14 @@ impl Server {
                 .split('/')
                 .next()
                 .and_then(|t| self.shared.lock().unwrap().get(t).cloned());
+            if req.options {
+                // A Chromecast's page asks first whether it may fetch with a Range header (CORS preflight).
+                respond(&mut wr, 204, &CORS_PREFLIGHT, b"").await?;
+                if req.close {
+                    return Ok(());
+                }
+                continue;
+            }
             let Some(entry) = entry else {
                 respond(&mut wr, 404, &[], b"").await?;
                 if req.close {
@@ -157,10 +208,26 @@ impl Server {
                 }
                 continue;
             }
+            let extra = extra_headers(&entry, &req);
             let keep = match &entry.item {
-                Item::File(p) => send_file(&mut wr, p, &entry.mime, &req).await?,
+                Item::File(p) if entry.vtt => {
+                    let text = tokio::fs::read(p).await.unwrap_or_default();
+                    let vtt = srt_to_vtt(&String::from_utf8_lossy(&text));
+                    let mut h: Vec<(&str, &str)> =
+                        vec![("Content-Type", "text/vtt; charset=utf-8")];
+                    h.extend(extra.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+                    respond(
+                        &mut wr,
+                        200,
+                        &h,
+                        if req.head { b"" } else { vtt.as_bytes() },
+                    )
+                    .await?;
+                    true
+                }
+                Item::File(p) => send_file(&mut wr, p, &entry.mime, &req, &extra).await?,
                 Item::Relay { url, headers } => {
-                    self.relay(&mut wr, url, headers, &req, entry.client, local)
+                    self.relay(&mut wr, url, headers, &req, entry.client, local, &extra)
                         .await?
                 }
             };
@@ -171,6 +238,7 @@ impl Server {
     }
 
     /// Fetches `url` with the page's headers and passes it on; a playlist comes back with its links made ours.
+    #[allow(clippy::too_many_arguments)]
     async fn relay(
         &self,
         wr: &mut tokio::net::tcp::OwnedWriteHalf,
@@ -179,6 +247,7 @@ impl Server {
         req: &Request,
         client: IpAddr,
         local: IpAddr,
+        extra: &[(String, String)],
     ) -> io::Result<bool> {
         let mut up = self.http.get(url);
         for (k, v) in headers {
@@ -221,13 +290,9 @@ impl Server {
                 );
                 self.url(local, &t, &last_segment(abs))
             });
-            respond(
-                wr,
-                200,
-                &[("Content-Type", "application/vnd.apple.mpegurl")],
-                if req.head { b"" } else { out.as_bytes() },
-            )
-            .await?;
+            let mut h: Vec<(&str, &str)> = vec![("Content-Type", "application/vnd.apple.mpegurl")];
+            h.extend(extra.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+            respond(wr, 200, &h, if req.head { b"" } else { out.as_bytes() }).await?;
             return Ok(true);
         }
         let mut head = format!("HTTP/1.1 {status} {}\r\n", reason(status));
@@ -242,6 +307,9 @@ impl Server {
             if let Some(v) = res.headers().get(h).and_then(|v| v.to_str().ok()) {
                 head.push_str(&format!("{h}: {v}\r\n"));
             }
+        }
+        for (k, v) in extra {
+            head.push_str(&format!("{k}: {v}\r\n"));
         }
         let chunked = res.headers().get("content-length").is_none();
         if chunked {
@@ -305,8 +373,64 @@ fn encode(name: &str) -> String {
 struct Request {
     path: String,
     head: bool,
+    options: bool,
     range: Option<String>,
     close: bool,
+    /// A DLNA TV asked `getcontentFeatures.dlna.org: 1`.
+    dlna_features: bool,
+    /// A DLNA TV's `transferMode.dlna.org`, echoed back.
+    transfer_mode: Option<String>,
+    /// A Chromecast's page fetches with an `Origin`: the answer needs CORS headers.
+    origin: bool,
+}
+
+/// What a Chromecast's page may ask before fetching (everything here is behind a token and one client anyway).
+const CORS_PREFLIGHT: [(&str, &str); 4] = [
+    ("Access-Control-Allow-Origin", "*"),
+    ("Access-Control-Allow-Methods", "GET, HEAD, OPTIONS"),
+    (
+        "Access-Control-Allow-Headers",
+        "Range, Content-Type, Origin, Accept",
+    ),
+    ("Access-Control-Max-Age", "600"),
+];
+
+/// The headers an answer for `e` adds: the entry's own, DLNA's when asked, CORS for a page.
+fn extra_headers(e: &Entry, req: &Request) -> Vec<(String, String)> {
+    let mut h = e.headers.clone();
+    if req.dlna_features {
+        let f = if e.mime.starts_with("image/") {
+            DLNA_PHOTO
+        } else {
+            DLNA_STREAM
+        };
+        h.push(("contentFeatures.dlna.org".into(), f.into()));
+    }
+    if let Some(m) = &req.transfer_mode {
+        h.push(("transferMode.dlna.org".into(), m.clone()));
+    }
+    if req.origin {
+        h.push(("Access-Control-Allow-Origin".into(), "*".into()));
+        h.push((
+            "Access-Control-Expose-Headers".into(),
+            "Content-Length, Content-Range, Accept-Ranges".into(),
+        ));
+    }
+    h
+}
+
+/// SubRip as WebVTT: a header, and the decimal comma of the times made a point.
+pub fn srt_to_vtt(srt: &str) -> String {
+    let mut out = String::from("WEBVTT\n\n");
+    for line in srt.trim_start_matches('\u{feff}').lines() {
+        if line.contains("-->") {
+            out.push_str(&line.replace(',', "."));
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    out
 }
 
 async fn read_request<R: tokio::io::AsyncBufRead + Unpin>(
@@ -321,6 +445,7 @@ async fn read_request<R: tokio::io::AsyncBufRead + Unpin>(
     let mut req = Request {
         path: parts.next().unwrap_or("/").to_string(),
         head: method == "HEAD",
+        options: method == "OPTIONS",
         ..Default::default()
     };
     if parts.next() == Some("HTTP/1.0") {
@@ -344,6 +469,12 @@ async fn read_request<R: tokio::io::AsyncBufRead + Unpin>(
                 req.range = Some(v.to_string());
             } else if k == "connection" && v.eq_ignore_ascii_case("close") {
                 req.close = true;
+            } else if k == "getcontentfeatures.dlna.org" && v == "1" {
+                req.dlna_features = true;
+            } else if k == "transfermode.dlna.org" && !v.contains(['\r', '\n']) {
+                req.transfer_mode = Some(v.to_string());
+            } else if k == "origin" {
+                req.origin = true;
             }
         }
     }
@@ -356,6 +487,7 @@ async fn read_request<R: tokio::io::AsyncBufRead + Unpin>(
 fn reason(code: u16) -> &'static str {
     match code {
         200 => "OK",
+        204 => "No Content",
         206 => "Partial Content",
         403 => "Forbidden",
         404 => "Not Found",
@@ -407,6 +539,7 @@ async fn send_file(
     path: &Path,
     mime: &str,
     req: &Request,
+    extra: &[(String, String)],
 ) -> io::Result<bool> {
     let mut f = match tokio::fs::File::open(path).await {
         Ok(f) => f,
@@ -434,6 +567,9 @@ async fn send_file(
     );
     if code == 206 {
         head.push_str(&format!("Content-Range: bytes {start}-{end}/{size}\r\n"));
+    }
+    for (k, v) in extra {
+        head.push_str(&format!("{k}: {v}\r\n"));
     }
     head.push_str("\r\n");
     wr.write_all(head.as_bytes()).await?;
@@ -624,6 +760,8 @@ pub struct Options {
     /// The same video in several qualities, best first: [{url, mime, w, h}] (a page's 360/720/1080 files). The
     /// receiver plays the best its screen shows; the first item is then only the fallback.
     pub sources: Vec<Value>,
+    /// The way to the TV when it has several ("luch", "cast", "dlna"); luchd picks the best by itself otherwise.
+    pub transport: Option<String>,
 }
 
 impl Options {
@@ -640,6 +778,7 @@ impl Options {
             rate: v["rate"].as_f64(),
             mime: v["mime"].as_str().map(String::from),
             poster: v["poster"].as_str().map(String::from),
+            transport: v["transport"].as_str().map(String::from),
             sources: v["sources"]
                 .as_array()
                 .map(|a| {
@@ -1188,6 +1327,63 @@ mod tests {
         );
         let (code, _, _) = get(addr, &format!("/{bare}/seg0.ts"), None).await;
         assert_eq!(code, 403);
+    }
+
+    async fn raw(addr: SocketAddr, req: &str) -> String {
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        s.write_all(req.as_bytes()).await.unwrap();
+        let mut all = Vec::new();
+        s.read_to_end(&mut all).await.unwrap();
+        String::from_utf8_lossy(&all).into_owned()
+    }
+
+    /// What TVs without Luch ask of the file server: DLNA's content features, CORS for a Chromecast's page (and its
+    /// preflight), WebVTT made of SubRip, a header added for one link.
+    #[tokio::test]
+    async fn tvs_get_dlna_features_cors_and_webvtt() {
+        let (srv, addr) = server().await;
+        let me: IpAddr = "127.0.0.1".parse().unwrap();
+        let v = temp_file("a.mp4", b"0123456789");
+        let t = srv.share(Item::File(v), me, "video/mp4");
+        let url = srv.url(me, &t, "a.mp4");
+        srv.add_header(&url, "CaptionInfo.sec", "http://127.0.0.1/s.srt");
+        let r = raw(addr, &format!("GET /{t}/a.mp4 HTTP/1.1\r\ngetcontentFeatures.dlna.org: 1\r\ntransferMode.dlna.org: Streaming\r\nConnection: close\r\n\r\n")).await;
+        assert!(
+            r.contains(&format!("contentFeatures.dlna.org: {DLNA_STREAM}\r\n")),
+            "{r}"
+        );
+        assert!(r.contains("transferMode.dlna.org: Streaming\r\n"), "{r}");
+        assert!(
+            r.contains("CaptionInfo.sec: http://127.0.0.1/s.srt\r\n"),
+            "{r}"
+        );
+        assert!(
+            !r.contains("Access-Control"),
+            "no CORS unless a page asks: {r}"
+        );
+        let r = raw(addr, &format!("GET /{t}/a.mp4 HTTP/1.1\r\nOrigin: https://www.gstatic.com\r\nConnection: close\r\n\r\n")).await;
+        assert!(r.contains("Access-Control-Allow-Origin: *\r\n"), "{r}");
+        let r = raw(addr, &format!("OPTIONS /{t}/a.mp4 HTTP/1.1\r\nOrigin: https://www.gstatic.com\r\nAccess-Control-Request-Headers: range\r\nConnection: close\r\n\r\n")).await;
+        assert!(
+            r.starts_with("HTTP/1.1 204 ") && r.contains("Access-Control-Allow-Headers: Range"),
+            "{r}"
+        );
+
+        let srt = temp_file(
+            "a.en.srt",
+            "\u{feff}1\r\n00:00:01,000 --> 00:00:02,500\r\nHello, world\r\n".as_bytes(),
+        );
+        let t = srv.share(Item::File(srt), me, "application/x-subrip");
+        let url = srv.url(me, &t, "a.en.srt");
+        assert!(srv.as_vtt(&url));
+        assert!(!srv.as_vtt("http://127.0.0.1:1/nope/x.srt"));
+        let (code, head, body) = get(addr, &format!("/{t}/a.en.srt"), None).await;
+        assert_eq!(code, 200);
+        assert!(head.contains("text/vtt"), "{head}");
+        assert_eq!(
+            String::from_utf8(body).unwrap(),
+            "WEBVTT\n\n1\n00:00:01.000 --> 00:00:02.500\nHello, world\n"
+        );
     }
 
     #[test]

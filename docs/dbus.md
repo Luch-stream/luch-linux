@@ -31,6 +31,19 @@ camera for the TV's QR code. Every receiver found any way is checked with a real
 `Discovered()` says how each was found. Receivers heard over Bluetooth are listed nearest (strongest signal) first,
 the others by name. One found other than by mDNS leaves the list when it no longer answers at the next climb.
 
+### TVs without Luch
+
+TVs that do not run Luch are in the same list and play what `Cast` gives them ([other-tvs.md](other-tvs.md)):
+Chromecasts and Google TVs (mDNS `_googlecast._tcp` through Avahi, ids `cast:<id>`) and DLNA/UPnP renderers (SSDP
+M-SEARCH for `MediaRenderer:1` at start, every minute and on `Refresh`, ids `dlna:<UDN>`). A TV is one row whatever
+it speaks: the ways that share an address are put together, and the best one names the row and is used, Luch first,
+then Cast, then DLNA. `Devices` tells the kind and every way; the `transport` option of `Cast` picks another one.
+
+Such a TV plays media and photos (the first picture), with subtitles where it reads them; it cannot mirror the screen,
+show documents or open its YouTube app from here (`Mirror` and `Connect` fail with `NotSupported`). Its state comes
+as `media_state` in `MediaState`/`MediaStateChanged` like a Luch receiver's, polled once a second over DLNA. Its
+volume can be set with `SetVolume` while it plays for us.
+
 ## Methods
 
 ### `Receivers() → a(sssssqbb)`
@@ -45,12 +58,25 @@ Returns every known receiver as a tuple:
 | 3 | `s` | IPv4 address |
 | 4 | `s` | network interface it was found on |
 | 5 | `q` | control port |
-| 6 | `b` | a control channel is open |
+| 6 | `b` | a control channel is open (a TV without Luch: it plays something for us) |
 | 7 | `b` | mirroring is running |
+
+### `Devices() → s`
+
+Every row of `Receivers` as JSON, with how luchd reaches it: `id`, `name`, `model`, `address`, `kind` (`luch`,
+`cast`, `dlna`: the way used), `can` (what that way does: `mirror`, `media`, `photo`, `doc`, `apps`, `volume`, `subs`,
+`rate`), `control_ms` (about how long a command takes to show on the TV) and `transports` (every way to this TV, best
+first, as `{"kind","id"}`).
+
+```json
+[{"id": "cast:1c4f…", "name": "Living room TV", "model": "Chromecast", "address": "192.168.1.41", "kind": "cast",
+  "can": ["media", "photo", "volume", "subs", "rate"], "control_ms": 150,
+  "transports": [{"kind": "cast", "id": "cast:1c4f…"}, {"kind": "dlna", "id": "dlna:5f1c…"}]}]
+```
 
 ### `Refresh()`
 
-Requests an immediate Avahi rescan and resolution of advertised services. Returns immediately;
+Requests an immediate Avahi rescan and resolution of advertised services, and an SSDP search. Returns immediately;
 read `Receivers()` for the current cache and listen for `ReceiversChanged()` for updates.
 Overlapping requests share in-flight lookups. This does not connect to receivers or interrupt
 active streams. The GNOME menu calls it when opened; the TUI calls it on entry and on `r`/Enter.
@@ -172,7 +198,8 @@ Capture sources usable on this machine, best first: `fast` (only when `luch-kms`
 ### `Capabilities(s id) → s`
 
 The receiver's last `welcome` as JSON (`hw`, `bench`, decoders), `{}` until the control channel has
-been opened once (`Connect` or `Mirror`). It never connects by itself.
+been opened once (`Connect` or `Mirror`). It never connects by itself. For a TV without Luch:
+`{"kind","modes","name","model"}`, `modes` being `media` and `photo`.
 
 ### `StopMirror(s id)`
 
@@ -273,14 +300,20 @@ with any subtitle files (`.srt`, `.vtt`) among the items. Returns `"media"` or `
 it; fails with the receiver's reason (`bad_link`, `media_failed`, `busy`) otherwise.
 
 `options` is JSON or `""`: `title`, `start` (seconds), `paused`, `rate`, `subs` (paths or links), `mime` (for a link
-without an extension), `poster`, `via` and `headers`. A link is fetched by the receiver itself (`"via":"direct"`, the
+without an extension), `poster`, `via`, `headers` and `transport` (`luch`, `cast` or `dlna`: another way to the same TV
+than the one luchd picks; `InvalidArgs` when the TV has none such). A link is fetched by the receiver itself (`"via":"direct"`, the
 default; the computer may go to sleep meanwhile), with `headers` (only `Referer`, `User-Agent`, `Origin`, `Cookie`,
 `Authorization`). `"via":"sender"` relays it through luchd: luchd fetches it with those headers and passes the
 bytes on unchanged, rewriting HLS playlists to point back at itself. That is for links only this computer can reach:
 a company VPN, a site that needs the browser's login, Wi-Fi Direct. Local files always go through luchd.
 
 Files are served on TCP port 47810 (any free port if it is taken), each under a random token and only to the receiver
-it was cast to; open that port in a firewall. Nothing is served once the cast ends.
+it was cast to; open that port in a firewall. Nothing is served once the cast ends. For TVs without Luch the server
+also answers DLNA's `getcontentFeatures.dlna.org` and `transferMode.dlna.org`, Samsung's `CaptionInfo.sec`, CORS for
+a Chromecast's page (with its `OPTIONS` preflight), and serves SubRip files as WebVTT to a Chromecast.
+
+A TV without Luch cannot send a page's headers, so a link with `headers` goes through luchd there unless `via` says
+otherwise.
 
 ### `MediaCmd(s id, s cmd)`
 

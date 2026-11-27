@@ -46,3 +46,10 @@ test('the menu says what the discovery ladder tries', () => {
     assert.ok(/<signal name="FindProgress">/.test(ext));
     assert.match(luchd, /async fn find_progress\(/);
 });
+
+test('TVs without Luch are told by their id', () => {
+    const isTv = new Function('id', ext.match(/function isTv\(id\) \{([\s\S]*?)\n\}/)[1]);
+    assert.ok(isTv('cast:1c4f3a2b9d8e7f60a1b2c3d4e5f60718'));
+    assert.ok(isTv('dlna:5f1c2e3d-0000-1000-8000-0123456789ab'));
+    assert.ok(!isTv('3f0c2a8e-9d1b-4c7e-8a55-0b6f2d9e1c47'));
+});

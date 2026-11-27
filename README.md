@@ -41,8 +41,9 @@ Sound (Opus, 5 ms frames) is captured from the default output in every mode. Any
 (including compatible TV browsers) is also a receiver: open the HTTPS `WebUrl` the daemon serves
 (see `docs/dbus.md`), accept the local certificate and press Watch — handy where no Android receiver
 can be installed. Certificate trust support depends on the TV browser. Videos, sounds and photos can also be *cast*:
-the receiver plays them itself in their own quality, like Chromecast (see **Use**). Planned: presentation mode with
-a presenter view.
+the receiver plays them itself in their own quality, like Chromecast (see **Use**). TVs without the Luch app (a hotel
+TV) are in the same list and play cast media too: Chromecasts and Google TVs over Google Cast, other smart TVs over
+DLNA; luchd picks the best way by itself (`docs/other-tvs.md`). Planned: presentation mode with a presenter view.
 
 **Control from the receiver.** A tablet or phone running the receiver can drive this desktop: real multitouch
 where you see it, or a touchpad mode. A stylus works with pressure where uinput is allowed. A keyboard, mouse or

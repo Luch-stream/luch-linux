@@ -23,6 +23,19 @@ gdbus introspect --session --dest dev.luch.Luch1 --object-path /dev/luch/Luch1
 Временная ошибка разрешения сохраняет известный приёмник; `ItemRemove` удаляет его
 и отменяет незавершённый поиск.
 
+### Телевизоры без Луча
+
+Телевизоры без Луча — в том же списке и играют то, что дано `Cast` ([other-tvs.md](other-tvs.md)): Chromecast и
+Google TV (mDNS `_googlecast._tcp` через Avahi, id `cast:<id>`) и рендереры DLNA/UPnP (SSDP M-SEARCH `MediaRenderer:1`
+при старте, раз в минуту и по `Refresh`, id `dlna:<UDN>`). Один телевизор — одна строка, на каком бы языке он ни
+говорил: способы с одним адресом собираются вместе, строку называет и используется лучший — Луч, потом Cast, потом
+DLNA. `Devices` говорит вид и все способы; опция `transport` у `Cast` выбирает другой.
+
+Такой телевизор играет медиа и фото (первую картинку), с субтитрами, где он их понимает; повторять экран, показывать
+документы и открывать свой YouTube отсюда он не может (`Mirror` и `Connect` — ошибка `NotSupported`). Его состояние
+приходит как `media_state` в `MediaState`/`MediaStateChanged`, как у приёмника Луча; по DLNA его спрашивают раз в
+секунду. Громкость — `SetVolume`, пока он играет для нас.
+
 ## Методы
 
 ### `Receivers() → a(sssssqbb)`
@@ -39,6 +52,13 @@ gdbus introspect --session --dest dev.luch.Luch1 --object-path /dev/luch/Luch1
 | 5 | `q` | порт управления |
 | 6 | `b` | канал управления открыт |
 | 7 | `b` | идёт трансляция |
+
+### `Devices() → s`
+
+Все строки `Receivers` в JSON и как до них дотянуться: `id`, `name`, `model`, `address`, `kind` (`luch`, `cast`,
+`dlna`: используемый способ), `can` (что он умеет: `mirror`, `media`, `photo`, `doc`, `apps`, `volume`, `subs`,
+`rate`), `control_ms` (примерно сколько команда идёт до экрана) и `transports` (все способы к этому телевизору,
+лучший первым, как `{"kind","id"}`).
 
 ### `Refresh()`
 
@@ -231,7 +251,8 @@ gdbus introspect --session --dest dev.luch.Luch1 --object-path /dev/luch/Luch1
 приёмник принял; иначе ошибка с его причиной (`bad_link`, `media_failed`, `busy`).
 
 `options` — JSON или `""`: `title`, `start` (секунды), `paused`, `rate`, `subs` (пути или ссылки), `mime` (для ссылки
-без расширения), `poster`, `via` и `headers`. Ссылку приёмник качает сам (`"via":"direct"`, по умолчанию; компьютер
+без расширения), `poster`, `via`, `headers` и `transport` (`luch`, `cast` или `dlna`: другой способ к тому же
+телевизору вместо выбранного luchd; `InvalidArgs`, если такого у него нет). Ссылку приёмник качает сам (`"via":"direct"`, по умолчанию; компьютер
 может тем временем уснуть) с `headers` (только `Referer`, `User-Agent`, `Origin`, `Cookie`, `Authorization`).
 `"via":"sender"` пропускает её через luchd: luchd качает с этими заголовками и отдаёт байты как есть, а плейлисты HLS
 переписывает на себя. Это для ссылок, до которых дотягивается только этот компьютер: рабочий VPN, сайт с логином
