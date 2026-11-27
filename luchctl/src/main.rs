@@ -36,6 +36,14 @@ trait Luch1 {
     fn set_volume(&self, id: &str, what: &str) -> zbus::Result<String>;
     fn get_volume(&self, id: &str) -> zbus::Result<String>;
     fn doc_page(&self, id: &str, what: &str) -> zbus::Result<String>;
+    fn mirror_group(
+        &self,
+        ids: &[String],
+        roles: &[String],
+        source: &str,
+        mode: &str,
+    ) -> zbus::Result<()>;
+    fn set_offset(&self, id: &str, ms: f64) -> zbus::Result<()>;
     #[zbus(signal)]
     fn receivers_changed(&self) -> zbus::Result<()>;
     #[zbus(signal)]
@@ -49,7 +57,8 @@ const USAGE: &str = "usage: luchctl [list | refresh | connect [r] | disconnect [
                 | known | wake [r] | wake <r> learn | wake <r> mac|ble <value>|off | sleep [r]
                 | cast [r] <file|link>... [--title T] [--start m:ss] [--sub file] [--relay] [--paused]
                 | media [r] [play|pause|toggle|seek m:ss|skip s|rate x|audio id|sub id|sub off|watch]
-                | volume [r] [0..100|+|-|mute|unmute] | page [r] next|prev|<n> | browser install]
+                | volume [r] [0..100|+|-|mute|unmute] | page [r] next|prev|<n> | browser install
+                | group interactive|watch <r>[=role] <r>[=role]... [--source S] | offset <r> <ms>]
        r = receiver id or name, optional when there is only one; mirror defaults to fast; no arguments: interactive
        wake: turns on a receiver luchd has talked to before (Wake-on-LAN, or the remote's Bluetooth signal that
        `wake <r> learn` picks up while you press the remote's power key with the receiver off)
@@ -57,7 +66,10 @@ const USAGE: &str = "usage: luchctl [list | refresh | connect [r] | disconnect [
        receiver, or with --relay through this computer (a VPN, a login); media: control it, no word: its state
        mirror audio: this computer's sound only, the TV as a speaker showing what plays (its remote's keys control
        the player here); cast also takes PDF, office files, text and code (others through LibreOffice)
-       browser install: lets the Luch browser extension reach luchd (Chrome, Chromium, Brave, Edge, Yandex, Firefox)";
+       browser install: lets the Luch browser extension reach luchd (Chrome, Chromium, Brave, Edge, Yandex, Firefox)
+       group: several receivers in step, the first one shows the picture; role video|audio|both (first: both, others:
+       audio, a speaker); interactive keeps the picture as fast as alone, watch delays all alike (rooms, TV walls);
+       offset: a receiver's own correction in ms (positive = later), for its output route";
 
 const AUDIO: [&str; 4] = ["auto", "on", "off", "sync"];
 
@@ -137,6 +149,28 @@ fn need_one(
 }
 
 /// Receiver by id or name; with no key, the only receiver on the LAN.
+/// `group`'s receivers (`name` or `name=role`) and its `--source` (default fast).
+fn group_args<'a>(args: &[&'a str]) -> Result<(Vec<(&'a str, Option<&'a str>)>, &'a str), String> {
+    let (mut members, mut source) = (Vec::new(), "fast");
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        if *a == "--source" {
+            source = it.next().ok_or("--source needs a source")?;
+            continue;
+        }
+        let (key, role) = match a.rsplit_once('=') {
+            Some((k, r)) if matches!(r, "video" | "audio" | "both") => (k, Some(r)),
+            Some((_, r)) => return Err(format!("role video|audio|both, not {r}")),
+            None => (*a, None),
+        };
+        members.push((key, role));
+    }
+    if members.len() < 2 {
+        return Err("a group has two or more receivers".into());
+    }
+    Ok((members, source))
+}
+
 async fn find_id(p: &Luch1Proxy<'_>, key: Option<&str>) -> Result<String, String> {
     let rows = p.receivers().await.map_err(|e| e.to_string())?;
     let Some(key) = key else {
@@ -215,6 +249,26 @@ async fn run(args: &[String]) -> Result<(), String> {
             .mirror(&find_id(&p, Some(key)).await?, source)
             .await
             .map_err(e)?,
+        ["group", mode, rest @ ..] if rest.len() >= 2 => {
+            let (members, source) = group_args(rest)?;
+            let (mut ids, mut roles) = (Vec::new(), Vec::new());
+            for (i, (key, role)) in members.into_iter().enumerate() {
+                ids.push(find_id(&p, Some(key)).await?);
+                roles.push(
+                    role.unwrap_or(if i == 0 { "both" } else { "audio" })
+                        .to_string(),
+                );
+            }
+            p.mirror_group(&ids, &roles, source, mode)
+                .await
+                .map_err(e)?
+        }
+        ["offset", key, ms] => {
+            let ms: f64 = ms.parse().map_err(|_| format!("offset in ms, not {ms}"))?;
+            p.set_offset(&find_id(&p, Some(key)).await?, ms)
+                .await
+                .map_err(e)?
+        }
         ["stats", key @ ..] if key.len() <= 1 => {
             let id = find_id(&p, key.first().copied()).await?;
             loop {
@@ -772,6 +826,24 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn group_arguments() {
+        let (m, source) =
+            group_args(&["Living room TV", "Kitchen=audio", "--source", "monitor"]).unwrap();
+        assert_eq!(
+            m,
+            vec![("Living room TV", None), ("Kitchen", Some("audio"))]
+        );
+        assert_eq!(source, "monitor");
+        assert!(group_args(&["TV"]).is_err());
+        assert!(group_args(&["TV", "B=loud"]).is_err());
+        // A name with "=" in it that is not a role stays a name only when it has no role after it.
+        assert_eq!(
+            group_args(&["TV=both", "Den=video"]).unwrap().0[1],
+            ("Den", Some("video"))
+        );
+    }
 
     #[test]
     fn cast_arguments() {

@@ -106,6 +106,23 @@ Like `Mirror`, with the stream size in pixels (even numbers, 320x240 to 7680x432
 twice the 1080p rate). The sizes a receiver can show are in `welcome.hw.display.modes` and
 `welcome.hw.video`; a receiver's decoder may not keep up with 4K at 60 fps, so check `Stats`.
 
+### `MirrorGroup(as ids, as roles, s source, s mode)`
+
+Mirrors to several receivers in step (PROTOCOL.md 4h): `ids[0]` shows the picture, every receiver presents what its
+role says (`video`, `audio` or `both`; the first one's is `video` or `both`). `mode` `interactive` keeps the picture
+as fast as alone and lets the sound wait for it (a TV and a speaker); `watch` gives every receiver the same playout
+delay, at least 150 ms (speakers in several rooms, a wall of TVs). Every receiver must be connected (it is connected
+when it is not) and announce `sync` in its welcome; a busy or older one is refused. `StopMirror` on any member ends the
+group; a member that leaves by itself is dropped and the others go on. `Stats` of `ids[0]` then has a `group` part:
+`d_video_ms`, `d_audio_ms` and per member `need_ms`, `video_pts_ms`, `route`, `offset_ms`.
+
+### `SetOffset(s id, d ms)`
+
+A receiver's own correction in ms, positive = later, within ±1000 (the slider of a group, or a calibration's
+result). It is kept per receiver and output route (a TV with and without its soundbar are two entries), saved, and
+sent at once when the receiver is playing in a group. A route without a saved value starts from a preset: HDMI ARC
++40 ms, a Bluetooth speaker whose delay the platform does not report +150 ms.
+
 ### `Sources() → as`
 
 Capture sources usable on this machine, best first: `fast` (only when `luch-kms` is installed),
