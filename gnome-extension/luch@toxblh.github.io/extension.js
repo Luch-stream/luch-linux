@@ -85,6 +85,11 @@ function reason(e) {
 }
 
 /** Files picked in a dialog (zenity, or kdialog), or [] when cancelled or there is no dialog to show. */
+/** A TV without the Luch app (luchd's "cast:" and "dlna:" ids): it plays files, it cannot mirror or sleep. */
+function isTv(id) {
+    return /^(cast|dlna):/.test(id);
+}
+
 function chooseFiles(title) {
     return new Promise(resolve => {
         let argv = null;
@@ -203,7 +208,7 @@ class LuchToggle extends QuickMenuToggle {
             }));
             if (isMirroring) {
                 add(T.stop, () => this._proxy.StopMirrorAsync(id));
-            } else {
+            } else if (!isTv(id)) {
                 add(T.fast, () => this._mirror(id, 'fast'));
                 add(T.monitor, () => this._mirror(id, 'monitor'));
                 add(T.window, () => this._mirror(id, 'window'));
@@ -217,6 +222,10 @@ class LuchToggle extends QuickMenuToggle {
             });
             if (connected)
                 add(T.stopCast, () => this._proxy.StopCastAsync(id));
+            if (isTv(id)) {
+                this._section.addMenuItem(sub);
+                continue;
+            }
             add(T.turnOff, () => this._proxy.SleepAsync(id));
             if (connected)
                 add(T.disconnect, () => this._proxy.DisconnectAsync(id));
@@ -290,7 +299,7 @@ class LuchToggle extends QuickMenuToggle {
             return;
         }
         // One tap = the lowest-latency mode to the last (or only/first) receiver.
-        const target = this._rows.find(r => r[0] === this._lastId) ?? this._rows[0];
+        const target = this._rows.find(r => r[0] === this._lastId) ?? this._rows.find(r => !isTv(r[0]));
         if (target)
             this._mirror(target[0], 'fast').catch(e => logError(e, 'Luch'));
         else

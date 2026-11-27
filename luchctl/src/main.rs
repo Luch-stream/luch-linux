@@ -63,14 +63,23 @@ const AUDIO: [&str; 4] = ["auto", "on", "off", "sync"];
 
 const SOURCES: [&str; 5] = ["fast", "monitor", "window", "virtual", "audio"];
 
+/// How luchd reaches a receiver, from its id: TVs without Luch have "cast:" or "dlna:" ids (docs/dbus.md, Devices).
+pub fn kind_of(id: &str) -> &'static str {
+    match id.split_once(':').map(|(k, _)| k) {
+        Some("cast") => "cast",
+        Some("dlna") => "dlna",
+        _ => "luch",
+    }
+}
+
 fn print(rows: &[ReceiverRow]) {
     if rows.is_empty() {
         println!("(no receivers)");
         return;
     }
     println!(
-        "{:<38} {:<20} {:<16} {:<21} {:<10} STATE",
-        "ID", "NAME", "MODEL", "ADDRESS", "IFACE"
+        "{:<38} {:<20} {:<16} {:<21} {:<10} {:<5} STATE",
+        "ID", "NAME", "MODEL", "ADDRESS", "IFACE", "KIND"
     );
     for (id, name, model, addr, ifname, port, connected, mirroring) in rows {
         let state = if *mirroring {
@@ -81,8 +90,9 @@ fn print(rows: &[ReceiverRow]) {
             "-"
         };
         println!(
-            "{id:<38} {name:<20} {model:<16} {:<21} {ifname:<10} {state}",
-            format!("{addr}:{port}")
+            "{id:<38} {name:<20} {model:<16} {:<21} {ifname:<10} {:<5} {state}",
+            format!("{addr}:{port}"),
+            kind_of(id)
         );
     }
 }
@@ -772,6 +782,13 @@ async fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_kind_comes_from_the_id() {
+        assert_eq!(kind_of("cast:1c4f3a2b9d8e7f60a1b2c3d4e5f60718"), "cast");
+        assert_eq!(kind_of("dlna:5f1c2e3d-0000-1000-8000-0123456789ab"), "dlna");
+        assert_eq!(kind_of("3f0c2a8e-9d1b-4c7e-8a55-0b6f2d9e1c47"), "luch");
+    }
 
     #[test]
     fn cast_arguments() {
