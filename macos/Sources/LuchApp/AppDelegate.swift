@@ -78,6 +78,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var timer: Timer?
     private var receivers: [Receiver] = []
     private var pendingMenuRefresh = false
+    private var menuOpen = false
     private var server: LocalServer?
     private var currentReceiverID: String?
     private var currentReceiver: Receiver?
@@ -102,6 +103,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                            accessibilityDescription: "Luch")
         statusItem.button?.toolTip = "Luch"
         statusItem.menu = menu
+        menu.delegate = self
 
         discovery.onUpdate = { [weak self] in
             DispatchQueue.main.async { self?.refreshReceivers() }
@@ -110,6 +112,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let identity = senderIdentity()
         discovery.publish(name: identity.name, id: identity.id)
         startLocalServer()
+        caster.onChange = { [weak self] in DispatchQueue.main.async { self?.rebuildMenu() } }
 
         rebuildMenu()
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.tick() }
@@ -224,6 +227,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func rebuildMenu() {
+        // Rebuilt under the pointer, an open menu would close its submenus: wait for it to close.
+        if menuOpen {
+            pendingMenuRefresh = true
+            return
+        }
         menu.removeAllItems()
 
         if receivers.isEmpty {
@@ -233,20 +241,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         for (index, receiver) in receivers.enumerated() {
             let item = NSMenuItem(title: receiver.name, action: nil, keyEquivalent: "")
-            let submenu = NSMenu()
-            let mirror = NSMenuItem(title: "Mirror Screen", action: #selector(mirrorScreen(_:)), keyEquivalent: "")
-            mirror.target = self
-            mirror.representedObject = index
-            submenu.addItem(mirror)
-            let sound = NSMenuItem(title: "Play Sound Only", action: #selector(playSound(_:)), keyEquivalent: "")
-            sound.target = self
-            sound.representedObject = index
-            submenu.addItem(sound)
-            let stop = NSMenuItem(title: "Stop", action: #selector(stopMirror), keyEquivalent: "")
-            stop.target = self
-            stop.isEnabled = engine != nil
-            submenu.addItem(stop)
-            item.submenu = submenu
+            item.submenu = receiverMenu(receiver)
+            if caster.existing(receiver.id)?.showing != nil || currentReceiverID == receiver.id { item.state = .on }
             if index == 0 { item.image = NSImage(systemSymbolName: "tv", accessibilityDescription: nil) }
             menu.addItem(item)
         }
@@ -413,17 +409,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // MARK: - actions
-
-    @objc private func mirrorScreen(_ sender: NSMenuItem) {
-        guard let index = sender.representedObject as? Int, index < receivers.count else { return }
-        startMirror(receivers[index])
-    }
-
-    /// The TV as a speaker for this Mac: its sound, no picture (PROTOCOL.md 4d).
-    @objc private func playSound(_ sender: NSMenuItem) {
-        guard let index = sender.representedObject as? Int, index < receivers.count else { return }
-        startMirror(receivers[index], soundOnly: true)
-    }
 
     @objc private func mirrorIfSingle() {
         guard engine == nil, receivers.count == 1 else { return }
@@ -645,5 +630,197 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             log("app: login item failed: \(error.localizedDescription)")
         }
         rebuildMenu()
+    }
+}
+
+// MARK: - a receiver's menu: everything luchctl does, for the mouse
+
+extension AppDelegate {
+    fileprivate func receiverMenu(_ r: Receiver) -> NSMenu {
+        let m = NSMenu()
+        let mirroringHere = currentReceiverID == r.id
+        m.addItem(.run("Mirror Screen", symbol: "rectangle.on.rectangle") { [weak self] in self?.startMirror(r) })
+        m.addItem(.run("Play Sound Only", symbol: "hifispeaker") { [weak self] in self?.startMirror(r, soundOnly: true) })
+        if mirroringHere {
+            m.addItem(.run("Stop Mirroring", symbol: "stop.circle") { [weak self] in self?.stopMirror() })
+        }
+
+        m.addItem(.separator())
+        m.addItem(.run("Show File…", symbol: "doc") { [weak self] in self?.chooseFiles(for: r) })
+        let link = Self.clipboardLink()
+        let linkTitle = link.flatMap { URL(string: $0)?.host }.map { "Show Link from Clipboard (\($0))" }
+            ?? "Show Link from Clipboard"
+        m.addItem(.run(linkTitle, enabled: link != nil, symbol: "link") { [weak self] in
+            if let link { self?.send(["cmd": "cast", "items": [link]], to: r) }
+        })
+
+        if let s = caster.existing(r.id), let kind = s.showing {
+            m.addItem(.separator())
+            addShowing(kind, session: s, to: m, receiver: r)
+        }
+
+        m.addItem(.separator())
+        m.addItem(volumeItem(r))
+        m.addItem(.run("Put to Sleep", symbol: "moon") { [weak self] in self?.send(["cmd": "sleep"], to: r) })
+        return m
+    }
+
+    /// The controls for what is shown: a video's, a document's pages, or just Stop.
+    private func addShowing(_ kind: String, session s: CastSession, to m: NSMenu, receiver r: Receiver) {
+        let state = s.state
+        switch kind {
+        case "media":
+            let title = (state["title"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "Video"
+            let playing = state["state"] as? String == "playing"
+            var line = title
+            if let pos = (state["pos"] as? NSNumber)?.doubleValue {
+                line += " · " + Self.clock(pos)
+                if let dur = (state["dur"] as? NSNumber)?.doubleValue { line += " / " + Self.clock(dur) }
+            }
+            m.addItem(.label(line))
+            m.addItem(.run(playing ? "Pause" : "Play", symbol: playing ? "pause.fill" : "play.fill") { [weak self] in
+                self?.send(["cmd": "media_cmd", "media": ["do": "toggle"]], to: r)
+            })
+            m.addItem(.run("Back 10 s", symbol: "gobackward.10") { [weak self] in
+                self?.send(["cmd": "media_cmd", "media": ["do": "skip", "by": -10]], to: r)
+            })
+            m.addItem(.run("Forward 30 s", symbol: "goforward.30") { [weak self] in
+                self?.send(["cmd": "media_cmd", "media": ["do": "skip", "by": 30]], to: r)
+            })
+            let speed = NSMenuItem(title: "Speed", action: nil, keyEquivalent: "")
+            let speeds = NSMenu()
+            let now = (state["rate"] as? NSNumber)?.doubleValue ?? 1
+            for rate in [0.75, 1, 1.25, 1.5, 2] {
+                let item = NSMenuItem.run(rate == 1 ? "Normal" : String(format: "%g×", rate)) { [weak self] in
+                    self?.send(["cmd": "media_cmd", "media": ["do": "rate", "rate": rate]], to: r)
+                }
+                if abs(rate - now) < 0.01 { item.state = .on }
+                speeds.addItem(item)
+            }
+            speed.submenu = speeds
+            m.addItem(speed)
+        case "doc":
+            let p = s.pages
+            m.addItem(.label(p.pages > 0 ? "Document · page \(p.page + 1) of \(p.pages)" : "Document"))
+            m.addItem(.run("Previous Page", enabled: p.page > 0, symbol: "chevron.left") { [weak self] in
+                self?.send(["cmd": "page", "what": "prev"], to: r)
+            })
+            m.addItem(.run("Next Page", enabled: p.page + 1 < p.pages, symbol: "chevron.right") { [weak self] in
+                self?.send(["cmd": "page", "what": "next"], to: r)
+            })
+        case "photo":
+            m.addItem(.label("Photos · left and right on the remote"))
+        default:
+            m.addItem(.label("Opened in the TV's own app"))
+        }
+        m.addItem(.run("Stop Showing", symbol: "xmark.circle") { [weak self] in self?.send(["cmd": "stop_cast"], to: r) })
+    }
+
+    /// Volume: a slider (sent when let go), a step either way and mute; the level the TV last said.
+    private func volumeItem(_ r: Receiver) -> NSMenuItem {
+        let parent = NSMenuItem(title: "Volume", action: nil, keyEquivalent: "")
+        parent.image = NSImage(systemSymbolName: "speaker.wave.2", accessibilityDescription: nil)
+        let menu = NSMenu()
+        let v = caster.existing(r.id)?.currentVolume
+        let level = (v?["level"] as? NSNumber)?.intValue
+        let muted = (v?["muted"] as? NSNumber)?.boolValue ?? false
+        if let level { parent.title = muted ? "Volume · muted" : "Volume · \(level)%" }
+
+        let row = NSView(frame: NSRect(x: 0, y: 0, width: 220, height: 26))
+        let slider = NSSlider(value: Double(level ?? 0), minValue: 0, maxValue: 100, target: nil, action: nil)
+        slider.isContinuous = false
+        slider.controlSize = .small
+        slider.frame = NSRect(x: 20, y: 4, width: 186, height: 18)
+        let act = MenuAction { [weak self, weak slider] in
+            guard let slider else { return }
+            self?.send(["cmd": "volume", "what": String(Int(slider.doubleValue.rounded()))], to: r)
+        }
+        slider.target = act
+        slider.action = #selector(MenuAction.fire)
+        row.addSubview(slider)
+        let sliderItem = NSMenuItem()
+        sliderItem.view = row
+        sliderItem.representedObject = act
+        menu.addItem(sliderItem)
+        menu.addItem(.run("Louder", symbol: "speaker.plus") { [weak self] in self?.send(["cmd": "volume", "what": "+"], to: r) })
+        menu.addItem(.run("Quieter", symbol: "speaker.minus") { [weak self] in self?.send(["cmd": "volume", "what": "-"], to: r) })
+        let mute = NSMenuItem.run(muted ? "Unmute" : "Mute", symbol: muted ? "speaker.wave.2" : "speaker.slash") { [weak self] in
+            self?.send(["cmd": "volume", "what": muted ? "unmute" : "mute"], to: r)
+        }
+        menu.addItem(mute)
+        if level == nil {
+            menu.addItem(.separator())
+            menu.addItem(.label("The level shows once the TV has been talked to"))
+        }
+        parent.submenu = menu
+        return parent
+    }
+
+    /// Off the main thread (it waits for the TV); a refusal is shown, not swallowed.
+    private func send(_ request: [String: Any], to r: Receiver) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let response = self.caster.run(request, on: r)
+            DispatchQueue.main.async {
+                if let error = response["error"] as? String {
+                    let alert = NSAlert()
+                    alert.messageText = r.name
+                    alert.informativeText = error
+                    NSApp.activate(ignoringOtherApps: true)
+                    alert.runModal()
+                }
+                self.rebuildMenu()
+            }
+        }
+    }
+
+    private func chooseFiles(for r: Receiver) {
+        let panel = NSOpenPanel()
+        panel.title = "Show on \(r.name)"
+        panel.prompt = "Show"
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        NSApp.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK, !panel.urls.isEmpty else { return }
+        send(["cmd": "cast", "items": panel.urls.map(\.path)], to: r)
+    }
+
+    /// An http(s) link on the clipboard, if that is what is there.
+    static func clipboardLink() -> String? {
+        guard let text = NSPasteboard.general.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !text.contains(" "), !text.contains("\n"),
+              let u = URL(string: text), ["http", "https"].contains(u.scheme?.lowercased() ?? ""), u.host != nil else {
+            return nil
+        }
+        return text
+    }
+
+    static func clock(_ seconds: Double) -> String {
+        let t = Int(seconds.rounded(.down))
+        return t >= 3600 ? String(format: "%d:%02d:%02d", t / 3600, t / 60 % 60, t % 60)
+            : String(format: "%d:%02d", t / 60, t % 60)
+    }
+}
+
+extension AppDelegate: NSMenuDelegate {
+    /// Built afresh just before it shows: the clipboard's link, the volume and what plays are as they are now.
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        guard menu === self.menu, !menuOpen else { return }
+        pendingMenuRefresh = false
+        rebuildMenu()
+    }
+
+    func menuWillOpen(_ menu: NSMenu) {
+        guard menu === self.menu else { return }
+        menuOpen = true
+    }
+
+    func menuDidClose(_ menu: NSMenu) {
+        guard menu === self.menu else { return }
+        menuOpen = false
+        if pendingMenuRefresh {
+            pendingMenuRefresh = false
+            rebuildMenu()
+        }
     }
 }

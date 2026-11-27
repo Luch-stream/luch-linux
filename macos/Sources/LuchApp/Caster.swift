@@ -33,10 +33,28 @@ final class Caster {
         }
         lock.unlock()
         let s = try CastSession.open(r)
+        s.onShowing = { [weak self] in self?.onChange?() }
         lock.lock()
         sessions[r.id] = s
         lock.unlock()
         return s
+    }
+
+    /// Something shown on a receiver started, ended or changed (the menu follows it). Called on any thread.
+    var onChange: (() -> Void)?
+
+    /// The open session with a receiver, if there is one; none is made.
+    func existing(_ id: String) -> CastSession? {
+        lock.lock()
+        defer { lock.unlock() }
+        return sessions[id].flatMap { $0.isOpen ? $0 : nil }
+    }
+
+    /// A command for one receiver (the menu's).
+    func run(_ request: [String: Any], on r: Receiver) -> [String: Any] {
+        var q = request
+        q["id"] = r.id
+        return handle(q, receivers: [r])
     }
 
     private func files() throws -> FileServer {

@@ -16,6 +16,31 @@ public final class CastSession {
     private var stopped = false
     /// Every media_state (and {"state":"stopped"} at the end), for whoever follows it (luchctl, the browser).
     public var onState: (([String: Any]) -> Void)?
+    /// What is shown changed: something started or ended, a page turned, the video paused (the menu follows it).
+    public var onShowing: (() -> Void)?
+    private var shown: String?
+    private var volumeNow: [String: Any]?
+
+    /// The receiver's volume as it last said ({"level":N,"muted":B}); nil when it keeps its volume to itself.
+    public var currentVolume: [String: Any]? {
+        lock.lock()
+        defer { lock.unlock() }
+        return volumeNow
+    }
+
+    /// What this session shows on the receiver now: "media", "photo", "doc" or "app"; nil when nothing.
+    public var showing: String? {
+        lock.lock()
+        defer { lock.unlock() }
+        return shown
+    }
+
+    /// The document's page (from 0) and page count; (0, 0) without one.
+    public var pages: (page: Int, pages: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        return docPages
+    }
 
     public var isOpen: Bool { !ctl.isClosed }
 
@@ -37,6 +62,7 @@ public final class CastSession {
             throw CastError.bad("\(r.name) did not answer")
         }
         let s = CastSession(receiver: r, ctl: ctl, welcome: welcome)
+        s.volumeNow = welcome["volume"] as? [String: Any]
         ctl.onEvent = { [weak s] msg in s?.event(msg) }
         ctl.onClosed = { [weak s] _ in s?.ended("closed") }
         return s
@@ -52,8 +78,12 @@ public final class CastSession {
             lock.lock()
             let ignore = stopped
             if !ignore { lastState = m }
+            if !ignore, m["state"] as? String == "stopped", shown == "media" { shown = nil }
             lock.unlock()
-            if !ignore { onState?(m) }
+            if !ignore {
+                onState?(m)
+                onShowing?()
+            }
         case "media_ready":
             lock.lock()
             stopped = false
@@ -66,6 +96,12 @@ public final class CastSession {
             lock.lock()
             docPages.page = (m["page"] as? NSNumber)?.intValue ?? 0
             lock.unlock()
+            onShowing?()
+        case "volume":
+            lock.lock()
+            volumeNow = m.filter { $0.key != "t" }
+            lock.unlock()
+            onShowing?()
         case "stop":
             ended((m["reason"] as? String) ?? "receiver")
         default:
@@ -77,7 +113,11 @@ public final class CastSession {
         lock.lock()
         let had = !lastState.isEmpty
         lastState = [:]
+        let was = shown
+        shown = nil
+        docPages = (0, 0)
         lock.unlock()
+        if was != nil { onShowing?() }
         if had { onState?(["t": "media_state", "state": "stopped", "reason": reason]) }
     }
 
@@ -110,7 +150,12 @@ public final class CastSession {
             if code == "no_app" { throw CastError.bad("the TV has no YouTube app") }
             throw CastError.bad(code + ((r["detail"] as? String).map { ": \($0)" } ?? ""))
         }
-        return t == "open_app" ? "app" : t
+        let kind = t == "open_app" ? "app" : t
+        lock.lock()
+        shown = kind
+        lock.unlock()
+        onShowing?()
+        return kind
     }
 
     public func command(_ cmd: [String: Any]) {
@@ -140,10 +185,13 @@ public final class CastSession {
         }
     }
 
-    /// "0".."100", "+", "-", "mute", "unmute"; the receiver's volume after it.
+    /// "0".."100", "+", "-", "mute", "unmute"; the receiver's volume after it. "" only reads it.
     public func volume(_ what: String) throws -> [String: Any] {
         var m: [String: Any] = ["t": "volume"]
         switch what {
+        case "":
+            guard let v = currentVolume else { throw CastError.bad("the TV keeps its volume to itself") }
+            return v
         case "+", "up": m["step"] = 1
         case "-", "down": m["step"] = -1
         case "mute": m["muted"] = true

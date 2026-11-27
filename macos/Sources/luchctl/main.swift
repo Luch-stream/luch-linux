@@ -218,7 +218,7 @@ case "sleep":
 case "volume":
     let words = Array(args.dropFirst())
     let (name, rest) = receiverAnd(words) { ["+", "-", "up", "down", "mute", "unmute"].contains($0) || Int($0) != nil }
-    let r = callPicking(withReceiver(["cmd": "volume", "what": rest.first ?? "+0"], name))
+    let r = callPicking(withReceiver(["cmd": "volume", "what": rest.first ?? ""], name))
     fail(r)
     let v = r["volume"] as? [String: Any] ?? [:]
     print("\(v["level"] ?? "?")%\((v["muted"] as? Bool) == true ? " (muted)" : "")")
