@@ -297,6 +297,22 @@ public final class TVSession {
     public var state: [String: Any] { tell.last }
     public var ended: Bool { asks.closed }
 
+    private let volumeLock = NSLock()
+    private var volumeNow: [String: Any]?
+
+    /// The TV's volume as it last said ({"level":N,"muted":B}); nil until it has.
+    public var volume: [String: Any]? {
+        volumeLock.lock()
+        defer { volumeLock.unlock() }
+        return volumeNow
+    }
+
+    func noteVolume(_ v: [String: Any]) {
+        volumeLock.lock()
+        volumeNow = v
+        volumeLock.unlock()
+    }
+
     /// The session's thread is done: asks still waiting are told so.
     func finish(_ why: String) {
         for (_, r) in asks.close() { r.send(.failure(TVError("the TV is no longer playing"))) }

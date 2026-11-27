@@ -75,7 +75,9 @@ case "list":
         let port = (receiver["port"] as? NSNumber)?.intValue ?? 0
         let iface = receiver["iface"] as? String ?? "-"
         let model = receiver["model"] as? String ?? ""
-        print("\(name)\(mirroring)\t\(address):\(port)\t\(iface.isEmpty ? "-" : iface)\t\(model)")
+        // luch, cast or dlna: how the TV is reached (a TV without the Luch app plays files and links only).
+        let kind = receiver["kind"] as? String ?? "luch"
+        print("\(name)\(mirroring)\t\(address):\(port)\t\(iface.isEmpty ? "-" : iface)\t\(kind)\t\(model)")
     }
 
 case "mirror":

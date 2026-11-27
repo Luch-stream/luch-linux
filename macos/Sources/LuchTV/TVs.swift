@@ -187,7 +187,10 @@ public final class TVs {
                     return isTV ? ["error": "this TV's volume can be set while it plays something cast to it"] : nil
                 }
                 let what = request["what"] as? String ?? ""
-                return ["ok": true, "volume": try s.ask(.volume(try Self.volumeMessage(what))).get()]
+                let v = try s.ask(.volume(try Self.volumeMessage(what))).get()
+                s.noteVolume(v)
+                onChange?()
+                return ["ok": true, "volume": v]
             case "receiver_modes":
                 guard isTV, let k = way?.kind else { return nil }
                 return ["ok": true, "modes": k.can.filter { $0 == "media" || $0 == "photo" }]

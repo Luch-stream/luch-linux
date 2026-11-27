@@ -9,6 +9,7 @@ import LuchLocal
 import LuchMedia
 import LuchNet
 import LuchProto
+import LuchTV
 import ServiceManagement
 
 final class Preferences {
@@ -122,6 +123,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         discovery.publish(name: identity.name, id: identity.id)
         startLocalServer()
         caster.onChange = { [weak self] in DispatchQueue.main.async { self?.rebuildMenu() } }
+        caster.tvs.onChange = { [weak self] in DispatchQueue.main.async { self?.refreshReceivers() } }
+        caster.tvs.start()
 
         rebuildMenu()
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.tick() }
@@ -174,7 +177,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return ["receivers": receivers.map { receiver in
                 ["id": receiver.id, "name": receiver.name, "model": receiver.model,
                  "address": receiver.address, "iface": receiver.interfaceName,
-                 "port": Int(receiver.port),
+                 "port": Int(receiver.port), "kind": TVKind.of(receiver.id).rawValue,
                  "mirroring": engine != nil && currentReceiverID == receiver.id]
             }]
         case "state":
@@ -199,6 +202,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let match = receivers.first { $0.id == wanted || $0.name == wanted }
                 ?? (receivers.count == 1 ? receivers[0] : nil)
             guard let receiver = match else { return ["error": "receiver not found"] }
+            if TVKind.of(receiver.id) != .luch {
+                return ["error": "\(receiver.name) has no Luch app: it plays files and links (luchctl cast), not this screen"]
+            }
             let ultra = (request["ultra"] as? String).flatMap(UltraPriority.init(rawValue:))
             if request["ultra"] != nil, ultra == nil { return ["error": "ultra: speed, quality or mac"] }
             startMirror(receiver, extend: request["extend"] as? Bool, ultra: ultra)
@@ -243,7 +249,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - menu
 
     private func refreshReceivers() {
-        receivers = discovery.all()
+        receivers = caster.rows(discovery.all())
         rebuildMenu()
     }
 
@@ -262,8 +268,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         for (index, receiver) in receivers.enumerated() {
             let item = NSMenuItem(title: receiver.name, action: nil, keyEquivalent: "")
-            item.submenu = receiverMenu(receiver)
-            if caster.existing(receiver.id)?.showing != nil || currentReceiverID == receiver.id { item.state = .on }
+            let luch = TVKind.of(receiver.id) == .luch
+            item.submenu = luch ? receiverMenu(receiver) : tvMenu(receiver)
+            if caster.existing(receiver.id)?.showing != nil || currentReceiverID == receiver.id
+                || caster.tvs.session(receiver.id) != nil { item.state = .on }
             if index == 0 { item.image = NSImage(systemSymbolName: "tv", accessibilityDescription: nil) }
             menu.addItem(item)
         }
@@ -432,7 +440,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - actions
 
     @objc private func mirrorIfSingle() {
-        guard engine == nil, receivers.count == 1 else { return }
+        guard engine == nil, receivers.count == 1, TVKind.of(receivers[0].id) == .luch else { return }
         startMirror(receivers[0])
     }
 
@@ -810,7 +818,7 @@ extension AppDelegate {
     }
 
     /// Off the main thread (it waits for the TV); a refusal is shown, not swallowed.
-    private func send(_ request: [String: Any], to r: Receiver) {
+    func send(_ request: [String: Any], to r: Receiver) {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             let response = self.caster.run(request, on: r)
@@ -827,7 +835,7 @@ extension AppDelegate {
         }
     }
 
-    private func chooseFiles(for r: Receiver) {
+    func chooseFiles(for r: Receiver) {
         let panel = NSOpenPanel()
         panel.title = "Show on \(r.name)"
         panel.prompt = "Show"

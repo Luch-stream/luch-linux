@@ -318,6 +318,7 @@ public enum CastV2 {
             }
             let s = TVSession(device: d, onState: onState)
             let p = Player(ch: ch, transport: transport, appSession: appSession, volume: volume, session: s)
+            s.noteVolume(p.volumeNow)
             if let why = p.status(first) {
                 // Over before it began (a picture shown and done, an error): the session ends with this.
                 s.finish(why)
