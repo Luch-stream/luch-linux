@@ -156,6 +156,7 @@ luchctl pair                              # type the code the TV shows; luchctl 
 luchctl web                               # browsers allowed to watch through the web receiver
 luchctl reports                           # crash and error reports the receivers handed over
 luchctl report 1 open                     # file one as an issue (or: report 1, report 1 dismiss)
+luchctl report "HEVC stutters"            # a problem: one file in Downloads with every log, to hand over
 luchctl known                             # every receiver luchd has talked to, on or off, and how to wake it
 luchctl wake                              # turn a receiver on from standby and wait for it
 luchctl wake "XGIMI MoGo 4 Laser" learn   # pick up its remote's power signal over Bluetooth (receiver off)
