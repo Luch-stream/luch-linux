@@ -2974,6 +2974,58 @@ mod tests {
         std::fs::remove_dir_all(dir).unwrap();
     }
 
+    /// Against a real receiver (the Android app on an emulator): `LUCH_TV=host:port` of its TLS port, and the code
+    /// it shows written to the file `LUCH_TV_CODE` by whoever reads the screen. Pairs, connects again with the pin,
+    /// and starts a sealed session. Run by hand: `cargo test -p luchd -- --ignored real_receiver`.
+    #[tokio::test]
+    #[ignore]
+    async fn real_receiver_pairs_and_takes_sealed_media() {
+        let tv: SocketAddr = std::env::var("LUCH_TV").unwrap().parse().unwrap();
+        let code_file = std::env::var("LUCH_TV_CODE").unwrap();
+        let dir = temp_dir("real");
+        let me = pair::Identity::load(&dir).unwrap();
+        let mut o = dial(tv, &me, None).await.unwrap();
+        assert_eq!(o.first["t"], "pair", "{}", o.first);
+        let code = timeout(Duration::from_secs(60), async {
+            loop {
+                if let Ok(c) = std::fs::read_to_string(&code_file) {
+                    if let Ok(c) = pair::clean_code(c.trim()) {
+                        return c;
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let theirs = o.receiver_fp.unwrap();
+        pair::code_check(&mut o.rd, &mut o.wr, &code, &me.fp, &theirs)
+            .await
+            .unwrap();
+        assert_eq!(read_msg(&mut o.rd).await.unwrap().unwrap()["t"], "welcome");
+        drop(o);
+
+        let mut o = dial(tv, &me, Some(theirs)).await.unwrap();
+        assert_eq!(o.first["t"], "welcome", "paired: straight in");
+        send(
+            &mut o.wr,
+            &json!({"t": "start", "mode": "mirror",
+            "video": {"codec": "video/avc", "width": 1280, "height": 720, "fps": 30}}),
+        )
+        .await
+        .unwrap();
+        let ready = loop {
+            let v = read_msg(&mut o.rd).await.unwrap().unwrap();
+            if v["t"] == "ready" {
+                break v;
+            }
+        };
+        assert_eq!(ready["crypt"], "aes-128-gcm");
+        assert_eq!(mirror::media_key(&ready).unwrap().unwrap().len(), 16);
+        eprintln!("real receiver: paired, pinned, ready with a media key");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn txt_parses_and_lowercases_keys() {
         let t = txt_map(&[

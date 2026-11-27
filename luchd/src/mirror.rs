@@ -763,7 +763,7 @@ impl Tx {
 }
 
 /// The media key a receiver gives in `ready` over TLS (PROTOCOL.md 4); none from an older receiver.
-fn media_key(ready: &Value) -> Result<Option<Vec<u8>>, String> {
+pub(crate) fn media_key(ready: &Value) -> Result<Option<Vec<u8>>, String> {
     use base64::Engine;
     match (ready["crypt"].as_str(), ready["key"].as_str()) {
         (None, _) => Ok(None),
