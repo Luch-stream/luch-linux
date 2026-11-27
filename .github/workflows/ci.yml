@@ -12,6 +12,9 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    # luchd's "Send to the developers" (built in with option_env!; empty in forks: the button is then hidden).
+    env:
+      LUCH_REPORT_DSN: ${{ secrets.REPORT_DSN }}
     steps:
       - uses: actions/checkout@v4
 
