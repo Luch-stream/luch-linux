@@ -184,8 +184,12 @@ files of 1 MB, where Console.app shows it too), the logs of the paired receivers
 receiver's welcome, the last session's plan and stats, what you wrote) and the receivers' crash reports. "Hide
 addresses and names" (on unless `--keep-names`) turns IPv4 addresses into 192.0.2.N, IPv6 into 2001:db8::N, MACs
 into 02:00:00:00:00:NN and the names of this Mac, its user and the receivers into Computer, User, Receiver 1….
-Nothing is sent anywhere: Copy Description gives a few lines for a chat, Open an Issue a filled-in issue to attach
-the file to.
+Nothing is sent by itself: Copy Description gives a few lines for a chat, Open an Issue a filled-in issue to attach
+the file to, and in a build with a report address **Send to the Developers** (or `luchctl report --send`) sends it,
+with no account, to the developers' GlitchTip as one event (what happened, `about.txt` and the last 64 KB of each
+log, as hidden as the file) plus the zip, then shows its number (`LUCH-` and 8 hex digits) with Copy Number. The
+address is a DSN set when building, `REPORT_DSN="https://<key>@<host>/<project>" ./Tools/make-app.sh` (Info.plist
+`LuchReportDSN`; `LUCH_REPORT_DSN` in the app's environment overrides it); without one the button is not there.
 
 ## Not yet
 

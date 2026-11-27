@@ -420,7 +420,7 @@ default:
                    | find [auto|all|mdns,scan,ble,sound,qr] | add <link|host[:port]> | refresh | id | info [r]
                    | known | wake [r] | wake <r> learn | wake <r> mac|ble <value>|off
                    | pair [r] [code] | paired | forget <r> | reports | report <n> [open|dismiss]
-                   | report [--keep-names] [what happened…]
+                   | report [--keep-names] [--send] [what happened…]
                    | web [allow|deny <code> | forget <n>]
            present: shows a PDF or a presentation on the receiver and opens the presenter view here (current and
            next slide, notes, timer; the mouse is a laser pointer, dragging draws, a clicker turns the slides)
@@ -429,7 +429,8 @@ default:
            pair: the first connection to a receiver shows a code on the TV, typed here (any command that connects
            asks for it too); both then know each other and later connections need nothing. forget: pair again next time
            report: this Mac's log and its paired receivers' logs in one zip in Downloads, for a chat or an issue;
-           addresses and names hidden unless --keep-names
+           addresses and names hidden unless --keep-names; --send also sends it to the developers (no account;
+           when the app was built with a report address) and says its number
     """ + "\n" + togetherUsage + "\n" + calibrateUsage)
     exit(2)
 }

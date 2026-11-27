@@ -276,6 +276,22 @@ final class ProblemReportTests: XCTestCase {
         XCTAssertTrue(about.contains("addresses and names kept as they are"))
     }
 
+    func testWhatASentReportCarriesIsTheFilesTexts() throws {
+        let r = try ProblemReport.make(try input([receiver("tv-1", "Living room TV", tls: 0), receiver("tv-3", "Hall", tls: 0)],
+                                                 downloads: try tempDir()))
+        let f = r.facts
+        XCTAssertEqual(f.texts.map(\.0), ["about.txt", "luch-mac.log", "receiver-reports.json"], "about.txt first")
+        let out = try unzip(r.file)
+        for (name, text) in f.texts {
+            XCTAssertEqual(text, try String(contentsOf: out.appendingPathComponent(name), encoding: .utf8), name)
+        }
+        XCTAssertEqual(f.what, "HEVC stutters on Receiver 1")
+        XCTAssertEqual(f.receivers, ["Acme Box", "Acme Box"])
+        XCTAssertEqual(f.codec, "HEVC")
+        XCTAssertEqual(f.os, "macOS 99.0")
+        XCTAssertEqual(f.model, "Mac0,0")
+    }
+
     func testAnOlderReceiverIsNotAsked() throws {
         let old = try FakeTLSReceiver(dir: try tempDir())
         old.trust(me.fp)

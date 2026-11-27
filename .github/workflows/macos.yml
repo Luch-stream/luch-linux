@@ -49,6 +49,9 @@ jobs:
 
       - name: Luch.app
         run: ./Tools/make-app.sh
+        env:
+          # "Send to the Developers" (GlitchTip's DSN); unset, the app has no such button.
+          REPORT_DSN: ${{ secrets.REPORT_DSN }}
 
       - name: Notarize
         env:

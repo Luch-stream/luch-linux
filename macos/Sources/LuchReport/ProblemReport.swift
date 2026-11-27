@@ -27,6 +27,8 @@ public enum ProblemReport {
         public var me: (id: String, name: String)
         /// "Luch 1.2 (luch/0.1 (macos))": the app's version.
         public var app: String
+        /// "1.2": in a sent report's release.
+        public var version = "?"
         public var logPath: String?
         public var downloads: URL
         public var now = Date()
@@ -57,6 +59,23 @@ public enum ProblemReport {
         public let issueURL: String
         /// One line per receiver: its log taken, or why not.
         public let notes: [String]
+        /// What a sent report carries (ReportSender), as hidden as the file.
+        public let facts: Facts
+    }
+
+    /// The file's texts and what it is about, for "Send to the Developers".
+    public struct Facts {
+        public var what: String
+        /// (name in the zip, text), about.txt first.
+        public var texts: [(String, String)]
+        public var app: String
+        public var version: String
+        public var os: String
+        public var model: String
+        /// The receivers' models.
+        public var receivers: [String]
+        /// The codec of the last session ("HEVC"), from its plan line; empty when there was none.
+        public var codec: String
     }
 
     /// This Mac: what it is and the names that tell whose it is.
@@ -115,8 +134,11 @@ public enum ProblemReport {
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: work) }
 
+        var texts: [(String, String)] = []
         func write(_ name: String, _ s: String) throws {
-            try Data(text(s).utf8).write(to: dir.appendingPathComponent(name))
+            let t = text(s)
+            texts.append((name, t))
+            try Data(t.utf8).write(to: dir.appendingPathComponent(name))
         }
         try write("luch-mac.log", macLog)
         for (i, p) in parts.enumerated() {
@@ -133,9 +155,15 @@ public enum ProblemReport {
         try zip(dir, to: file)
         let notes = parts.map { text("\($0.receiver.name): \($0.note)") }
         let description = text(describe(input, parts: parts, file: file.lastPathComponent))
+        let what = text(input.what)
+        let plan = lastSession(macLog).first { $0.hasPrefix("plan: ") }
+        let facts = Facts(what: what, texts: texts.suffix(1) + texts.dropLast(), app: input.app, version: input.version,
+                          os: input.machine.os, model: input.machine.model,
+                          receivers: parts.map(\.receiver.model).filter { !$0.isEmpty },
+                          codec: plan.flatMap { $0.dropFirst(6).split(separator: " ").first.map(String.init) } ?? "")
         return Result(file: file, description: description,
-                      issueURL: issueURL(what: text(input.what), description: description, file: file.lastPathComponent),
-                      notes: notes)
+                      issueURL: issueURL(what: what, description: description, file: file.lastPathComponent),
+                      notes: notes, facts: facts)
     }
 
     // MARK: - receivers
@@ -308,7 +336,7 @@ public enum ProblemReport {
 
 public struct ReportError: Error, LocalizedError {
     public let errorDescription: String?
-    init(_ why: String) { errorDescription = why }
+    public init(_ why: String) { errorDescription = why }
 }
 
 private func sysctlString(_ name: String) -> String? {

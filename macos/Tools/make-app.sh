@@ -4,6 +4,7 @@
 #
 #   ./Tools/make-app.sh                     # ad-hoc
 #   SIGN_ID="<your code-signing identity>" ./Tools/make-app.sh
+#   REPORT_DSN="https://<key>@<host>/<project>" ./Tools/make-app.sh   # "Send to the Developers" (GlitchTip)
 # SPDX-License-Identifier: GPL-3.0-or-later
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -71,6 +72,10 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </dict>
 </plist>
 PLIST
+# The report address (LuchReport/ReportSender.swift): without one the app has no "Send to the Developers".
+if [ -n "${REPORT_DSN:-}" ]; then
+    /usr/libexec/PlistBuddy -c "Add :LuchReportDSN string $REPORT_DSN" "$APP/Contents/Info.plist"
+fi
 
 SIGN_ID="${SIGN_ID:-}"
 LIBS="$APP/Contents/Frameworks/libLuchNowPlaying.dylib"
