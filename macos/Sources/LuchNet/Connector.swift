@@ -33,7 +33,8 @@ public struct Connection {
 }
 
 public final class Connector {
-    public static let shared = Connector()
+    /// The app's and the command line's; tests put in one with a directory of their own.
+    public static var shared = Connector()
 
     /// Where the pins live (tests use their own).
     let dir: URL

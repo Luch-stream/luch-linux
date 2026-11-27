@@ -128,6 +128,7 @@ case "mirror":
     let response = call(request)
     if let error = response["error"] as? String { print("error: \(error)"); exit(1) }
     print("mirroring to \(response["receiver"] as? String ?? "?")")
+    codeIfAskedWhileMirroring(response["receiver"] as? String ?? "")
 
 case "stats":
     let response = call(["cmd": "stats"])

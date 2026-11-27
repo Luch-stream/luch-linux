@@ -75,12 +75,28 @@ final class FakeTLSReceiver {
                 link.send(["t": "paired"])
             }
             link.send(["t": "welcome", "v": 1, "id": "tv-1", "name": "Living room TV", "decoders": ["video/avc"],
-                       "modes": ["mirror"]])
+                       "modes": ["mirror", "audio"], "hw": ["audio": ["audio/opus"]]])
             if !reports.isEmpty, (hello["want"] as? [String])?.contains("reports") == true {
                 link.send(["t": "reports", "items": reports])
             }
-            while read(link) != nil {}
+            while let m = read(link) {
+                // A session's media goes to `mediaPort`, sealed with `mediaKey` (PROTOCOL.md 4).
+                if m["t"] as? String == "start" {
+                    link.send(["t": "ready", "video_port": Int(mediaPort), "audio_port": Int(mediaPort),
+                               "crypt": "aes-128-gcm", "key": Data(mediaKey).base64EncodedString()])
+                }
+            }
         }
+    }
+
+    var mediaPort: UInt16 = 0
+    var mediaKey: [UInt8] = Array(repeating: 9, count: 16)
+
+    /// A sender paired before (its certificate pinned here).
+    func trust(_ fp: Fingerprint) {
+        lock.lock()
+        pairedFPs.insert(hex(fp))
+        lock.unlock()
     }
 
     private func rounds(_ link: Lines, sender: Fingerprint) -> Bool {

@@ -1,7 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+import CryptoKit
+import Darwin
 import XCTest
-import LuchProto
+import LuchEngine
 @testable import LuchNet
+@testable import LuchProto
 
 /// Pairing end to end over TLS on loopback, against a receiver made of Swift (FakeTLSReceiver): what luchd's
 /// tests do against a TV made of Rust.
@@ -127,5 +130,55 @@ final class PairingFlowTests: XCTestCase {
         XCTAssertEqual(tv.messages.last(where: { $0["t"] as? String == "reports_taken" })?["ids"] as? [String], [id])
         XCTAssertEqual(Reports.list(base: dir).count, 1)
         c.channel.bye()
+    }
+
+    /// A session with a paired receiver: its media key from `ready`, every datagram sealed (sound only here, the
+    /// path that needs no screen; video goes through the same sender).
+    func testASessionWithAPairedReceiverIsSealed() throws {
+        let udp = socket(AF_INET, SOCK_DGRAM, 0)
+        defer { close(udp) }
+        var a = sockaddr_in()
+        a.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        a.sin_family = sa_family_t(AF_INET)
+        a.sin_addr.s_addr = inet_addr("127.0.0.1")
+        var len = socklen_t(MemoryLayout<sockaddr_in>.size)
+        withUnsafeMutablePointer(to: &a) { p in
+            p.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                _ = Darwin.bind(udp, $0, len)
+                _ = getsockname(udp, $0, &len)
+            }
+        }
+        var timeout = timeval(tv_sec: 3, tv_usec: 0)
+        setsockopt(udp, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        tv.mediaPort = UInt16(bigEndian: a.sin_port)
+        tv.trust(me.fp)
+        try Pins.pin("tv-1", fp: tv.certificate.fp, name: "Living room TV", dir: dir)
+        let saved = Connector.shared
+        Connector.shared = connector
+        defer { Connector.shared = saved }
+
+        var options = MirrorOptions()
+        options.soundOnly = true
+        options.synthetic = true
+        let engine = Engine(options: options)
+        try engine.start(receiver: receiver)
+        defer { engine.stop(reason: "test") }
+
+        var b = [UInt8](repeating: 0, count: 2048)
+        let n = recv(udp, &b, b.count, 0)
+        XCTAssertGreaterThan(n, Proto.headerSize)
+        let h = Array(b[0..<Proto.headerSize])
+        XCTAssertEqual(h[1], PacketFlags.config.rawValue)
+        XCTAssertEqual(Int(h.be32(16)), 19 + MediaSeal.tag, "the length counts the tag")
+        var aad = h
+        aad[2] = 0
+        aad[3] = 0
+        var nonce = [UInt8](repeating: 0, count: 12)
+        nonce[0] = MediaKind.audio.rawValue
+        nonce[4..<8] = h[8..<12]
+        let body = Array(b[Proto.headerSize..<n])
+        let box = try AES.GCM.SealedBox(nonce: AES.GCM.Nonce(data: nonce), ciphertext: body.dropLast(16), tag: body.suffix(16))
+        let plain = try AES.GCM.open(box, using: SymmetricKey(data: tv.mediaKey), authenticating: aad)
+        XCTAssertEqual(Array(plain.prefix(8)), Array("OpusHead".utf8))
     }
 }

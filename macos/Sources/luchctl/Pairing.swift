@@ -76,6 +76,26 @@ func pairedAndAgain(_ request: [String: Any], _ response: [String: Any], timeout
     return (try? LocalClient.request(request, timeout: timeout)) ?? ["error": "Luch.app is not running"]
 }
 
+/// The app mirrors in the background: a receiver that asks for pairing shows in its pairing state within the time
+/// it takes to connect. Its code is typed here; the app then starts the mirror itself.
+func codeIfAskedWhileMirroring(_ receiverName: String) {
+    guard isatty(STDIN_FILENO) != 0 else { return }
+    let receivers = request(["cmd": "receivers"])["receivers"] as? [[String: Any]] ?? []
+    guard let id = receivers.first(where: { $0["name"] as? String == receiverName })?["id"] as? String else { return }
+    let until = Date().addingTimeInterval(8)
+    while Date() < until {
+        let step = (request(["cmd": "pairing", "id": id])["state"] as? [String: Any])?["step"] as? String
+        if step == "allow" || step == "code" {
+            if let why = enterCode(id, code: nil) { failed(why) }
+            return
+        }
+        // Connected, refused, or waiting for an older receiver's Allow: no code to ask for.
+        let state = request(["cmd": "state"])["state"] as? String ?? ""
+        if ["Mirroring", "Extended", "Playing", "Error", "Press Allow", "Idle"].contains(where: state.hasPrefix) { return }
+        usleep(300_000)
+    }
+}
+
 func listPaired() {
     let all = request(["cmd": "paired"])["paired"] as? [[String: Any]] ?? []
     if all.isEmpty { print("(not paired with any receiver yet: `luchctl pair`)") }
