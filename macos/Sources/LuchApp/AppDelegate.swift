@@ -462,8 +462,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             NSApp.setActivationPolicy(.accessory)
             if !CGPreflightScreenCaptureAccess() {
-                state = "Screen Recording permission required"
+                // Once refused, macOS shows no dialog again: only the switch in Settings can allow it, and the
+                // app sees the change only after it restarts.
+                state = "Allow Luch in Screen Recording, then reopen Luch"
                 rebuildMenu()
+                if let pane = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
+                    NSWorkspace.shared.open(pane)
+                }
                 return
             }
         }
