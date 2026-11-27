@@ -104,7 +104,7 @@ public final class WebSocket {
             var data = n > 0 ? (stream.read(n, timeout: timeout) ?? Data()) : Data()
             guard data.count == n else { return nil }
             let k = [UInt8](key)
-            data.withUnsafeMutableBytes { p in
+            data.withUnsafeMutableBytes { (p: UnsafeMutableRawBufferPointer) in
                 for i in 0..<n { p[i] ^= k[i & 3] }
             }
             switch op {
