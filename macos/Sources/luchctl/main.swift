@@ -153,6 +153,10 @@ case "state":
     let response = call(["cmd": "state"])
     print("state: \(response["state"] as? String ?? "?"), streaming: \((response["streaming"] as? Bool) == true)")
 
+case "screen":
+    guard args.count > 1 else { print("usage: luchctl screen asis|speed|quality|mac|extend"); exit(2) }
+    fail(call(["cmd": "screen", "mode": args[1]]))
+
 case "warmth":
     guard args.count > 1, let value = Double(args[1]) else {
         print("usage: luchctl warmth 0...1")

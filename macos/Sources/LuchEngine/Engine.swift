@@ -244,6 +244,8 @@ public final class Engine {
     private var audioFrames: UInt64 = 0
     private var watcher: NowPlayingWatcher?
     private var virtualScreen: VirtualScreen?
+    /// The receiver's welcome, kept for a change of screen within the session.
+    private var caps: ReceiverCaps?
     private var displayMirror: DisplayMirror?
     /// The TV's mode the ultra-low latency session draws at.
     public private(set) var ultraMode: DisplayMode?
@@ -273,10 +275,57 @@ public final class Engine {
         guard let welcome = ctl.waitFor("welcome", timeout: 5) else { throw EngineError.noWelcome }
         guard let caps = ReceiverCaps(welcome: welcome) else { throw EngineError.noWelcome }
         log(caps.describe())
+        self.caps = caps
         if options.soundOnly {
             try startSound(ctl, caps: caps, receiver: r)
             return
         }
+        try begin(ctl, caps: caps, receiver: r)
+    }
+
+    /// Changes how this Mac's screen is shown (as it is, at the TV's mode, or extended) while the session runs:
+    /// a new start on the same connection, which the receiver takes as the same sender's, so nobody is asked to
+    /// Allow again and the TV keeps its screen up.
+    public func switchScreen(extend: Bool, ultra: UltraPriority?) throws {
+        guard running, !stopping, !options.soundOnly, let ctl = control, let caps, let r = receiver else {
+            throw EngineError.noReady
+        }
+        log("switching the screen: \(ultra.map { "at the TV's mode, " + $0.rawValue } ?? (extend ? "extended" : "as it is"))")
+        tearDownMedia()
+        options.extend = extend
+        options.ultra = ultra
+        try begin(ctl, caps: caps, receiver: r)
+    }
+
+    /// Everything of one picture's pipeline, the connection left open.
+    private func tearDownMedia() {
+        stopTimers()
+        watcher?.stop()
+        watcher = nil
+        let done = DispatchSemaphore(value: 0)
+        let capture = self.capture
+        Task {
+            await capture?.stop()
+            done.signal()
+        }
+        _ = done.wait(timeout: .now() + 2)
+        self.capture = nil
+        encoder = nil
+        videoTx = nil
+        audioTx = nil
+        audio = nil
+        lastAU = nil
+        basePTS = nil
+        lastFrames = 0
+        lastBytes = 0
+        lastLatency = 0
+        displayMirror = nil
+        virtualScreen = nil
+        ultraMode = nil
+    }
+
+    /// The picture: the plan, the screen to capture, the start, then capture, encoder and sockets.
+    private func begin(_ ctl: ControlChannel, caps: ReceiverCaps, receiver r: Receiver) throws {
         var planned = options
         // A screen of the TV's own takes the TV's shape: nothing to crop or fit.
         if planned.extend { planned.sizeMode = .client }
@@ -646,9 +695,11 @@ public final class Engine {
             return
         }
         let snap = tx.snapshot()
-        let df = snap.frames - lastFrames
-        let db = snap.bytes - lastBytes
-        let dl = snap.latencySum - lastLatency
+        // A new sender (the screen switched) counts from zero again: a smaller count is a fresh start, not an
+        // overflow that would end the app.
+        let df = snap.frames >= lastFrames ? snap.frames - lastFrames : snap.frames
+        let db = snap.bytes >= lastBytes ? snap.bytes - lastBytes : snap.bytes
+        let dl = snap.latencySum >= lastLatency ? snap.latencySum - lastLatency : snap.latencySum
         lastFrames = snap.frames
         lastBytes = snap.bytes
         lastLatency = snap.latencySum
