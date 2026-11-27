@@ -81,6 +81,14 @@ polling.
 
 ## Use
 
+Tab completion for `luchctl` (commands, each one's words, receivers' names from the app, files where a file goes):
+
+```sh
+luchctl completion zsh > "$(brew --prefix)/share/zsh/site-functions/_luchctl"   # then: rm ~/.zcompdump; exec zsh
+luchctl completion bash > ~/.local/share/bash-completion/completions/luchctl
+luchctl completion fish > ~/.config/fish/completions/luchctl.fish
+```
+
 Menu bar: pick a receiver → **Mirror Screen**. While streaming the menu shows the estimated latency
 (capture + encode + one-way network + the receiver's decode), host time, RTT, the decoder's own number,
 the receiver's battery and thermal headroom.

@@ -14,6 +14,15 @@ func call(_ request: [String: Any]) -> [String: Any] {
 
 let args = Array(CommandLine.arguments.dropFirst())
 if NativeHost.startedByBrowser(args) { NativeHost.run() }
+if args.first == "__complete" { Complete.run(Array(args.dropFirst())) }
+if args.first == "completion" {
+    guard args.count == 2, let script = Complete.script(args[1]) else {
+        print("usage: luchctl completion zsh|bash|fish   (zsh: luchctl completion zsh > \"${fpath[1]}/_luchctl\")")
+        exit(2)
+    }
+    print(script)
+    exit(0)
+}
 let command = args.first ?? "list"
 
 func fail(_ response: [String: Any]) {
