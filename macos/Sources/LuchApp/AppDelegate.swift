@@ -80,6 +80,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
     private let menu = NSMenu()
     private let discovery = Discovery()
+    /// Receivers past mDNS, the ones talked to before, waking them (Finding.swift).
+    private lazy var finding = Finding(discovery: discovery)
     private var engine: Engine?
     private var state = "Idle"
     private var statsLine = "Not streaming"
@@ -118,6 +120,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.async { self?.refreshReceivers() }
         }
         discovery.start()
+        finding.onChange = { [weak self] in DispatchQueue.main.async { self?.refreshReceivers() } }
+        finding.finder.isConnected = { [caster] id in caster.existing(id) != nil }
+        caster.onOpen = { [finding] r in finding.finder.remember(r) }
+        try? finding.finder.start("auto")
         let identity = senderIdentity()
         discovery.publish(name: identity.name, id: identity.id)
         startLocalServer()
@@ -153,6 +159,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 }
                 return self.caster.handle(request, receivers: known, mirroring: mirroring)
             }
+            if Finding.commands.contains(request["cmd"] as? String ?? "") {
+                var listed: [Receiver] = []
+                DispatchQueue.main.sync { listed = self.receivers }
+                return self.finding.handle(request, receivers: listed)
+            }
             var response: [String: Any] = [:]
             // The socket thread must not touch AppKit state directly.
             DispatchQueue.main.sync { response = self.handleLocal(request) }
@@ -171,6 +182,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case "ping":
             return ["ok": true]
         case "receivers":
+            try? finding.finder.start("auto") // as luchd's list: the automatic ladder, at most every 30 s
             return ["receivers": receivers.map { receiver in
                 ["id": receiver.id, "name": receiver.name, "model": receiver.model,
                  "address": receiver.address, "iface": receiver.interfaceName,
@@ -243,7 +255,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - menu
 
     private func refreshReceivers() {
-        receivers = discovery.all()
+        receivers = finding.finder.list()
         rebuildMenu()
     }
 
@@ -267,6 +279,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if index == 0 { item.image = NSImage(systemSymbolName: "tv", accessibilityDescription: nil) }
             menu.addItem(item)
         }
+        finding.addMenu(to: menu, online: receivers)
 
         menu.addItem(.separator())
 
@@ -533,6 +546,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             do {
                 try engine.start(receiver: receiver)
+                self?.finding.finder.remember(receiver)
                 let codec = engine.plan?.codec.label ?? ""
                 let batteryNote = engine.deviceOnBattery ? " · 🔋 on battery" : ""
                 DispatchQueue.main.async {

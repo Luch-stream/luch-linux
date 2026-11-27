@@ -45,6 +45,12 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>NSHighResolutionCapable</key><true/>
     <key>NSLocalNetworkUsageDescription</key>
     <string>Luch finds receivers on the local network with Bonjour and streams the screen to them.</string>
+    <key>NSBluetoothAlwaysUsageDescription</key>
+    <string>Luch finds receivers nearby over Bluetooth, and learns your TV remote's power key to turn the TV on.</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Luch listens for a TV saying its address by sound, only while you ask it to find receivers that way.</string>
+    <key>NSCameraUsageDescription</key>
+    <string>Luch reads the QR code on a TV's screen, only while you ask it to find receivers that way.</string>
     <key>NSBonjourServices</key>
     <array>
         <string>_luch._tcp</string>

@@ -33,12 +33,16 @@ final class Caster {
         }
         lock.unlock()
         let s = try CastSession.open(r)
+        onOpen?(r)
         s.onShowing = { [weak self] in self?.onChange?() }
         lock.lock()
         sessions[r.id] = s
         lock.unlock()
         return s
     }
+
+    /// A session with a receiver was opened (it is then remembered for waking). Called on any thread.
+    var onOpen: ((Receiver) -> Void)?
 
     /// Something shown on a receiver started, ended or changed (the menu follows it). Called on any thread.
     var onChange: (() -> Void)?

@@ -61,6 +61,8 @@ func chooseReceiver() -> String? {
     return ReceiverChoice.ask(all)?.id
 }
 
+if FindCommands.handles(args) { exit(FindCommands.run(args)) }
+
 switch command {
 case "list":
     let response = call(["cmd": "receivers"])
@@ -275,6 +277,8 @@ default:
                    | cast <file|link>... [--to r] [--title T] [--start m:ss] [--sub file] [--relay] | stop-cast [r]
                    | media [r] [play|pause|toggle|seek m:ss|skip s|rate x|audio id|sub id|sub off]
                    | volume [r] [0..100|+|-|mute|unmute] | page [r] next|prev|<n> | sleep [r] | browser install
+                   | find [auto|all|mdns,scan,ble,sound,qr] | add <link|host[:port]> | refresh | id | info [r]
+                   | known | wake [r] | wake <r> learn | wake <r> mac|ble <value>|off
     """)
     exit(2)
 }
