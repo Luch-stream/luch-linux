@@ -195,3 +195,22 @@ What plays comes from MediaRemote, the source of Control Center's player. Since 
 own processes and returns nothing to other apps, so a small library (`libLuchNowPlaying.dylib`, in the app's
 Frameworks) is loaded into the system `/usr/bin/perl`, which is one of them, and reports changes as JSON lines; the
 open mediaremote-adapter does the same. If Apple closes that too, the TV simply shows no title.
+
+## In step, sound modes, the latency lab
+
+Several receivers can play one capture in step (PROTOCOL.md 4k), as luchd's groups: "Play Together…" in the menu,
+or the Linux luchctl's words. One capture and one encode; every member gets the streams of its role on its own
+sockets, with the playout delay D in each packet, chosen from what the members report by the same policy as luchd's
+(the same test vectors, `SyncTests`). The receivers' clock requests are answered on the media sockets.
+
+```sh
+luchctl group watch "Living room TV" Kitchen Den --source audio   # this Mac's sound on three speakers, one delay
+luchctl group interactive "Living room TV" Kitchen=audio          # the picture as fast as alone, the sound waits
+luchctl offset Kitchen 40                  # its own correction (positive = later), kept per output route
+luchctl stats                              # also D and each member's need, route and correction
+luchctl audio "Living room TV" sync        # auto | on | off | sync: the sound of the next session
+luchctl latency on                         # the lab's page opens here, the TV draws its pattern (docs/latency-lab.md)
+luchctl latency analyze clip.mov           # runs luch-latency (cargo install --path luch-latency; brew install ffmpeg)
+```
+
+The TV's menu has the same: its sound mode, a slider for its correction, and the latency lab.

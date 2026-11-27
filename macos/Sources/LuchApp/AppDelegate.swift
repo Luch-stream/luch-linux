@@ -122,6 +122,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         discovery.publish(name: identity.name, id: identity.id)
         startLocalServer()
         caster.onChange = { [weak self] in DispatchQueue.main.async { self?.rebuildMenu() } }
+        wireTogether()
 
         rebuildMenu()
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.tick() }
@@ -138,11 +139,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - local API (luchctl)
 
     let caster = Caster()
+    let together = Together()
 
     private func startLocalServer() {
         let server = LocalServer()
         server.handler = { [weak self] request in
             guard let self else { return ["error": "app is shutting down"] }
+            if let answer = self.together.intercept(request) { return answer }
             // What waits for a receiver's answer runs here, on the socket's thread, not on the main one.
             if Caster.commands.contains(request["cmd"] as? String ?? "") {
                 var known: [Receiver] = []
@@ -268,6 +271,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             menu.addItem(item)
         }
 
+        menu.addItem(.separator())
+        together.addMenuItems(to: menu, receivers: receivers)
         menu.addItem(.separator())
 
         let stats = NSMenuItem(title: statsLine, action: nil, keyEquivalent: "")
@@ -489,9 +494,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         stopMirror()
+        DispatchQueue.global(qos: .userInitiated).async { [together] in together.stop() }
         var options = MirrorOptions()
         options.bitrate = Preferences.shared.bitrate
-        options.audio = Preferences.shared.audio
+        options.audioMode = SyncStore.shared.audioMode(receiver.id)
+        options.audio = Preferences.shared.audio && options.audioMode != .off
         options.display = Preferences.shared.display
         options.codec = codecOverride ?? (CodecChoice(rawValue: Preferences.shared.codec) ?? .auto)
         options.sizeMode = sizeModeOverride ?? (SizeMode(rawValue: Preferences.shared.sizeMode) ?? .fit)
@@ -533,6 +540,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             do {
                 try engine.start(receiver: receiver)
+                self?.together.sessionStarted(receiver.id)
                 let codec = engine.plan?.codec.label ?? ""
                 let batteryNote = engine.deviceOnBattery ? " · 🔋 on battery" : ""
                 DispatchQueue.main.async {
@@ -697,6 +705,7 @@ extension AppDelegate {
         if mirroringHere {
             m.addItem(.run("Stop Mirroring", symbol: "stop.circle") { [weak self] in self?.stopMirror() })
         }
+        together.addReceiverItems(to: m, receiver: r)
 
         m.addItem(.separator())
         m.addItem(.run("Show File…", symbol: "doc") { [weak self] in self?.chooseFiles(for: r) })
@@ -950,5 +959,32 @@ enum ScreenMode: String, CaseIterable {
         case .speed, .quality, .likeMac: return "bolt"
         case .extend: return "rectangle.split.2x1"
         }
+    }
+}
+
+// MARK: - playing in step, sound modes, the latency lab (Together.swift)
+
+extension AppDelegate {
+    fileprivate func wireTogether() {
+        together.hooks.receivers = { [weak self] in self?.receivers ?? [] }
+        together.hooks.mirroring = { [weak self] in
+            guard let self, let engine, let id = currentReceiverID else { return nil }
+            let mode = engine.options.soundOnly ? "audio" : Preferences.shared.screenMode(for: id).rawValue
+            return (id, engine, mode)
+        }
+        together.hooks.stopMirror = { [weak self] in self?.stopMirror() }
+        together.hooks.options = {
+            var o = MirrorOptions()
+            o.bitrate = Preferences.shared.bitrate
+            o.audio = Preferences.shared.audio
+            o.display = Preferences.shared.display
+            o.codec = CodecChoice(rawValue: Preferences.shared.codec) ?? .auto
+            o.sizeMode = SizeMode(rawValue: Preferences.shared.sizeMode) ?? .fit
+            o.preset = QualityPreset.parse(Preferences.shared.preset) ?? .balanced
+            o.warmth = Preferences.shared.warmth
+            return o
+        }
+        together.hooks.restart = { [weak self] _ in self?.restartIfStreaming() }
+        together.hooks.changed = { [weak self] in self?.rebuildMenu() }
     }
 }

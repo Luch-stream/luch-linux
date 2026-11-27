@@ -148,6 +148,19 @@ case "stats":
         if let thermal = stats["thermal"] as? String, thermal != "none" { line += " · \(thermal)" }
         print(line)
     }
+    printGroup()
+
+case "group":
+    groupCommand(args)
+
+case "offset":
+    offsetCommand(args)
+
+case "audio":
+    audioCommand(args)
+
+case "latency":
+    latencyCommand(args)
 
 case "state":
     let response = call(["cmd": "state"])
@@ -275,6 +288,6 @@ default:
                    | cast <file|link>... [--to r] [--title T] [--start m:ss] [--sub file] [--relay] | stop-cast [r]
                    | media [r] [play|pause|toggle|seek m:ss|skip s|rate x|audio id|sub id|sub off]
                    | volume [r] [0..100|+|-|mute|unmute] | page [r] next|prev|<n> | sleep [r] | browser install
-    """)
+    """ + "\n" + togetherUsage)
     exit(2)
 }
