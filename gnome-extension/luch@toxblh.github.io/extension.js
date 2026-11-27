@@ -7,6 +7,7 @@ import GObject from 'gi://GObject';
 import St from 'gi://St';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import {CheckBox} from 'resource:///org/gnome/shell/ui/checkBox.js';
 import * as ModalDialog from 'resource:///org/gnome/shell/ui/modalDialog.js';
 import * as MessageTray from 'resource:///org/gnome/shell/ui/messageTray.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
@@ -14,6 +15,7 @@ import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import {QuickMenuToggle, SystemIndicator} from 'resource:///org/gnome/shell/ui/quickSettings.js';
 import VirtualCursor from './cursor.js';
 import QuietAsker from './quiet.js';
+import Reporter from './report.js';
 
 const IFACE = `<node>
   <interface name="dev.luch.Luch1">
@@ -37,6 +39,7 @@ const IFACE = `<node>
     <method name="DirectOff"><arg type="s" direction="out"/></method>
     <method name="DirectStatus"><arg type="s" direction="out"/></method>
     <method name="DirectOffers"><arg type="s" direction="out"/></method>
+    <method name="Report"><arg name="text" type="s" direction="in"/><arg name="keep_names" type="b" direction="in"/><arg type="s" direction="out"/></method>
     <property name="WebUrl" type="s" access="read"/>
     <property name="Quiet" type="s" access="readwrite"/>
     <signal name="ReceiversChanged"/>
@@ -105,6 +108,18 @@ const T = RU ? {
         pairing: 'сопряжение', asking: 'разрешите подключение на ТВ', joining: 'подключаюсь к сети ТВ',
         connecting: 'подключаюсь к ТВ'},
     directing: (name, step) => `Напрямую${name ? ` к ${name}` : ''}: ${step}…`,
+    report: 'Сообщить о проблеме…',
+    reporting: 'Собираю отчёт…',
+    reportWhat: 'Что случилось?',
+    reportHint: 'Например: с HEVC картинка дёргается',
+    reportHide: 'Скрыть адреса и имена',
+    reportMake: 'Собрать отчёт',
+    reportReady: 'Отчёт готов',
+    reportBody: file => `${file} в папке «Загрузки». Ничего не отправлено: перетащите файл в чат или приложите к issue.`,
+    reportShow: 'Показать файл',
+    reportCopy: 'Скопировать описание',
+    reportIssue: 'Открыть issue',
+    close: 'Закрыть',
 } : {
     title: 'Luch',
     header: 'Screen mirroring',
@@ -158,6 +173,18 @@ const T = RU ? {
         pairing: 'pairing', asking: 'allow the connection on the TV', joining: 'joining the TV\u2019s network',
         connecting: 'connecting to the TV'},
     directing: (name, step) => `Directly${name ? ` to ${name}` : ''}: ${step}…`,
+    report: 'Report a problem…',
+    reporting: 'Collecting the report…',
+    reportWhat: 'What happened?',
+    reportHint: 'e.g. the picture stutters with HEVC',
+    reportHide: 'Hide addresses and names',
+    reportMake: 'Make the report',
+    reportReady: 'The report is ready',
+    reportBody: file => `${file} is in Downloads. Nothing was sent: drag it into a chat or attach it to an issue.`,
+    reportShow: 'Show the file',
+    reportCopy: 'Copy description',
+    reportIssue: 'Open an issue',
+    close: 'Close',
 };
 
 /** A D-Bus error's own message, without the "GDBus.Error:...: " prefix. */
@@ -252,6 +279,70 @@ function confirm(title, body, yes) {
     });
 }
 
+/** The report's short form: what happened, and whether to hide addresses and names (on by default). */
+function reportForm() {
+    const dialog = new ModalDialog.ModalDialog({destroyOnClose: true});
+    const box = new St.BoxLayout({vertical: true, style: 'spacing: 12px; min-width: 420px;'});
+    box.add_child(new St.Label({text: T.reportWhat, style: 'font-weight: bold; font-size: 1.2em;'}));
+    const entry = new St.Entry({can_focus: true, hint_text: T.reportHint, style: 'min-height: 5em;'});
+    entry.clutter_text.single_line_mode = false;
+    entry.clutter_text.activatable = false;
+    entry.clutter_text.line_wrap = true;
+    box.add_child(entry);
+    const hide = new CheckBox(T.reportHide);
+    hide.checked = true;
+    box.add_child(hide);
+    dialog.contentLayout.add_child(box);
+    return new Promise(resolve => {
+        let answered = false;
+        const done = value => {
+            if (answered)
+                return;
+            answered = true;
+            dialog.close();
+            resolve(value);
+        };
+        dialog.connect('closed', () => done(null));
+        dialog.setButtons([
+            {label: T.cancel, action: () => done(null), key: Clutter.KEY_Escape},
+            {label: T.reportMake, action: () => done({text: entry.get_text(), hide: hide.checked}), default: true},
+        ]);
+        dialog.open();
+        global.stage.set_key_focus(entry);
+    });
+}
+
+/** The report written: where it is, who gave no log, and what to do with it; the buttons leave the dialog open. */
+function reportDone(r, actions) {
+    const dialog = new ModalDialog.ModalDialog({destroyOnClose: true});
+    const box = new St.BoxLayout({vertical: true, style: 'spacing: 12px; max-width: 480px;'});
+    box.add_child(new St.Label({text: T.reportReady, style: 'font-weight: bold; font-size: 1.2em;'}));
+    const file = GLib.path_get_basename(r.path ?? '');
+    const text = new St.Label({text: [T.reportBody(file), ...(r.notes ?? [])].join('\n')});
+    text.clutter_text.line_wrap = true;
+    box.add_child(text);
+    dialog.contentLayout.add_child(box);
+    dialog.setButtons([
+        ...actions.map(([label, fn]) => ({label, action: fn})),
+        {label: T.close, action: () => dialog.close(), key: Clutter.KEY_Escape, default: true},
+    ]);
+    dialog.open();
+}
+
+/** The file selected in the file manager (FileManager1, as Files and most others serve it), else its folder. */
+function showFile(path) {
+    const file = Gio.File.new_for_path(path);
+    Gio.DBus.session.call('org.freedesktop.FileManager1', '/org/freedesktop/FileManager1',
+        'org.freedesktop.FileManager1', 'ShowItems', new GLib.Variant('(ass)', [[file.get_uri()], '']),
+        null, Gio.DBusCallFlags.NONE, -1, null, (bus, res) => {
+            try {
+                bus.call_finish(res);
+            } catch (e) {
+                Gio.AppInfo.launch_default_for_uri(file.get_parent().get_uri(), null);
+            }
+        });
+}
+
 /** A TV without the Luch app (luchd's "cast:" and "dlna:" ids): it plays files, it cannot mirror or sleep. */
 function isTv(id) {
     return /^(cast|dlna):/.test(id);
@@ -338,6 +429,19 @@ class LuchToggle extends QuickMenuToggle {
                 this._directState = JSON.parse(status);
             }).catch(() => {}); // an older luchd
             this._quiet = new QuietAsker(proxy, askQuestion, T);
+            this._reporter = new Reporter(proxy, {
+                form: reportForm,
+                busy: on => {
+                    this._reporting = on;
+                    this._render(null);
+                },
+                done: reportDone,
+                failed: e => Main.notify(T.failed(T.title), reason(e)),
+            }, {
+                showFile,
+                copy: text => St.Clipboard.get_default().set_text(St.ClipboardType.CLIPBOARD, text),
+                open: url => Gio.AppInfo.launch_default_for_uri(url, null),
+            }, T);
             this._quietId = proxy.connectSignal('QuietAsk', () => this._quiet.onAsk());
             this._ownerId = proxy.connect('notify::g-name-owner', () => this._discover());
             this._propId = proxy.connect('g-properties-changed', () => this._refresh());
@@ -564,6 +668,15 @@ class LuchToggle extends QuickMenuToggle {
             item.label.add_style_class_name('monospace');
             web.menu.addMenuItem(item);
             this._section.addMenuItem(web);
+        }
+
+        // Everything a tester hands over, as one file; nothing is sent by itself.
+        if (this._reporter) {
+            const item = new PopupMenu.PopupImageMenuItem(this._reporting ? T.reporting : T.report,
+                'dialog-warning-symbolic');
+            item.setSensitive(!this._reporting);
+            item.connect('activate', () => this._reporter.run());
+            this._section.addMenuItem(item);
         }
 
         if (mirroring.length > 0) {

@@ -150,6 +150,7 @@ luchctl info                              # Android приёмника и что
 luchctl audio sync                        # звук: auto | on | off | sync (для каждого приёмника, запоминается)
 luchctl reports                           # отчёты о сбоях, которые передали приёмники
 luchctl report 1 open                     # оформить отчёт как issue (или: report 1, report 1 dismiss)
+luchctl report "HEVC дёргается"           # о проблеме: один файл в «Загрузках» со всеми логами, чтобы передать
 luchctl known                             # все приёмники, с которыми luchd работал: включены ли и как их будить
 luchctl wake                              # включить приёмник из режима ожидания и дождаться его
 luchctl wake "XGIMI MoGo 4 Laser" learn   # запомнить сигнал кнопки питания его пульта по Bluetooth (приёмник выключен)
