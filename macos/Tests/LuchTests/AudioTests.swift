@@ -2,6 +2,7 @@
 import XCTest
 import LuchMedia
 import LuchProto
+import CoreMedia
 
 final class AudioTests: XCTestCase {
     func testOpusHeadUsesEncoderPreSkip() throws {
@@ -38,5 +39,24 @@ final class AudioTests: XCTestCase {
         XCTAssertEqual(packets.count, 0)
         audio.emit([Float](repeating: 0, count: 180), pts: .zero) // tops it up to 5 ms
         XCTAssertEqual(packets.count, 1)
+    }
+
+    /// A packet's pts is its first sample's time, from the buffer it came in: steady 20 ms buffers give pts 20 ms
+    /// apart (they ran twice as fast once, and every receiver in a group resynced every second packet).
+    func testPacketPtsFollowTheSamples() throws {
+        let audio = try XCTUnwrap(OpusAudio(frameMs: 20))
+        var pts: [Double] = []
+        audio.onPacket = { _, t in pts.append(CMTimeGetSeconds(t) * 1000) }
+        let ms20 = [Float](repeating: 0, count: 960 * 2)
+        for i in 0..<5 { audio.emit(ms20, pts: CMTime(value: CMTimeValue(1000 + 20 * i), timescale: 1000)) }
+        XCTAssertEqual(pts.map { $0.rounded() }, [1000, 1020, 1040, 1060, 1080])
+
+        // Buffers that don't fall on packet edges: 30 ms each, a packet starts 10 ms into the second one.
+        pts.removeAll()
+        let other = try XCTUnwrap(OpusAudio(frameMs: 20))
+        other.onPacket = { _, t in pts.append(CMTimeGetSeconds(t) * 1000) }
+        let ms30 = [Float](repeating: 0, count: 1440 * 2)
+        for i in 0..<4 { other.emit(ms30, pts: CMTime(value: CMTimeValue(500 + 30 * i), timescale: 1000)) }
+        XCTAssertEqual(pts.map { $0.rounded() }, [500, 520, 540, 560, 580, 600])
     }
 }

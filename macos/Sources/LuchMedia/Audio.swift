@@ -14,7 +14,6 @@ public final class OpusAudio {
 
     private var encoder: OpaquePointer?
     private var pending: [Float] = []
-    private var framesEmitted: UInt64 = 0
     private var warnedFormat = false
     private var loggedFormat = false
     private var rmsSum: Double = 0
@@ -105,6 +104,10 @@ public final class OpusAudio {
     @discardableResult
     public func emit(_ samples: [Float], pts: CMTime) -> [Data] {
         guard let encoder else { return [] }
+        // A packet's pts is its first sample's: `pts` is the first new sample's, and what was left over from the
+        // buffers before plays just ahead of it.
+        let start = CMTimeSubtract(pts, CMTime(value: CMTimeValue(pending.count / channels), timescale: CMTimeScale(sampleRate)))
+        var cut = 0
         pending.append(contentsOf: samples)
         var out: [Data] = []
         let need = frameSamples * channels
@@ -122,8 +125,8 @@ public final class OpusAudio {
                 continue
             }
             let packet = Data(buffer[0..<Int(written)])
-            let framePTS = CMTimeAdd(pts, CMTime(value: CMTimeValue(framesEmitted * UInt64(frameMs)), timescale: 1000))
-            framesEmitted += 1
+            let framePTS = CMTimeAdd(start, CMTime(value: CMTimeValue(cut * frameSamples), timescale: CMTimeScale(sampleRate)))
+            cut += 1
             out.append(packet)
             onPacket?(packet, framePTS)
         }
