@@ -25,7 +25,7 @@ public enum BLE {
 
     /// A receiver's card in an advertisement, if it holds one.
     public static func card(_ data: Data?) -> Card? {
-        guard let m = manufacturer(data), m.company == cardCompany, let c = Card.decode(m.bytes),
+        guard let m = manufacturer(data), m.company == cardCompany, let c = Card.decode(m.bytes, bluetooth: true),
               c.kind == Card.receiver else { return nil }
         return c
     }

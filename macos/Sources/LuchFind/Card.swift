@@ -7,6 +7,8 @@
 //   7..11  IPv4            receiver only
 //   11..13 port            receiver only, big-endian
 //   13..17 token           a one-time pairing token: sound only, never over Bluetooth
+//   13..15 PSM             Bluetooth only: the L2CAP channel for connecting directly (Direct.swift), big-endian,
+//                          0 = none; with one, the address may be 0.0.0.0:0 (no usable LAN)
 // SPDX-License-Identifier: GPL-3.0-or-later
 import Foundation
 import LuchNet
@@ -25,18 +27,21 @@ public struct Card: Equatable {
     public var addr: (ip: UInt32, port: UInt16)?
     /// 8 lowercase hex digits.
     public var token: String?
+    /// The L2CAP PSM a receiver takes a direct connection on (Bluetooth only), 0 when it offers none.
+    public var psm: UInt16
 
     public init(kind: UInt8, version: UInt8 = UInt8(Proto.version), id: String, addr: (ip: UInt32, port: UInt16)?,
-                token: String? = nil) {
+                token: String? = nil, psm: UInt16 = 0) {
         self.kind = kind
         self.version = version
         self.id = id
         self.addr = addr
         self.token = token
+        self.psm = psm
     }
 
     public static func == (a: Card, b: Card) -> Bool {
-        a.kind == b.kind && a.version == b.version && a.id == b.id && a.token == b.token
+        a.kind == b.kind && a.version == b.version && a.id == b.id && a.token == b.token && a.psm == b.psm
             && a.addr?.ip == b.addr?.ip && a.addr?.port == b.addr?.port
     }
 
@@ -49,16 +54,24 @@ public struct Card: Equatable {
         var b = Card.magic
         b.append(version << 4 | kind)
         b += hex4(id) ?? [0, 0, 0, 0]
-        if let (ip, port) = addr {
+        if addr != nil || psm != 0 {
+            let (ip, port) = addr ?? (0, 0)
             b += [UInt8(ip >> 24), UInt8(ip >> 16 & 255), UInt8(ip >> 8 & 255), UInt8(ip & 255)]
             b += [UInt8(port >> 8), UInt8(port & 255)]
-            if let t = token.flatMap(hex4) { b += t }
+            if psm != 0 {
+                b += [UInt8(psm >> 8), UInt8(psm & 255)]
+            } else if let t = token.flatMap(hex4) {
+                b += t
+            }
         }
         return b
     }
 
-    /// Nil for anything that is not a card of a version this sender speaks.
-    public static func decode(_ b: [UInt8]) -> Card? {
+    /// Nil for anything that is not a card of a version this sender speaks (a card heard by sound).
+    public static func decode(_ b: [UInt8]) -> Card? { decode(b, bluetooth: false) }
+
+    /// `bluetooth`: the card of an advertisement, where bytes 13..15 are the PSM instead of a token.
+    public static func decode(_ b: [UInt8], bluetooth: Bool) -> Card? {
         guard b.count >= 7, Array(b[0..<2]) == magic else { return nil }
         let (version, kind) = (b[2] >> 4, b[2] & 15)
         guard UInt32(version) == Proto.version, kind == receiver || kind == sender else { return nil }
@@ -68,9 +81,12 @@ public struct Card: Equatable {
             addr = (UInt32(b[7]) << 24 | UInt32(b[8]) << 16 | UInt32(b[9]) << 8 | UInt32(b[10]),
                     UInt16(b[11]) << 8 | UInt16(b[12]))
         }
-        if kind == receiver, addr.map({ $0.ip == 0 || $0.port == 0 }) ?? true { return nil }
-        let token = b.count >= 17 ? hexString(b[13..<17]) : nil
-        return Card(kind: kind, version: version, id: id, addr: addr, token: token)
+        let psm = bluetooth && b.count >= 15 ? UInt16(b[13]) << 8 | UInt16(b[14]) : 0
+        if addr.map({ $0.ip == 0 || $0.port == 0 }) ?? true { addr = nil }
+        // A receiver is reached at its address, or directly by its PSM; with neither it is of no use.
+        if kind == receiver, addr == nil, psm == 0 { return nil }
+        let token = !bluetooth && b.count >= 17 ? hexString(b[13..<17]) : nil
+        return Card(kind: kind, version: version, id: id, addr: addr, token: token, psm: psm)
     }
 
     /// `luch://connect?host=<ip>&port=<port>&id=<8 hex>&t=<token>` (what the receiver's QR code says), or a plain
