@@ -132,13 +132,22 @@ public final class SenderCertificate {
         guard let secKey = SecKeyCreateWithData(key.x963Representation as CFData, attrs as CFDictionary, &err) else {
             throw CertificateError("the sender key: \(err?.takeRetainedValue().localizedDescription ?? "?")")
         }
-        typealias Create = @convention(c) (CFAllocator?, SecCertificate, SecKey) -> Unmanaged<SecIdentity>?
-        guard let sym = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "SecIdentityCreate"),
-              let identity = unsafeBitCast(sym, to: Create.self)(nil, cert, secKey)?.takeRetainedValue() else {
+        guard let identity = makeIdentity(cert, secKey) else {
             throw CertificateError("this macOS makes no TLS identity of the sender certificate")
         }
         return identity
     }
+}
+
+/// A certificate and its key as one SecIdentity, without the keychain: Security's SecIdentityCreate, looked up at run
+/// time, as the SDKs before macOS 26's do not declare it (the function has been there all along).
+public func makeIdentity(_ cert: SecCertificate, _ key: SecKey) -> SecIdentity? {
+    typealias Create = @convention(c) (CFAllocator?, SecCertificate, SecKey) -> Unmanaged<SecIdentity>?
+    guard let sym = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "SecIdentityCreate") else { return nil }
+    return unsafeBitCast(sym, to: Create.self)(nil, cert, key)?.takeRetainedValue()
+}
+
+extension SenderCertificate {
 
     static func pem(_ label: String, _ der: [UInt8]) -> String {
         let b64 = Data(der).base64EncodedString(options: [.lineLength64Characters, .endLineWithLineFeed])

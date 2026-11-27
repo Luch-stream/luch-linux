@@ -51,7 +51,7 @@ public struct SelfSigned {
     /// The identity a TLS server presents.
     public func identity() throws -> SecIdentity {
         guard let cert = SecCertificateCreateWithData(nil, certificate as CFData) else { throw TVError("a bad certificate") }
-        guard let id = SecIdentityCreate(nil, cert, key) else { throw TVError("the key does not fit the certificate") }
+        guard let id = makeIdentity(cert, key) else { throw TVError("the key does not fit the certificate") }
         return id
     }
 
