@@ -25,7 +25,7 @@ enum Complete {
         ("add", "a receiver by its QR link or address"), ("refresh", "look for receivers again"),
         ("info", "what a receiver is and can do"), ("id", "this Mac's id"), ("known", "receivers met before"),
         ("pair", "pair with a receiver (its code)"), ("paired", "receivers this Mac is paired with"),
-        ("forget", "forget a pairing"), ("reports", "receivers' crash reports"), ("report", "one crash report"),
+        ("forget", "forget a pairing"), ("reports", "receivers' crash reports"), ("report", "a problem report, or one crash report"),
         ("web", "browsers allowed to watch"), ("audio", "a receiver's sound mode"),
         ("latency", "the latency lab"), ("group", "several receivers in step"),
         ("offset", "a receiver's own sound correction"), ("calibrate", "time a group's receivers by microphone"),
@@ -122,7 +122,9 @@ enum Complete {
             if before.isEmpty {
                 out.add([("allow", "a browser's code"), ("deny", "a browser's code"), ("forget", "an allowed browser")])
             }
-        case "report": if before.count == 1 { out.add([("open", "the issue, filled in"), ("dismiss", "")]) }
+        case "report":
+            if before.isEmpty { out.add([("--keep-names", "a problem report with addresses and names")]) }
+            else if before.count == 1, Int(before[0]) != nil { out.add([("open", "the issue, filled in"), ("dismiss", "")]) }
         case "wake":
             if before.isEmpty { out.add(names) }
             else if before.count == 1 {
