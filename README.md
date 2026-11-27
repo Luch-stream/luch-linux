@@ -26,6 +26,7 @@ Measured on an Intel Arrow Lake laptop → XGIMI MoGo 4 Laser over Wi‑Fi, full
 | `luch-latency` | The latency lab: the test pattern, and the analyser of a phone's 240 fps video of both screens ([docs/latency-lab.md](docs/latency-lab.md)). |
 | `gnome-extension/` | GNOME Shell Quick Settings toggle «Luch». |
 | `docs/dbus.md` | D-Bus API reference. |
+| `macos/` | macOS sender: ScreenCaptureKit capture, VideoToolbox H.264 or HEVC chosen by a weighted grade, Opus system audio, a size that follows the client, a menu bar app and `luchctl`. See [macos/README.md](macos/README.md). |
 
 ![luchctl: receivers and live latency](docs/img/luchctl.png)
 

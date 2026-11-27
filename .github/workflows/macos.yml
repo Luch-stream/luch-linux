@@ -1,0 +1,23 @@
+name: macOS
+
+on:
+  push:
+    branches: [main]
+    paths: ["macos/**"]
+  pull_request:
+    paths: ["macos/**"]
+
+jobs:
+  build:
+    runs-on: macos-14
+    defaults:
+      run:
+        working-directory: macos
+    steps:
+      - uses: actions/checkout@v4
+      - name: libopus
+        run: brew install opus
+      - name: Build
+        run: swift build -c release
+      - name: Test
+        run: swift test
