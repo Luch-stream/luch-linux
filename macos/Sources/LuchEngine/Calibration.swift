@@ -34,8 +34,9 @@ public struct ProbeSignal {
 }
 
 public enum Calibration {
-    /// Each sweep is looked for this far around when its member says it reached the DAC.
-    public static let windowMs = 150.0
+    /// Each sweep is looked for from this long before to this long after its member says it reached the DAC: sound
+    /// only comes later, and a projector's own processing held it back 179 ms (the next sweep starts 700 ms on).
+    public static let beforeMs = 50.0, afterMs = 400.0
     /// A member whose sweeps the detector refused is asked once more, louder: 0.6 in the design, but a receiver
     /// plays at most 0.5 of full scale.
     public static let retryGain = 0.5
@@ -310,9 +311,9 @@ public final class Calibrator {
                 out[id] = Detected(result: none, heard: played.map { _ in nil })
                 continue
             }
-            let r = probe.measure(rec.samples, scheduled: positions, windowMs: Calibration.windowMs)
+            let r = probe.measure(rec.samples, scheduled: positions, beforeMs: Calibration.beforeMs, afterMs: Calibration.afterMs)
             let heard = played.indices.map { i -> Int64? in
-                guard i < r.arrivals.count, r.arrivals[i].trusted, let t = rec.host(position: r.arrivals[i].at) else {
+                guard i < r.arrivals.count, r.accepted || r.arrivals[i].trusted, let t = rec.host(position: r.arrivals[i].at) else {
                     return nil
                 }
                 return Int64(((t - zero) * 1e6).rounded())

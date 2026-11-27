@@ -12,11 +12,13 @@ import Foundation
 /// The direct path is the earliest strong peak, not the largest one: reflections come later and can be louder. It is
 /// the first local maximum of at least a third of the largest within 50 ms before it, timed to a fraction of a sample
 /// by a parabola. It is trusted when it stands at least 12 dB over everything before it (only noise comes before the
-/// direct sound), and a device is measured when all its sweeps are trusted and agree within 0.5 ms.
+/// direct sound), and a device is measured when all its sweeps are trusted and agree within 0.5 ms. Sweeps found at
+/// one delay but under 12 dB are reported as too quiet, with their delay, and not used.
 public final class AcousticProbe {
     public static let f0 = 2000.0, f1 = 6000.0, ms = 200.0
     public static let bandLo = 1500.0, bandHi = 7000.0
     public static let minPsrDb = 12.0, agreeMs = 0.5
+    public static let quietPsrDb = 6.0, quietAgreeMs = 0.2
     /// The direct path: the earliest peak of at least this share of the largest, at most this long before it.
     static let directShare = 1 / 3.0, directBeforeMs = 50.0
     /// What counts as "before the direct sound" for the sidelobes: from the window's start to this long before it.
@@ -74,18 +76,36 @@ public final class AcousticProbe {
     /// Measures one device: its sweeps were scheduled to start at `scheduled` (samples of the recording's own
     /// timeline, its capture timestamps mapped to the sender's clock); each is looked for within ±`windowMs`.
     public func measure(_ rec: [Float], scheduled: [Double], windowMs: Double) -> Result {
-        let w = Int((Double(rate) * windowMs / 1000).rounded())
+        measure(rec, scheduled: scheduled, beforeMs: windowMs, afterMs: windowMs)
+    }
+
+    /// The same, looked for from `beforeMs` before to `afterMs` after.
+    public func measure(_ rec: [Float], scheduled: [Double], beforeMs: Double, afterMs: Double) -> Result {
+        let wb = Int((Double(rate) * beforeMs / 1000).rounded())
+        let wa = Int((Double(rate) * afterMs / 1000).rounded())
         var a: [Arrival] = []
         var d: [Double] = []
-        for (i, s) in scheduled.enumerated() {
-            let one = find(rec, from: Int(s.rounded(.down)) - w, to: Int(s.rounded(.up)) + w)
+        for s in scheduled {
+            let one = find(rec, from: Int(s.rounded(.down)) - wb, to: Int(s.rounded(.up)) + wa)
             a.append(one)
             d.append(one.at - s)
-            if !one.trusted { return Result(accepted: false, delaySamples: .nan, arrivals: a, why: "sweep \(i): \(one.why)") }
         }
         guard !d.isEmpty else { return Result(accepted: false, delaySamples: .nan, arrivals: a, why: "no sweeps") }
+        let spreadOf = { (d: [Double]) in ((d.max() ?? 0) - (d.min() ?? 0)) * 1000 / Double(self.rate) }
+        if let i = a.firstIndex(where: { !$0.trusted }) {
+            // Every sweep found at one delay but too quiet to trust: not taken (a reflection can repeat as exactly as
+            // the direct sound, 5 ms off in the simulated rooms), but said, with what to do.
+            if a.allSatisfy({ !$0.at.isNaN && $0.psrDb >= Self.quietPsrDb }) && spreadOf(d) <= Self.quietAgreeMs {
+                let ms = d.sorted()[d.count / 2] * 1000 / Double(rate)
+                let db = a.map(\.psrDb).min() ?? 0
+                return Result(accepted: false, delaySamples: .nan, arrivals: a, why: String(
+                    format: "too quiet: heard %.0f ms after it played but only %.0f dB over the noise (%.0f needed); " +
+                        "turn it up and calibrate again", ms, db, Self.minPsrDb))
+            }
+            return Result(accepted: false, delaySamples: .nan, arrivals: Array(a[...i]), why: "sweep \(i): \(a[i].why)")
+        }
         let s = d.sorted()
-        let spread = (s[s.count - 1] - s[0]) * 1000 / Double(rate)
+        let spread = spreadOf(d)
         if spread > Self.agreeMs {
             return Result(accepted: false, delaySamples: .nan, arrivals: a,
                           why: String(format: "the sweeps disagree by %.2f ms", spread))
