@@ -266,6 +266,39 @@ case "browser":
         exit(1)
     }
 
+case "web":
+    // The browsers allowed to watch this screen (the web receiver), and the one waiting to be allowed.
+    let words = Array(args.dropFirst())
+    let r = call(["cmd": "web_clients"])
+    fail(r)
+    let all = r["clients"] as? [[String: Any]] ?? []
+    switch (words.first, words.count) {
+    case (nil, _):
+        if all.isEmpty {
+            let url = call(["cmd": "web_url"])["url"] as? String ?? "https://<this Mac>:47801/"
+            print("(no browser allowed yet: open \(url) in a browser and confirm the code here)")
+        }
+        for (n, b) in all.enumerated() {
+            let wait = b["waiting"] as? Bool == true ? " waiting, code \(b["code"] as? String ?? "?")" : ""
+            print("\(n + 1). \(b["name"] as? String ?? "?") \(b["address"] as? String ?? "")\(wait)")
+        }
+    case (let answer?, 2) where answer == "allow" || answer == "deny":
+        guard let b = all.first(where: { $0["waiting"] as? Bool == true && $0["code"] as? String == words[1] }) else {
+            print("error: no browser waiting with the code \(words[1])")
+            exit(1)
+        }
+        fail(call(["cmd": "approve_web", "request": b["id"] as? String ?? "", "allow": answer == "allow"]))
+    case ("forget"?, 2):
+        guard let n = Int(words[1]), n >= 1, n <= all.count else {
+            print("error: no browser \(words[1]) (see `luchctl web`)")
+            exit(1)
+        }
+        fail(call(["cmd": "forget_web", "id": all[n - 1]["id"] as? String ?? ""]))
+    default:
+        print("usage: luchctl web [allow|deny <code> | forget <n>]")
+        exit(2)
+    }
+
 case "ping":
     let response = call(["cmd": "ping"])
     print((response["ok"] as? Bool) == true ? "app is running" : "no response")
@@ -277,6 +310,7 @@ default:
                    | cast <file|link>... [--to r] [--title T] [--start m:ss] [--sub file] [--relay] | stop-cast [r]
                    | media [r] [play|pause|toggle|seek m:ss|skip s|rate x|audio id|sub id|sub off]
                    | volume [r] [0..100|+|-|mute|unmute] | page [r] next|prev|<n> | sleep [r] | browser install
+                   | web [allow|deny <code> | forget <n>]
     """)
     exit(2)
 }

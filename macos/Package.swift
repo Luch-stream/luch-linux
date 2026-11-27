@@ -24,9 +24,10 @@ let package = Package(
         .target(name: "LuchLocal", dependencies: ["LuchProto"], path: "Sources/LuchLocal"),
         .target(name: "LuchCast", dependencies: ["LuchProto", "LuchNet", "LuchEngine"], path: "Sources/LuchCast"),
         .target(name: "LuchTV", dependencies: ["LuchProto", "LuchCast"], path: "Sources/LuchTV"),
+        .target(name: "LuchWeb", dependencies: ["LuchProto", "LuchNet", "LuchTV"], path: "Sources/LuchWeb"),
         .executableTarget(name: "luch", dependencies: ["LuchProto", "LuchNet", "LuchMedia", "LuchEngine"], path: "Sources/luch"),
-        .executableTarget(name: "LuchApp", dependencies: ["LuchProto", "LuchNet", "LuchMedia", "LuchEngine", "LuchLocal", "LuchCast", "LuchTV"], path: "Sources/LuchApp"),
+        .executableTarget(name: "LuchApp", dependencies: ["LuchProto", "LuchNet", "LuchMedia", "LuchEngine", "LuchLocal", "LuchCast", "LuchTV", "LuchWeb"], path: "Sources/LuchApp"),
         .executableTarget(name: "luchctl", dependencies: ["LuchLocal"], path: "Sources/luchctl"),
-        .testTarget(name: "LuchTests", dependencies: ["LuchProto", "LuchNet", "LuchMedia", "LuchEngine", "LuchCast", "LuchLocal", "LuchTV"], path: "Tests/LuchTests"),
+        .testTarget(name: "LuchTests", dependencies: ["LuchProto", "LuchNet", "LuchMedia", "LuchEngine", "LuchCast", "LuchLocal", "LuchTV", "LuchWeb"], path: "Tests/LuchTests"),
     ]
 )

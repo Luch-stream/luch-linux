@@ -20,13 +20,16 @@ extension Caster {
     }
 
     static func entries(_ receivers: [Receiver]) -> [Entry] {
-        receivers.filter { TVKind.of($0.id) == .luch }.map {
+        receivers.filter { TVKind.of($0.id) == .luch && $0.service != "web" }.map {
             Entry(kind: .luch, id: $0.id, name: $0.name, model: $0.model, address: $0.address, port: $0.port)
         }
     }
 
     /// The answer when `row` is a TV without Luch's to handle; nil leaves it to the Luch receiver.
     func tvCommand(_ request: [String: Any], row: Receiver, receivers: [Receiver]) -> [String: Any]? {
-        tvs.handle(request, row: row.id, luch: Self.entries(receivers), files: files)
+        if row.service == "web" {
+            return ["error": "the web receiver cannot play media: it shows this screen (luchctl mirror)"]
+        }
+        return tvs.handle(request, row: row.id, luch: Self.entries(receivers), files: files)
     }
 }

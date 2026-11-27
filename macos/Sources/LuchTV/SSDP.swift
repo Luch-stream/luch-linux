@@ -52,7 +52,7 @@ public enum SSDP {
     }
 
     /// IPv4 addresses of the interfaces a TV may be on: up, multicast, not loopback, not a tunnel.
-    static func lanAddresses() -> [String] {
+    public static func lanAddresses() -> [String] {
         var head: UnsafeMutablePointer<ifaddrs>?
         guard getifaddrs(&head) == 0, let first = head else { return [] }
         defer { freeifaddrs(head) }

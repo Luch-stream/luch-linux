@@ -10,6 +10,7 @@ import LuchMedia
 import LuchNet
 import LuchProto
 import LuchTV
+import LuchWeb
 import ServiceManagement
 
 final class Preferences {
@@ -125,6 +126,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         caster.onChange = { [weak self] in DispatchQueue.main.async { self?.rebuildMenu() } }
         caster.tvs.onChange = { [weak self] in DispatchQueue.main.async { self?.refreshReceivers() } }
         caster.tvs.start()
+        startWebReceiver()
 
         rebuildMenu()
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in self?.tick() }
@@ -147,6 +149,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         server.handler = { [weak self] request in
             guard let self else { return ["error": "app is shutting down"] }
             // What waits for a receiver's answer runs here, on the socket's thread, not on the main one.
+            if WebReceiver.commands.contains(request["cmd"] as? String ?? "") { return webReceiver.handle(request) }
             if Caster.commands.contains(request["cmd"] as? String ?? "") {
                 var known: [Receiver] = []
                 var mirroring: String?
@@ -248,8 +251,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - menu
 
-    private func refreshReceivers() {
-        receivers = caster.rows(discovery.all())
+    func refreshReceivers() {
+        receivers = caster.rows(discovery.all()) + webReceiver.receivers
         rebuildMenu()
     }
 
@@ -269,7 +272,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         for (index, receiver) in receivers.enumerated() {
             let item = NSMenuItem(title: receiver.name, action: nil, keyEquivalent: "")
             let luch = TVKind.of(receiver.id) == .luch
-            item.submenu = luch ? receiverMenu(receiver) : tvMenu(receiver)
+            item.submenu = receiver.service == "web" ? webBrowserMenu(receiver) : luch ? receiverMenu(receiver) : tvMenu(receiver)
             if caster.existing(receiver.id)?.showing != nil || currentReceiverID == receiver.id
                 || caster.tvs.session(receiver.id) != nil { item.state = .on }
             if index == 0 { item.image = NSImage(systemSymbolName: "tv", accessibilityDescription: nil) }
@@ -393,6 +396,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         display.submenu = displayMenu
         menu.addItem(display)
 
+        menu.addItem(webMenuItem())
         menu.addItem(.separator())
 
         let launch = NSMenuItem(title: "Mirror on launch", action: #selector(toggleMirrorOnLaunch), keyEquivalent: "")
@@ -444,7 +448,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         startMirror(receivers[0])
     }
 
-    private func startMirror(_ receiver: Receiver, soundOnly: Bool = false, extend: Bool? = nil,
+    func startMirror(_ receiver: Receiver, soundOnly: Bool = false, extend: Bool? = nil,
                              ultra: UltraPriority? = nil) {
         // Nothing asked for: the way chosen for this TV in its menu (also for mirror on launch and luchctl).
         let saved = Preferences.shared.screenMode(for: receiver.id)
@@ -578,7 +582,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statsItem?.title = line
     }
 
-    @objc private func stopMirror() {
+    @objc func stopMirror() {
         guard let engine else { return }
         self.engine = nil
         currentReceiverID = nil

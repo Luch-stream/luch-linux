@@ -28,6 +28,12 @@ public struct SelfSigned {
         certificate = try Self.certificate(key: key, names: names, commonName: commonName)
     }
 
+    /// A certificate made before, with its key.
+    public init(key: SecKey, certificate: Data) {
+        self.key = key
+        self.certificate = certificate
+    }
+
     /// The key as X9.63 bytes (04 || X || Y || D), to keep in a file.
     public var keyData: Data {
         (SecKeyCopyExternalRepresentation(key, nil) as Data?) ?? Data()
