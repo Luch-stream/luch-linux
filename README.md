@@ -133,6 +133,8 @@ estimated latency. On the TV, press OK on the remote to show the statistics over
 luchctl                                   # interactive: list, f<N> fast, m<N> screen, w<N> window, e<N> extend, s<N> stop
 luchctl list
 luchctl refresh                           # rescan now; updates arrive asynchronously in TUI/watch
+luchctl find                              # mDNS gets nowhere: every LAN address, Bluetooth, the TV's sound, its QR code
+luchctl add 192.168.1.20                  # a receiver by its address or QR link
 luchctl mirror                            # fast mode; the receiver name is optional when there is only one
 luchctl mirror "XGIMI MoGo 4 Laser" window # or monitor | window | virtual
 luchctl stats                             # live latency, fps, bitrate
@@ -192,7 +194,10 @@ tries every one it knows for that receiver:
 ## Troubleshooting
 
 - `luchctl list` is empty: the receiver app must be running, `avahi-daemon` active, and both devices
-  on the same LAN segment (mDNS does not cross routers).
+  on the same LAN segment (mDNS does not cross routers). luchd also asks every address of the subnet and listens
+  over Bluetooth by itself; `luchctl find` goes further (on the TV choose "Say the address by sound", or hold the
+  laptop's camera up to the TV's QR code) and says what it tries. Client isolation (many hotels) keeps devices
+  apart altogether: then only the TV's own hotspot or a cable helps.
 - `fast` fails with «needs CAP_SYS_ADMIN»: run the `setcap` line again (reinstalling drops it).
 - Logs: `journalctl --user -u luchd -f`. `LUCH_PROBE=1` in the service environment prints
   per-stage latency.

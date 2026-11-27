@@ -33,3 +33,16 @@ test('the pairing signal is the one luchd sends', () => {
     assert.match(ext, /<signal name="PairChanged">/);
     assert.match(luchd, /async fn pair_changed\(e: &SignalEmitter<'_>, id: &str, state: &str\)/);
 });
+
+test('the menu says what the discovery ladder tries', () => {
+    const body = ext.match(/function findLine\(json, t\) \{([\s\S]*?)\n\}/)[1];
+    const findLine = new Function('json', 't', body);
+    const t = {rungs: {ble: 'Bluetooth', scan: 'every address'}, trying: w => `Looking: ${w}…`};
+    const status = {running: true, rungs: [{rung: 'mdns', state: 'done'}, {rung: 'scan', state: 'running'},
+        {rung: 'ble', state: 'running'}]};
+    assert.equal(findLine(JSON.stringify(status), t), 'Looking: every address, Bluetooth…');
+    assert.equal(findLine(JSON.stringify({...status, running: false}), t), null);
+    assert.equal(findLine('not json', t), null);
+    assert.ok(/<signal name="FindProgress">/.test(ext));
+    assert.match(luchd, /async fn find_progress\(/);
+});

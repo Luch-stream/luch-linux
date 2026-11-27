@@ -5,6 +5,7 @@ mod cast;
 mod discovery;
 mod display;
 mod enc;
+mod find;
 mod limits;
 mod mirror;
 mod mpris;
@@ -93,12 +94,59 @@ struct State {
     /// and the way back for ApproveWeb.
     web_waiting: HashMap<String, (Value, oneshot::Sender<bool>)>,
     web_limits: web_auth::Limits,
+    /// id -> how it was found: "mdns", "scan", "ble", "sound", "qr", "manual" (PROTOCOL.md 1).
+    via: HashMap<String, std::collections::BTreeSet<&'static str>>,
+    /// id -> its Bluetooth signal strength in dBm, when it was heard: the nearest is listed first.
+    rssi: HashMap<String, i16>,
+    /// id -> the one-time pairing token its QR code or sound gave, for the next hello.
+    tokens: HashMap<String, String>,
 }
 
 /// The code a person typed for a receiver, and where Pair's answer goes (the welcome, or why not).
 type CodeTyped = (Vec<u8>, PairReply);
 type PairReply = oneshot::Sender<Result<String, String>>;
 type Shared = Arc<Mutex<State>>;
+
+/// One fake BlueZ on the test bus at a time: the tests that make one share its well-known name.
+#[cfg(test)]
+pub(crate) static FAKE_BLUEZ: Mutex<()> = Mutex::const_new(());
+
+/// Lists a receiver found another way than mDNS (find.rs). One already listed keeps its entry; what is new is
+/// how it was found and how strong its signal is.
+async fn found(
+    st: &Shared,
+    conn: &Connection,
+    r: Receiver,
+    via: &'static str,
+    rssi: Option<i16>,
+    token: Option<String>,
+) {
+    let mut s = st.lock().await;
+    let fresh = !s.found.contains_key(&r.id);
+    let id = r.id.clone();
+    if fresh {
+        eprintln!(
+            "[luchd] found ({via}): {} id={} {}:{} via {}",
+            r.name, r.id, r.address, r.port, r.ifname
+        );
+        s.found.insert(id.clone(), r);
+    }
+    let new_way = s.via.entry(id.clone()).or_default().insert(via);
+    let stronger = rssi.is_some_and(|x| s.rssi.insert(id.clone(), x) != Some(x));
+    if let Some(t) = token {
+        s.tokens.insert(id, t);
+    }
+    drop(s);
+    if fresh || new_way || stronger {
+        changed(conn).await;
+    }
+}
+
+async fn find_progress(conn: &Connection, json: &str) {
+    if let Ok(e) = SignalEmitter::new(conn, p::DBUS_PATH) {
+        let _ = Luch::find_progress(&e, json).await;
+    }
+}
 
 /// Whether something accepts TCP at `address:port` within a second: tells a receiver that is on from one Avahi
 /// still lists after it went to standby.
@@ -118,6 +166,7 @@ struct Luch {
     discovery: discovery::Discovery,
     /// This computer's certificate for TLS receivers; None if it could not be made (then older receivers only).
     ident: Option<Arc<pair::Identity>>,
+    finder: find::Finder,
 }
 
 #[interface(name = "dev.luch.Luch1")]
@@ -141,13 +190,88 @@ impl Luch {
                 )
             })
             .collect();
-        rows.sort();
+        // Heard over Bluetooth: the strongest signal, the nearest TV, first; then by name.
+        rows.sort_by_cached_key(|r| {
+            let rssi = st.rssi.get(&r.0).copied().unwrap_or(i16::MIN);
+            (std::cmp::Reverse(rssi), r.1.to_lowercase(), r.0.clone())
+        });
         rows
     }
 
-    /// Starts an immediate Avahi rescan; results arrive via ReceiversChanged.
-    async fn refresh(&self) {
+    /// Starts an immediate Avahi rescan and, at most every 30 s, the automatic ladder (a sweep of the LAN, then
+    /// Bluetooth); results arrive via ReceiversChanged, what is tried via FindProgress.
+    async fn refresh(&self, #[zbus(connection)] conn: &Connection) {
         self.discovery.refresh();
+        let _ = self.finder.start(conn, "auto").await;
+    }
+
+    /// Climbs the discovery ladder (PROTOCOL.md 1): "auto" (mDNS and a sweep of the LAN, then Bluetooth), "all"
+    /// (then also the TV's sound through the microphone and its QR code through the camera: only when the person
+    /// asked), or some of "mdns,scan,ble,sound,qr" at once. Progress comes as FindProgress.
+    async fn find(&self, mode: String, #[zbus(connection)] conn: &Connection) -> fdo::Result<()> {
+        self.finder
+            .start(conn, &mode)
+            .await
+            .map_err(fdo::Error::InvalidArgs)
+    }
+
+    /// The last FindProgress (JSON).
+    async fn find_status(&self) -> String {
+        self.finder.status().await
+    }
+
+    /// How each listed receiver was found, and its Bluetooth signal: {"<id>":{"via":["mdns","ble"],"rssi":-48}}.
+    async fn discovered(&self) -> String {
+        let st = self.st.lock().await;
+        let all: serde_json::Map<String, Value> = st
+            .found
+            .keys()
+            .map(|id| {
+                let via: Vec<&str> = st
+                    .via
+                    .get(id)
+                    .map(|v| v.iter().copied().collect())
+                    .unwrap_or_default();
+                (id.clone(), json!({"via": via, "rssi": st.rssi.get(id)}))
+            })
+            .collect();
+        Value::Object(all).to_string()
+    }
+
+    /// Lists a receiver from what a person has: its QR link (luch://connect?...) or its address (host[:port]),
+    /// checked with a hello. Returns its id.
+    async fn add_receiver(
+        &self,
+        link: String,
+        #[zbus(connection)] conn: &Connection,
+    ) -> fdo::Result<String> {
+        let card = find::card::parse_link(&link).ok_or_else(|| {
+            fdo::Error::InvalidArgs(format!("not a receiver's link or address: {link}"))
+        })?;
+        let via = if link.trim().starts_with("luch://") {
+            "qr"
+        } else {
+            "manual"
+        };
+        let ctx = find::Ctx {
+            st: self.st.clone(),
+            sender_id: self.sender_id.clone(),
+            host: self.host.clone(),
+            discovery: self.discovery.clone(),
+        };
+        find::reach(&ctx, conn, &card, via, None)
+            .await
+            .map_err(fdo::Error::Failed)?;
+        let (ip, _) = card.addr.unwrap_or((std::net::Ipv4Addr::UNSPECIFIED, 0));
+        let st = self.st.lock().await;
+        st.found
+            .values()
+            .find(|r| {
+                r.address == ip.to_string()
+                    && (card.id.is_empty() || r.id.replace('-', "").starts_with(&card.id))
+            })
+            .map(|r| r.id.clone())
+            .ok_or_else(|| fdo::Error::Failed("receiver went away".into()))
     }
 
     /// Opens and keeps a control channel; returns the receiver's welcome as JSON. A receiver not paired yet answers
@@ -186,7 +310,9 @@ impl Luch {
                 r.name
             )));
         }
-        let o = handshake(&r, &self.sender_id, &self.host, ident, pinned)
+        // A token from the QR code or the sound is good for one hello only (PROTOCOL.md 1e).
+        let token = self.st.lock().await.tokens.remove(&id);
+        let o = handshake(&r, &self.sender_id, &self.host, ident, pinned, token.as_deref())
             .await
             .map_err(|e| {
                 if e.kind() == io::ErrorKind::PermissionDenied {
@@ -930,6 +1056,9 @@ impl Luch {
     /// Pairing with a receiver moved on (JSON as in Pairing): "allow", "code", "paired" or "failed".
     #[zbus(signal)]
     async fn pair_changed(e: &SignalEmitter<'_>, id: &str, state: &str) -> zbus::Result<()>;
+    /// What the discovery ladder is trying (JSON, as FindStatus).
+    #[zbus(signal)]
+    async fn find_progress(e: &SignalEmitter<'_>, status: &str) -> zbus::Result<()>;
 
     /// A receiver's `media_state` changed (JSON); {"state":"stopped"} when it ended.
     #[zbus(signal)]
@@ -997,35 +1126,83 @@ struct Opened {
     receiver_fp: Option<pair::Fingerprint>,
 }
 
-/// Socket pinned to the interface the receiver was discovered on: the default
-/// route may be a full-tunnel VPN, so it must never decide where this goes.
-/// With `ident`, TLS to the receiver's TLS port, its certificate taken only if it is `pinned` (when there is one);
-/// without a pin the hello asks the receiver to pair even if it knows this computer.
+/// What a sender says first (section 3). `token`: the one-time pairing token from the receiver's QR code or sound
+/// (section 1e). `probe`: discovery only asks who is there, and says bye after the welcome. This is the plain hello;
+/// open_channel makes it the TLS one.
+fn hello(id: &str, host: &str, token: Option<&str>, probe: bool) -> Value {
+    let mut h = json!({"t": "hello", "v": p::VERSION, "id": id, "name": host, "app": p::APP,
+                       "want": ["mirror", "media", "photo", "reports"]});
+    if let Some(t) = token {
+        h["token"] = json!(t);
+    }
+    if probe {
+        h["probe"] = json!(true);
+        h["want"] = json!([]);
+    }
+    h
+}
+
+/// Connects to `addr` from `ifname` (section 2: the default route may be a full-tunnel VPN, so it must never decide
+/// where this goes; None only for loopback).
+async fn connect_from(
+    addr: SocketAddr,
+    ifname: Option<&str>,
+    connect_in: Duration,
+) -> io::Result<tokio::net::TcpStream> {
+    let sock = TcpSocket::new_v4()?;
+    if let Some(i) = ifname {
+        sock.bind_device(Some(i.as_bytes()))?;
+    }
+    timeout(connect_in, sock.connect(addr))
+        .await
+        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timed out"))?
+}
+
+/// Socket pinned to the interface the receiver was discovered on. With `ident`, TLS to the receiver's TLS port, its
+/// certificate taken only if it is `pinned` (when there is one); without a pin the hello asks the receiver to pair
+/// even if it knows this computer. `token` (section 1e) goes either way: on the plain port it lets this computer in
+/// without the Allow on the TV; over TLS the receiver uses it up but still asks for its code.
 async fn handshake(
     r: &Receiver,
     id: &str,
     host: &str,
     ident: Option<&pair::Identity>,
     pinned: Option<pair::Fingerprint>,
+    token: Option<&str>,
 ) -> io::Result<Opened> {
     let port = if ident.is_some() { r.tls_port } else { r.port };
     let addr: SocketAddr = format!("{}:{}", r.address, port)
         .parse()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    let sock = TcpSocket::new_v4()?;
-    sock.bind_device(Some(r.ifname.as_bytes()))?;
-    let stream = timeout(HANDSHAKE_TIMEOUT, sock.connect(addr))
-        .await
-        .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "connect timed out"))??;
-    let opened = open_channel(stream, id, host, ident, pinned).await?;
-    Ok(opened)
+    let stream = connect_from(addr, Some(&r.ifname), HANDSHAKE_TIMEOUT).await?;
+    open_channel(stream, &hello(id, host, token, false), ident, pinned).await
+}
+
+/// Who answers at `addr`: the welcome of a probe hello on the plain port, then bye (discovery, find). The welcome
+/// must come within the 2 s a receiver has (section 3).
+async fn probe(
+    addr: SocketAddr,
+    ifname: Option<&str>,
+    id: &str,
+    host: &str,
+    token: Option<&str>,
+    connect_in: Duration,
+) -> io::Result<Value> {
+    let h = hello(id, host, token, true);
+    let mut o = timeout(connect_in + find::scan::WELCOME_TIMEOUT, async {
+        let stream = connect_from(addr, ifname, connect_in).await?;
+        open_channel(stream, &h, None, None).await
+    })
+    .await
+    .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "no welcome"))??;
+    let _ = send(&mut o.wr, &json!({"t": "bye"})).await;
+    Ok(o.first)
 }
 
 /// TLS (or not) and hello on a connected stream; the half of handshake that tests drive over localhost.
 async fn open_channel(
     stream: tokio::net::TcpStream,
-    id: &str,
-    host: &str,
+    hello: &Value,
     ident: Option<&pair::Identity>,
     pinned: Option<pair::Fingerprint>,
 ) -> io::Result<Opened> {
@@ -1055,11 +1232,12 @@ async fn open_channel(
         }
     };
     let mut rd = BufReader::new(rd);
-    let mut hello = json!({"t": "hello", "v": if ident.is_some() { p::VERSION_TLS } else { p::VERSION },
-                           "id": id, "name": host, "app": p::APP,
-                           "want": ["mirror", "media", "photo", "reports"]});
-    if ident.is_some() && pinned.is_none() {
-        hello["pair"] = json!(true);
+    let mut hello = hello.clone();
+    if ident.is_some() {
+        hello["v"] = json!(p::VERSION_TLS);
+        if pinned.is_none() {
+            hello["pair"] = json!(true);
+        }
     }
     send(&mut wr, &hello).await?;
     let first = timeout(HANDSHAKE_TIMEOUT, read_msg(&mut rd))
@@ -2391,6 +2569,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     };
     let (discovery, worker) = discovery::Discovery::new();
+    let finder = find::Finder::new(find::Ctx {
+        st: st.clone(),
+        sender_id: id.clone(),
+        host: host.clone(),
+        discovery: discovery.clone(),
+    });
     let conn = zbus::connection::Builder::session()?
         .name(p::DBUS_NAME)?
         .serve_at(
@@ -2401,10 +2585,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 host: host.clone(),
                 discovery,
                 ident,
+                finder: finder.clone(),
             },
         )?
         .build()
         .await?;
+    {
+        // The first climb right away: a network without mDNS shows its receivers without anyone asking.
+        let conn = conn.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let _ = finder.start(&conn, "auto").await;
+        });
+    }
     eprintln!(
         "[luchd] {} id={id} name={host}; browsing {}",
         p::APP,
@@ -2631,7 +2824,13 @@ mod tests {
         pinned: Option<pair::Fingerprint>,
     ) -> io::Result<Opened> {
         let s = tokio::net::TcpStream::connect(addr).await.unwrap();
-        open_channel(s, "sender-id", "Linux Laptop", Some(me), pinned).await
+        open_channel(
+            s,
+            &hello("sender-id", "Linux Laptop", None, false),
+            Some(me),
+            pinned,
+        )
+        .await
     }
 
     fn test_receiver(addr: std::net::SocketAddr) -> Receiver {
@@ -2740,6 +2939,31 @@ mod tests {
             .err()
             .expect("refused");
         assert_eq!(e.kind(), io::ErrorKind::PermissionDenied);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A token from the QR code or the sound goes in the TLS hello too (PROTOCOL.md 1e): the receiver uses it up
+    /// there, but the hello still asks to pair, since the token does not replace the code.
+    #[tokio::test]
+    async fn a_tls_hello_carries_the_token_and_still_pairs() {
+        let dir = temp_dir("token");
+        let me = pair::Identity::load(&dir).unwrap();
+        let tv = tv::Tv::new();
+        let addr = tv
+            .serve(|hello, _, mut wr, _| async move {
+                assert_eq!(hello["v"], 1);
+                assert_eq!(hello["token"], "0badf00d");
+                assert_eq!(hello["pair"], true);
+                assert!(hello.get("probe").is_none());
+                send(&mut wr, &json!({"t": "pair", "step": "code", "digits": 6}))
+                    .await
+                    .unwrap();
+            })
+            .await;
+        let s = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let h = hello("sender-id", "Linux Laptop", Some("0badf00d"), false);
+        let o = open_channel(s, &h, Some(&me), None).await.unwrap();
+        assert_eq!(o.first["t"], "pair");
         std::fs::remove_dir_all(dir).unwrap();
     }
 

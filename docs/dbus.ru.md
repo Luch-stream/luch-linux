@@ -46,7 +46,35 @@ gdbus introspect --session --dest dev.luch.Luch1 --object-path /dev/luch/Luch1
 управление сразу: текущий список доступен через `Receivers()`, обновления — через
 `ReceiversChanged()`. Одновременные запросы используют уже идущий поиск. Метод не подключается
 к приёмникам и не прерывает трансляции. Меню GNOME вызывает его при открытии, TUI — при запуске
-и по `r`/Enter. В командной строке доступен `luchctl refresh`.
+и по `r`/Enter. В командной строке доступен `luchctl refresh`. Заодно запускает автоматическую лестницу поиска
+(`Find("auto")`), не чаще раза в 30 с; luchd проходит её сам через секунду после старта.
+
+### `Find(s mode)`
+
+Лестница поиска там, куда не доходит mDNS (гостиничный Wi-Fi, изоляция клиентов, VPN; PROTOCOL.md, раздел 1).
+Возвращает управление сразу, ход поиска приходит сигналом `FindProgress`. `mode`: `auto` — mDNS и опрос всех
+адресов подсети (/24, не больше /22 вокруг этого компьютера, никогда через VPN) пробным `hello`, через 4 с без
+результата — Bluetooth LE (BlueZ); `all` — затем ещё звук через микрофон и QR-код ТВ через камеру (только по
+просьбе человека); или список из `mdns`, `scan`, `ble`, `sound`, `qr` через запятую. `luchctl find [mode]`.
+
+### `FindStatus() → s`
+
+Последний `FindProgress` (JSON).
+
+### `Discovered() → s`
+
+Как найден каждый приёмник: `{"<id>":{"via":["mdns","scan"],"rssi":-48}}`; `rssi` — сила сигнала Bluetooth
+(дБм): услышанные по Bluetooth идут в `Receivers()` первыми, ближайший раньше.
+
+### `AddReceiver(s link) → s`
+
+Добавляет приёмник по его QR-ссылке (`luch://connect?host=…&port=…&t=…`) или адресу (`host[:port]`), проверив
+пробным `hello`. Возвращает id. `luchctl add <ссылка|адрес>`.
+
+### `FindProgress(s status)` (сигнал)
+
+Что пробует лестница: `{"running":true,"mode":"all","found":0,"elapsed":4.3,"rungs":[{"rung":"ble",
+"state":"running","note":"..."}]}`; `state`: `waiting`, `running`, `done`, `failed`, `skipped`.
 
 ### `Connect(s id) → s`
 

@@ -158,6 +158,7 @@ async fn remember(st: &Shared, conn: &Connection, r: &Receiver) {
         return;
     }
     let mut s = st.lock().await;
+    s.via.entry(r.id.clone()).or_default().insert("mdns");
     if let Some(old) = s.found.get(&r.id) {
         if old == r
             || (old.ifindex != r.ifindex && (old.ifname == lan_iface() || r.ifname != lan_iface()))
@@ -263,7 +264,13 @@ impl Worker {
                         lookups.remove(&key);
                         let mut s = st.lock().await;
                         let before = s.found.len();
-                        s.found.retain(|_, r| !(r.ifindex == key.iface && r.service == key.name));
+                        let gone: Vec<String> = s.found.values()
+                            .filter(|r| r.ifindex == key.iface && r.service == key.name)
+                            .map(|r| r.id.clone()).collect();
+                        for id in &gone {
+                            s.found.remove(id);
+                            s.via.remove(id);
+                        }
                         if s.found.len() != before {
                             drop(s);
                             eprintln!("[luchd] gone: {} ({})", key.name, ifname(key.iface));

@@ -22,6 +22,15 @@ the advertised services and resolves their SRV/TXT/address records again, includ
 timeouts. A temporary resolution failure preserves the last known receiver; `ItemRemove`
 removes it and cancels any pending lookup.
 
+Where mDNS does not get through (hotel and guest Wi-Fi, client isolation, some VPNs) the daemon climbs a ladder
+(PROTOCOL.md section 1): together with mDNS it asks every address of each LAN interface's subnet (a /24, at most
+a /22 around this computer, never through a VPN) for the control port with a probe `hello`; after 4 s with nothing
+it listens for receivers' cards over Bluetooth LE (BlueZ) while advertising that it is looking. Only on request
+(`Find("all")`) does it also listen on the microphone for the TV saying its card by sound, and look through the
+camera for the TV's QR code. Every receiver found any way is checked with a real hello and joins the same list;
+`Discovered()` says how each was found. Receivers heard over Bluetooth are listed nearest (strongest signal) first,
+the others by name. One found other than by mDNS leaves the list when it no longer answers at the next climb.
+
 ## Methods
 
 ### `Receivers() → a(sssssqbb)`
@@ -45,7 +54,32 @@ Requests an immediate Avahi rescan and resolution of advertised services. Return
 read `Receivers()` for the current cache and listen for `ReceiversChanged()` for updates.
 Overlapping requests share in-flight lookups. This does not connect to receivers or interrupt
 active streams. The GNOME menu calls it when opened; the TUI calls it on entry and on `r`/Enter.
-The CLI also exposes `luchctl refresh`.
+The CLI also exposes `luchctl refresh`. It also starts the automatic discovery ladder (`Find("auto")`), at most
+once every 30 s; luchd climbs it once by itself a second after it starts.
+
+### `Find(s mode)`
+
+Climbs the discovery ladder; returns at once, progress comes as `FindProgress`. `mode`: `auto` (mDNS and the
+sweep of the LAN, then Bluetooth), `all` (then also sound and the camera, which need the person: the TV says its
+address when asked, the code is held up to the camera), or a comma-separated list of `mdns`, `scan`, `ble`,
+`sound`, `qr` to try at once. A climb already running is left to finish. Invalid modes fail with `InvalidArgs`.
+`luchctl find [mode]` (default `all`) prints what it tries.
+
+### `FindStatus() → s`
+
+The last `FindProgress` as JSON (see below); `"running": false` with no rungs before the first climb.
+
+### `Discovered() → s`
+
+How each listed receiver was found: `{"<id>":{"via":["mdns","scan"],"rssi":-48}}`. `via` holds `mdns`, `scan`,
+`ble`, `sound`, `qr` (its QR link through `AddReceiver`) or `manual`; `rssi` (dBm) is the Bluetooth signal when it
+was heard, else `null`.
+
+### `AddReceiver(s link) → s`
+
+Lists a receiver from what a person has: its QR link (`luch://connect?host=…&port=…&t=…`) or its address
+(`host` or `host:port`). It is checked with a probe hello from the interface that reaches it (never a VPN); a
+pairing token in the link goes with the next `Connect`. Returns the receiver's id. `luchctl add <link|address>`.
 
 ### `Connect(s id) → s`
 
@@ -274,6 +308,22 @@ A browser opened the web receiver and waits: its page shows `code`. luchd also a
 ### `MediaStateChanged(s id, s state)`
 
 Every `media_state` from a receiver, and `{"state":"stopped","reason":...}` when it ends.
+
+### `FindProgress(s status)`
+
+What the discovery ladder is trying, on every change:
+
+```json
+{"running": true, "mode": "all", "found": 0, "elapsed": 4.3,
+ "rungs": [{"rung": "mdns", "state": "done", "note": "0 found"},
+           {"rung": "scan", "state": "done", "note": "asked 253 addresses on wlan0: no receiver"},
+           {"rung": "ble", "state": "running", "note": "listening for receivers over Bluetooth"},
+           {"rung": "sound", "state": "waiting", "note": ""}, {"rung": "qr", "state": "waiting", "note": ""}]}
+```
+
+`state`: `waiting`, `running`, `done`, `failed` (the note says why: "Bluetooth is off", "no Bluetooth adapter"),
+`skipped` (a receiver was found before it was needed). The last one has `"running": false`. The GNOME menu shows
+the running rungs instead of "Searching…", and offers "Search harder" (`Find("all")`) when the list is empty.
 
 ### `ReceiversChanged()`
 
