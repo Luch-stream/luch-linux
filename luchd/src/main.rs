@@ -1,5 +1,6 @@
 //! luchd — Luch v0 sender daemon: announces `_luchsrc._tcp`, browses `_luch._tcp`
 //! receivers via Avahi's D-Bus API, keeps control channels, mirrors the screen, exposes dev.luch.Luch1.
+//! TVs without Luch (DLNA renderers, Chromecasts) are found too and play cast media (tv.rs).
 
 mod cast;
 mod discovery;
@@ -9,6 +10,7 @@ mod limits;
 mod mirror;
 mod mpris;
 mod reports;
+mod tv;
 mod volume;
 mod wake;
 mod web_tls;
@@ -96,36 +98,48 @@ struct Luch {
     sender_id: String,
     host: String,
     discovery: discovery::Discovery,
+    tvs: Arc<tv::Tvs>,
+    http: reqwest::Client,
 }
 
 #[interface(name = "dev.luch.Luch1")]
 impl Luch {
+    /// One row per TV: a Luch receiver, or a TV without Luch (its kind is in `Devices`). `connected` is a control
+    /// channel to a Luch receiver, or something a TV plays for us.
     async fn receivers(&self) -> Vec<ReceiverRow> {
+        let groups = self.groups().await;
         let st = self.st.lock().await;
-        let mut rows: Vec<ReceiverRow> = st
-            .found
-            .values()
-            .map(|r| {
-                let (c, m) = (st.conns.contains_key(&r.id), st.mirrors.contains_key(&r.id));
-                (
-                    r.id.clone(),
-                    r.name.clone(),
-                    r.model.clone(),
-                    r.address.clone(),
-                    r.ifname.clone(),
-                    r.port,
-                    c,
-                    m,
-                )
-            })
-            .collect();
+        let mut rows = Vec::new();
+        for g in groups {
+            let w = &g.ways[0];
+            let playing = self.tvs.with(&w.id, |_| ()).await.is_some();
+            rows.push((
+                w.id.clone(),
+                w.name.clone(),
+                w.model.clone(),
+                w.address.clone(),
+                w.ifname.clone(),
+                w.port,
+                st.conns.contains_key(&w.id) || playing,
+                st.mirrors.contains_key(&w.id),
+            ));
+        }
         rows.sort();
         rows
+    }
+
+    /// Every TV as JSON, one per row of `Receivers`: `id`, `name`, `model`, `address`, `kind` ("luch", "cast",
+    /// "dlna": the way luchd uses), `can` (what that way does: "mirror", "media", "photo", "doc", "apps",
+    /// "volume", "subs", "rate"), `control_ms` (about how long a command takes to show) and `transports`, every
+    /// way to that TV, best first, as {kind, id}.
+    async fn devices(&self) -> String {
+        Value::Array(self.groups().await.iter().map(tv::describe).collect()).to_string()
     }
 
     /// Starts an immediate Avahi rescan; results arrive via ReceiversChanged.
     async fn refresh(&self) {
         self.discovery.refresh();
+        self.tvs.refresh.notify_one();
     }
 
     /// Opens and keeps a control channel; returns the receiver's welcome as JSON.
@@ -138,6 +152,12 @@ impl Luch {
             let st = self.st.lock().await;
             if st.conns.contains_key(&id) {
                 return Err(fdo::Error::Failed(format!("already connected: {id}")));
+            }
+            if let Some(d) = self.tvs.device(&id) {
+                return Err(fdo::Error::NotSupported(format!(
+                    "{} has no Luch app: it plays what is cast to it, but cannot show this screen",
+                    d.name
+                )));
             }
             if !st.found.contains_key(&id) {
                 return Err(fdo::Error::InvalidArgs(format!("unknown receiver: {id}")));
@@ -245,6 +265,9 @@ impl Luch {
     /// The receiver's last `welcome` as JSON (decoders, `hw.display.modes`, `bench`), "{}" until
     /// the control channel has been opened once. Does not connect by itself.
     async fn capabilities(&self, id: String) -> String {
+        if let Some(d) = self.tvs.device(&id) {
+            return tv::capabilities(&d).to_string();
+        }
         self.st
             .lock()
             .await
@@ -473,6 +496,31 @@ impl Luch {
         #[zbus(connection)] conn: &Connection,
     ) -> fdo::Result<String> {
         let o = cast::Options::parse(&options).map_err(fdo::Error::InvalidArgs)?;
+        let forced = match o.transport.as_deref() {
+            None | Some("") | Some("auto") => None,
+            Some(t) => Some(tv::Kind::parse(t).ok_or_else(|| {
+                fdo::Error::InvalidArgs(format!("transport must be luch, cast or dlna, not {t}"))
+            })?),
+        };
+        let groups = self.groups().await;
+        let way = tv::pick(&groups, &id, forced).cloned();
+        if forced.is_some() && way.is_none() {
+            return Err(fdo::Error::InvalidArgs(format!(
+                "{id} cannot be reached that way: see Devices for its transports"
+            )));
+        }
+        // Several things for one TV: the row's id stays the handle, whichever way it plays.
+        let id = match way {
+            Some(w) if w.kind != tv::Kind::Luch => {
+                let d = self
+                    .tvs
+                    .device(&w.id)
+                    .ok_or_else(|| fdo::Error::Failed("the TV went away".into()))?;
+                return self.cast_to_tv(&id, d, items, o, conn).await;
+            }
+            Some(w) => w.id,
+            None => id,
+        };
         if !self.st.lock().await.conns.contains_key(&id) {
             self.connect(id.clone(), conn).await?;
         }
@@ -567,12 +615,18 @@ impl Luch {
         if !v["do"].is_string() {
             return Err(fdo::Error::InvalidArgs("no \"do\"".into()));
         }
+        if let Some(r) = self.tvs.ask(&id, tv::Ask::Cmd(v.clone())).await {
+            return r.map(|_| ()).map_err(fdo::Error::Failed);
+        }
         v["t"] = json!("media_cmd");
         self.send_to(&id, v).await
     }
 
     /// The last `media_state` from the receiver as JSON, "{}" when it plays nothing for us.
     async fn media_state(&self, id: String) -> String {
+        if let Some(s) = self.tvs.with(&id, |s| s.state()).await {
+            return s.to_string();
+        }
         self.st
             .lock()
             .await
@@ -588,6 +642,12 @@ impl Luch {
         id: String,
         #[zbus(connection)] conn: &Connection,
     ) -> fdo::Result<()> {
+        if let Some(r) = self.tvs.stop(&id).await {
+            if let (Some(srv), Some(d)) = (FILES.get(), self.tvs.device(&id)) {
+                srv.forget(d.address);
+            }
+            return r.map(|_| ()).map_err(fdo::Error::Failed);
+        }
         self.send_to(&id, json!({"t": "stop"})).await?;
         // The receiver does not answer a sender's stop: the end is told here.
         let was = {
@@ -651,6 +711,14 @@ impl Luch {
         #[zbus(connection)] conn: &Connection,
     ) -> fdo::Result<String> {
         let msg = volume::message(&what).map_err(fdo::Error::InvalidArgs)?;
+        if let Some(r) = self.tvs.ask(&id, tv::Ask::Volume(msg.clone())).await {
+            return r.map(|v| v.to_string()).map_err(fdo::Error::Failed);
+        }
+        if self.tvs.device(&id).is_some() {
+            return Err(fdo::Error::Failed(
+                "this TV's volume can be set while it plays something cast to it".into(),
+            ));
+        }
         if !self.st.lock().await.conns.contains_key(&id) {
             self.connect(id.clone(), conn).await?;
         }
@@ -742,6 +810,78 @@ impl Luch {
 }
 
 impl Luch {
+    /// Every TV with the ways to it, from the Luch receivers and the TVs found.
+    async fn groups(&self) -> Vec<tv::Group> {
+        let luch: Vec<tv::Entry> = self
+            .st
+            .lock()
+            .await
+            .found
+            .values()
+            .map(|r| tv::Entry {
+                kind: tv::Kind::Luch,
+                id: r.id.clone(),
+                name: r.name.clone(),
+                model: r.model.clone(),
+                address: r.address.clone(),
+                ifname: r.ifname.clone(),
+                port: r.port,
+            })
+            .collect();
+        let others = self.tvs.devices();
+        tv::group(luch.into_iter().chain(others.iter().map(tv::Entry::from)))
+    }
+
+    /// `Cast` to a TV without Luch: the same message a Luch receiver would get, played through the TV's own way.
+    async fn cast_to_tv(
+        &self,
+        row: &str,
+        d: tv::Device,
+        items: Vec<String>,
+        mut o: cast::Options,
+        conn: &Connection,
+    ) -> fdo::Result<String> {
+        // Such a TV cannot send a page's headers: a link that needs them goes through luchd.
+        if !o.headers.is_empty() && o.via.is_none() {
+            o.via = Some("sender".into());
+        }
+        let me = tv::local_for(d.address)
+            .map_err(|e| fdo::Error::Failed(format!("no way to {}: {e}", d.address)))?;
+        let srv = files()
+            .await
+            .map_err(|e| fdo::Error::Failed(format!("cannot serve files: {e}")))?;
+        let msg = cast::build(&items, &o, srv, d.address, me).map_err(fdo::Error::InvalidArgs)?;
+        let kind = msg["t"].as_str().unwrap_or("").to_string();
+        let mut m = tv::Media::from_message(&msg).map_err(fdo::Error::NotSupported)?;
+        match d.kind {
+            tv::Kind::Dlna => tv::dlna::prepare(srv, &m),
+            tv::Kind::Cast => tv::castv2::prepare(srv, &mut m),
+            tv::Kind::Luch => {}
+        }
+        let (session, mut states) = tv::play(&d, m, &self.http)
+            .await
+            .map_err(fdo::Error::Failed)?;
+        eprintln!("[luchd] {} plays {kind} over {}", d.name, d.kind.as_str());
+        self.tvs.start(row, session.clone()).await;
+        changed(conn).await;
+        let (conn, row, tvs, address) =
+            (conn.clone(), row.to_string(), self.tvs.clone(), d.address);
+        tokio::spawn(async move {
+            while let Some(v) = states.recv().await {
+                // A session something newer replaced on this TV is no longer news, and its files stay for the new one.
+                if tvs.with(&row, |s| !s.same(&session)).await == Some(true) {
+                    continue;
+                }
+                media_changed(&conn, &row, &v).await;
+                if v["state"] == "stopped" {
+                    srv.forget(address);
+                    changed(&conn).await;
+                }
+            }
+        });
+        Ok(kind)
+    }
+
     async fn send_to(&self, id: &str, v: Value) -> fdo::Result<()> {
         let c = self.st.lock().await.conns.get(id).cloned();
         let c = c.ok_or_else(|| fdo::Error::InvalidArgs(format!("not connected: {id}")))?;
@@ -1807,6 +1947,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     };
     let (discovery, worker) = discovery::Discovery::new();
+    let tvs = tv::Tvs::new();
     let conn = zbus::connection::Builder::session()?
         .name(p::DBUS_NAME)?
         .serve_at(
@@ -1816,10 +1957,32 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 sender_id: id.clone(),
                 host: host.clone(),
                 discovery,
+                tvs: tvs.clone(),
+                http: reqwest::Client::new(),
             },
         )?
         .build()
         .await?;
+    let on_change = {
+        let conn = conn.clone();
+        move || {
+            let conn = conn.clone();
+            tokio::spawn(async move { changed(&conn).await });
+        }
+    };
+    tokio::spawn(tv::search_renderers(
+        tvs.clone(),
+        tv::ssdp::Target::default(),
+        on_change.clone(),
+    ));
+    {
+        let (sys, tvs) = (sys.clone(), tvs.clone());
+        tokio::spawn(async move {
+            if let Err(e) = tv::mdns::browse(sys, tvs, on_change).await {
+                eprintln!("[luchd] cannot browse {}: {e}", tv::mdns::CAST_TYPE);
+            }
+        });
+    }
     eprintln!(
         "[luchd] {} id={id} name={host}; browsing {}",
         p::APP,
