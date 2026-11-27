@@ -1,4 +1,10 @@
-//! Luch protocol v0 constants shared by luchd and luchctl.
+//! The Luch protocol as every implementation shares it: constants, the control channel's lines and messages
+//! (`control`), the media datagram (`wire`) and the session numbers (`session`). No platform code: it builds for
+//! Linux, Windows and anything else Rust targets.
+
+pub mod control;
+pub mod session;
+pub mod wire;
 
 /// The plain control port's version (older receivers); `VERSION_TLS` on the TLS port, with pairing (PROTOCOL.md 3a).
 pub const VERSION: u32 = 0;

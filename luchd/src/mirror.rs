@@ -27,29 +27,11 @@ use tokio::sync::{broadcast, mpsc};
 use crate::display::{Layout, Size};
 
 static VIRTUAL_SETUP: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-const UHD: (u32, u32) = (3840, 2160);
-pub const WIDTH: u32 = 1920;
-pub const HEIGHT: u32 = 1080;
-pub const FPS: u32 = 60;
-pub const VIDEO_KBPS: u32 = 20_000; // at 1920x1080; other sizes scale, see `kbps_for`
-
-/// Video bitrate for a frame size: grows with the square root of the pixel count (4K gets twice
-/// the 1080p rate, not four times: Wi-Fi and TV decoders choke on 80 Mbit/s), never below 1080p's.
-pub fn kbps_for(w: u32, h: u32) -> u32 {
-    let ratio = (w as f64 * h as f64) / (WIDTH as f64 * HEIGHT as f64);
-    (VIDEO_KBPS as f64 * ratio.sqrt()).max(VIDEO_KBPS as f64) as u32
-}
-pub const AUDIO_BPS: u32 = 128_000;
-pub const AUDIO_FRAME_MS: u32 = 5;
-
-const HEADER: usize = 24;
-const SHARD: usize = 1376; // HEADER + SHARD = 1400, safe under a 1500 MTU
-
-pub const KIND_VIDEO: u8 = 1;
-pub const KIND_AUDIO: u8 = 2;
-pub const F_IDR: u8 = 1;
-pub const F_CONFIG: u8 = 2;
-pub const F_PARITY: u8 = 4;
+use luch_proto::control;
+pub use luch_proto::session::{kbps_for, session_size, AUDIO_BPS, AUDIO_FRAME_MS, FPS};
+use luch_proto::wire::{
+    self, header, opus_head, F_CONFIG, F_IDR, F_PARITY, HEADER, KIND_AUDIO, KIND_VIDEO, SHARD,
+};
 
 /// Latest numbers for one mirroring session, shared with D-Bus `Stats`.
 pub type Stats = Arc<Mutex<Value>>;
@@ -166,32 +148,6 @@ fn member_start(
     start["group"] =
         crate::sync::group_block(id, timeline, &who.role, mode, tolerance_ms, who.offset_ms);
     start
-}
-
-fn parse_size(s: &str) -> Option<(u32, u32)> {
-    let (w, h) = s.trim().split_once(['x', 'X'])?;
-    let (w, h) = (w.trim().parse::<u32>().ok()?, h.trim().parse::<u32>().ok()?);
-    // even sizes (4:2:0 chroma), within what encoders and receivers take
-    (w >= 64 && h >= 64 && w <= 8192 && h <= 8192).then_some((w & !1, h & !1))
-}
-
-/// Frame size of a session. `LUCH_SIZE` unset: 1920x1080 as before. `auto`: what the receiver announced
-/// as `max` in its welcome (e.g. a 4K TV). `WxH`: that size, never larger than the receiver's `max`.
-pub fn session_size(env: Option<&str>, receiver_max: Option<&str>) -> (u32, u32) {
-    let max = receiver_max.and_then(parse_size);
-    match env.map(str::trim) {
-        None | Some("") => (WIDTH, HEIGHT),
-        // A receiver's announced max can be more than its decoder takes (a Google TV Streamer says 4096x2304 and
-        // drops a 4096x2304@60 HEVC session), so `auto` stops at UHD.
-        Some("auto") => max
-            .map(|(w, h)| (w.min(UHD.0), h.min(UHD.1)))
-            .unwrap_or((WIDTH, HEIGHT)),
-        Some(v) => match (parse_size(v), max) {
-            (Some((w, h)), Some((mw, mh))) => (w.min(mw), h.min(mh)),
-            (Some(size), None) => size,
-            _ => (WIDTH, HEIGHT),
-        },
-    }
 }
 
 /// Restores the monitor's mode when the session ends.
@@ -656,32 +612,6 @@ pub enum Cmd {
     Send(Value),
 }
 
-/// Luch v1 datagram header (24 bytes, big-endian). The last field, the playout delay D (PROTOCOL.md 4k), is
-/// written per receiver by `Tx` and left 0 here.
-#[allow(clippy::too_many_arguments)]
-pub fn header(
-    kind: u8,
-    flags: u8,
-    idx: u16,
-    shards: u16,
-    seq: u32,
-    pts_us: u32,
-    len: u32,
-    host_lat: u16,
-) -> [u8; HEADER] {
-    let mut h = [0u8; HEADER];
-    h[0] = kind;
-    h[1] = flags;
-    h[2..4].copy_from_slice(&idx.to_be_bytes());
-    h[4..6].copy_from_slice(&shards.to_be_bytes());
-    // 6..8 parity_shards = 0 (no FEC yet)
-    h[8..12].copy_from_slice(&seq.to_be_bytes());
-    h[12..16].copy_from_slice(&pts_us.to_be_bytes());
-    h[16..20].copy_from_slice(&len.to_be_bytes());
-    h[20..22].copy_from_slice(&host_lat.to_be_bytes());
-    h
-}
-
 /// The media of a paired session (PROTOCOL.md 4): AES-128-GCM over each whole frame, the key from `ready` over TLS.
 /// One seal per frame, not per datagram: tens of microseconds for a 1080p frame, and nothing waits on it.
 pub struct Seal(ring::aead::LessSafeKey);
@@ -914,22 +844,22 @@ impl Tx {
                     .iter()
                     .filter(|d| d.alive.load(Ordering::Relaxed))
                     .map(|d| {
-                        let delay = d.delay.load(Ordering::Relaxed);
                         let body = match &d.seal {
                             Some(seal) => {
                                 let len = data.len() + TAG;
-                                let shards = len.div_ceil(SHARD).max(1) as u16;
                                 let mut h = header(
                                     self.kind,
                                     flags,
                                     0,
-                                    shards,
+                                    len.div_ceil(SHARD).max(1) as u16,
                                     seq,
                                     pts_us as u32,
                                     len as u32,
                                     host_lat,
                                 );
-                                h[22..24].copy_from_slice(&delay.to_be_bytes());
+                                h[22..24].copy_from_slice(
+                                    &d.delay.load(Ordering::Relaxed).to_be_bytes(),
+                                );
                                 std::borrow::Cow::Owned(seal.seal(&h, data))
                             }
                             None => std::borrow::Cow::Borrowed(data),
@@ -937,38 +867,29 @@ impl Tx {
                         (d, body)
                     })
                     .collect();
-                let most = frames
+                let parts: Vec<(&Dest, Vec<_>)> = frames
                     .iter()
-                    .map(|(_, b)| b.len().div_ceil(SHARD).max(1))
-                    .max()
-                    .unwrap_or(0);
+                    .map(|(d, body)| {
+                        let p = wire::shards(self.kind, flags, seq, pts_us as u32, host_lat, body);
+                        (*d, p.collect())
+                    })
+                    .collect();
+                let most = parts.iter().map(|(_, p)| p.len()).max().unwrap_or(0);
                 let mut pkt = Vec::with_capacity(HEADER + SHARD);
                 // Shard by shard to every receiver, so none of a group waits for the others' whole frame.
                 for i in 0..most {
                     if i > 0 && i % BURST == 0 {
                         std::thread::sleep(BURST_GAP); // ponytail: fixed pacing, ~3 ms for a 200 KB IDR
                     }
-                    for (d, body) in &frames {
-                        let shards = body.len().div_ceil(SHARD).max(1);
-                        if i >= shards {
+                    for (d, p) in &parts {
+                        let Some((h, chunk)) = p.get(i) else {
                             continue;
-                        }
-                        let chunk =
-                            &body[(i * SHARD).min(body.len())..((i + 1) * SHARD).min(body.len())];
+                        };
                         pkt.clear();
-                        pkt.extend_from_slice(&header(
-                            self.kind,
-                            flags,
-                            i as u16,
-                            shards as u16,
-                            seq,
-                            pts_us as u32,
-                            body.len() as u32,
-                            host_lat,
-                        ));
+                        pkt.extend_from_slice(h);
                         pkt[22..24].copy_from_slice(&d.delay.load(Ordering::Relaxed).to_be_bytes());
-                        pkt.extend_from_slice(chunk); // last shard is not padded; receiver uses frame_len
-                                                      // A lost datagram is recovered by the receiver's keyframe request; just report the first failure.
+                        pkt.extend_from_slice(chunk);
+                        // A lost datagram is recovered by the receiver's keyframe request; just report the first failure.
                         if let Err(e) = d.sock.send(&pkt) {
                             if !self.warned.swap(true, Ordering::Relaxed) {
                                 eprintln!("[luchd] udp send (kind {}): {e}", self.kind);
@@ -1013,17 +934,6 @@ pub(crate) fn media_key(ready: &Value) -> Result<Option<Vec<u8>>, String> {
             "the receiver wants media sealed with {other}, unknown here"
         )),
     }
-}
-
-/// 19-byte OpusHead (RFC 7845) for 48 kHz stereo: MediaCodec CSD-0.
-pub fn opus_head() -> [u8; 19] {
-    let mut h = [0u8; 19];
-    h[..8].copy_from_slice(b"OpusHead");
-    h[8] = 1; // version
-    h[9] = 2; // channels
-    h[10..12].copy_from_slice(&312u16.to_le_bytes()); // pre-skip (opusenc lookahead)
-    h[12..16].copy_from_slice(&48_000u32.to_le_bytes());
-    h
 }
 
 async fn portal(
@@ -1728,17 +1638,16 @@ pub async fn run(
 
     // HEVC only on the KMS path (luch-kms); the portal path's encoder is H.264.
     let hevc = t.kms && t.prefer == "video/hevc";
-    let mut start = if t.audio_only {
-        json!({"t": "start", "mode": "audio"})
-    } else {
-        json!({"t": "start", "mode": "mirror",
-            "video": {"codec": if hevc { "video/hevc" } else { "video/avc" }, "width": size.width, "height": size.height, "fps": FPS}})
-    };
+    let video = (!t.audio_only).then_some(control::Video {
+        codec: if hevc { "video/hevc" } else { "video/avc" },
+        width: size.width,
+        height: size.height,
+        fps: FPS,
+    });
     let mut group = t.group;
+    // In a group the target sends its sound only when its role has sound (PROTOCOL.md 4k).
     let primary_audio = group.as_ref().is_none_or(|g| g.primary.audio());
-    if let (true, Some(a)) = (primary_audio, &t.audio) {
-        start["audio"] = a.clone();
-    }
+    let mut start = control::start(video.as_ref(), t.audio.as_ref().filter(|_| primary_audio));
     if let Some(g) = &group {
         start["group"] = crate::sync::group_block(
             &g.id,
@@ -1753,7 +1662,6 @@ pub async fn run(
         .await
         .map_err(|_| "control channel closed")?;
     let ready = await_ready(&mut events).await?;
-    let port = |k: &str| port_of(&ready, k);
     // Web receivers take media over their websocket; everything else gets UDP sockets.
     let want_idr = Arc::new(AtomicBool::new(false));
     // Which member (0 = the target) each video and audio destination belongs to.
@@ -1764,9 +1672,7 @@ pub async fn run(
             Arc::new(Tx::ws(KIND_AUDIO, ws, want_idr.clone())),
         )
     } else {
-        let (vp, ap) = port("video_port")
-            .zip(port("audio_port"))
-            .ok_or(format!("bad ready: {ready}"))?;
+        let (vp, ap) = control::ready_ports(&ready).ok_or(format!("bad ready: {ready}"))?;
         let io = |e: std::io::Error| format!("udp: {e}");
         // A group: every member gets the streams of its role, each on its own sockets.
         // Each receiver seals with the key of its own ready (PROTOCOL.md 4); one key serves both kinds.
@@ -2092,64 +1998,7 @@ pub async fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn session_size_defaults_to_full_hd() {
-        assert_eq!(session_size(None, Some("3840x2160")), (1920, 1080));
-        assert_eq!(session_size(Some(""), None), (1920, 1080));
-        assert_eq!(
-            session_size(Some("nonsense"), Some("3840x2160")),
-            (1920, 1080)
-        );
-    }
-
-    #[test]
-    fn session_size_auto_follows_the_receiver() {
-        assert_eq!(session_size(Some("auto"), Some("3840x2160")), (3840, 2160));
-        assert_eq!(session_size(Some("auto"), Some("4096x2304")), (3840, 2160)); // announced max above UHD
-        assert_eq!(session_size(Some("auto"), Some("1280x720")), (1280, 720));
-        assert_eq!(session_size(Some("auto"), None), (1920, 1080));
-        assert_eq!(session_size(Some("auto"), Some("0x0")), (1920, 1080));
-    }
-
-    #[test]
-    fn session_size_explicit_is_capped_by_the_receiver_and_even() {
-        assert_eq!(
-            session_size(Some("2560x1440"), Some("3840x2160")),
-            (2560, 1440)
-        );
-        assert_eq!(
-            session_size(Some("3840x2160"), Some("1920x1080")),
-            (1920, 1080)
-        );
-        assert_eq!(session_size(Some("2561x1441"), None), (2560, 1440));
-        assert_eq!(session_size(Some("99999x1080"), None), (1920, 1080));
-    }
-
-    #[test]
-    fn bitrate_scales_with_pixels_but_not_below_1080p() {
-        assert_eq!(kbps_for(1920, 1080), VIDEO_KBPS);
-        assert_eq!(kbps_for(1280, 720), VIDEO_KBPS);
-        assert_eq!(kbps_for(3840, 2160), VIDEO_KBPS * 2);
-    }
-
-    #[test]
-    fn header_layout() {
-        let h = header(KIND_VIDEO, F_IDR, 2, 5, 0x01020304, 0x0a0b0c0d, 7000, 33);
-        assert_eq!(&h[..8], &[1, 1, 0, 2, 0, 5, 0, 0]);
-        assert_eq!(&h[8..12], &[1, 2, 3, 4]);
-        assert_eq!(&h[12..16], &[0x0a, 0x0b, 0x0c, 0x0d]);
-        assert_eq!(u32::from_be_bytes(h[16..20].try_into().unwrap()), 7000);
-        assert_eq!(u16::from_be_bytes(h[20..22].try_into().unwrap()), 33);
-    }
-
-    #[test]
-    fn opus_head_is_rfc7845() {
-        let h = opus_head();
-        assert_eq!(&h[..8], b"OpusHead");
-        assert_eq!((h[8], h[9]), (1, 2));
-        assert_eq!(u32::from_le_bytes(h[12..16].try_into().unwrap()), 48_000);
-    }
+    use luch_proto::wire::SHARD;
 
     #[test]
     fn frame_is_sharded_and_reassembles() {

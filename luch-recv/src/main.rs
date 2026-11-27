@@ -3,7 +3,6 @@
 
 mod control;
 mod player;
-mod wire;
 
 use std::sync::Arc;
 use tokio::net::TcpListener;

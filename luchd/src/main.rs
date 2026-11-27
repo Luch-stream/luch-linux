@@ -1468,21 +1468,13 @@ pub(crate) async fn read_msg<R: AsyncBufRead + Unpin>(rd: &mut R) -> io::Result<
     if n == 0 {
         return Ok(None);
     }
-    if buf.last() != Some(&b'\n') {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "line too long or truncated",
-        ));
-    }
-    serde_json::from_slice(&buf)
+    p::control::parse_line(&buf)
         .map(Some)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
 }
 
 pub(crate) async fn send<W: AsyncWrite + Unpin>(wr: &mut W, v: &Value) -> io::Result<()> {
-    let mut line = v.to_string();
-    line.push('\n');
-    wr.write_all(line.as_bytes()).await?;
+    wr.write_all(p::control::line(v).as_bytes()).await?;
     wr.flush().await
 }
 
@@ -1500,8 +1492,7 @@ struct Opened {
 /// (section 1e). `probe`: discovery only asks who is there, and says bye after the welcome. This is the plain hello;
 /// open_channel makes it the TLS one.
 fn hello(id: &str, host: &str, token: Option<&str>, probe: bool) -> Value {
-    let mut h = json!({"t": "hello", "v": p::VERSION, "id": id, "name": host, "app": p::APP,
-                       "want": ["mirror", "media", "photo", "reports", "input"]});
+    let mut h = p::control::hello(id, host, &["mirror", "media", "photo", "reports", "input"]);
     if let Some(t) = token {
         h["token"] = json!(t);
     }
@@ -2126,30 +2117,11 @@ async fn start_mirror(
     let (c, r) = c
         .zip(r)
         .ok_or_else(|| fdo::Error::Failed("receiver went away".into()))?;
-    // HEVC carries the same picture in less data. The receiver's own pick favours H.264 unless HEVC is clearly faster
-    // to decode; here HEVC also wins when it decodes about as fast (within 1 ms), as long as the receiver has a decoder
-    // for it and its bench ran. A person's choice (SetCodec) beats both.
-    let bench_ms = |mime: &str| welcome["bench"][mime]["ms"].as_f64();
-    let has_hevc = welcome["decoders"]
-        .as_array()
-        .is_some_and(|d| d.iter().any(|m| m.as_str() == Some("video/hevc")));
     let chosen = match st.lock().await.codec.get(id).cloned() {
         Some(c) => c,
         None => saved_codecs().get(id).cloned().unwrap_or_default(),
     };
-    let prefer = match (
-        chosen.as_str(),
-        bench_ms("video/avc"),
-        bench_ms("video/hevc"),
-    ) {
-        ("avc", _, _) => "video/avc".to_string(),
-        ("hevc", _, _) if has_hevc => "video/hevc".to_string(),
-        (_, Some(avc), Some(hevc)) if has_hevc && hevc <= avc + 1.0 => "video/hevc".to_string(),
-        _ => welcome["bench"]["prefer"]
-            .as_str()
-            .unwrap_or("video/avc")
-            .to_string(),
-    };
+    let prefer = p::session::choose_codec(&welcome, &chosen).to_string();
     let size = if requested != (0, 0) {
         display::Size {
             width: requested.0,
