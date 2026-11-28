@@ -73,11 +73,16 @@ Two independent knobs:
 ## The client's state
 
 `welcome.hw.device` and the per-second `stats` carry the client's battery, charging state, thermal
-status and thermal headroom (`PowerManager.getThermalHeadroom`: 1.0 cool, below 0.3 throttling soon).
-The sender **shows** them and never lowers the quality behind the user's back: the menu line says
-`🔋 on battery` or `🌡0.62` / `🔥0.21`, and the presets above 720p get a `drains the battery faster`
-note while the client runs on its own battery. The receiver reports these on change only, never by
-polling.
+status and thermal headroom (`PowerManager.getThermalHeadroom`: 0 cool, 1 severe throttling; hot from 0.7, or
+at a thermal status of moderate or worse, the receiver's own rule). A TV on mains power sends no battery.
+The receiver reports these on change only, never by polling.
+
+Watching them is off by default: **Settings › Watch the TV's Heat and Battery** (`luchctl watch-device on`,
+`luch mirror --watch-device`) turns it on. Then the start asks the TV for its 🔥 badge over the picture when it runs
+hot, the menu's line says `🔋 on battery` and `the TV is hot: lower the quality`, and the presets get a
+`drains the battery faster` note while the client runs on its own battery. The sender **shows** them and never
+lowers the quality behind the user's back. Off, nothing of it is shown; `luchctl stats` and the line's tooltip keep
+the numbers.
 
 ## Use
 
@@ -145,7 +150,8 @@ python3 Tools/fakerecv.py --seconds 20 --out .tmp/capture.h264 &
   slowly — so the receiver's 15 s silence timeout never fires (ScreenCaptureKit is change-driven and
   delivers ~1 fps on a still desktop);
 - menu bar with receiver list, live latency, warmth, quality, size, codec, bitrate, display and login item;
-- the client's battery, charging, thermal state and headroom, shown but never acted on silently;
+- the client's battery, charging, thermal state and headroom, shown when asked for (off by default) but never acted
+  on silently;
 - `luchctl` over a Unix socket;
 - what the TV shows, per TV in its **Screen** menu or `luchctl mirror [r] <source> [which]`, with luchd's
   words and the Mac's: `fast`/`asis` (this screen as it is), `virtual`/`extend` (a second screen),

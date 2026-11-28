@@ -135,6 +135,21 @@ final class SoundOnlyTests: XCTestCase {
         XCTAssertLessThan(took, 3.0)
     }
 
+    /// "Watch the TV's Heat and Battery" goes to the receiver in the start; off, the start says nothing (PROTOCOL.md 5).
+    func testTheStartAsksForTheHeatBadgeOnlyWhenWatching() throws {
+        for watch in [false, true] {
+            let tv = FakeReceiver(modes: ["mirror", "audio"])
+            var o = options()
+            o.watchDevice = watch
+            let engine = Engine(options: o)
+            try engine.start(receiver: tv.receiver)
+            XCTAssertTrue(tv.waitStart())
+            engine.stop(reason: "test")
+            if watch { XCTAssertEqual(tv.start?["watch_device"] as? Bool, true) }
+            else { XCTAssertNil(tv.start?["watch_device"], "missing means off, as from an older sender") }
+        }
+    }
+
     func testAReceiverWithoutSoundOnlyIsRefused() {
         let tv = FakeReceiver(modes: ["mirror"])
         let engine = Engine(options: options())

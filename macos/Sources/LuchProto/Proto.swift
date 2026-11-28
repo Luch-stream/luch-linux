@@ -34,6 +34,12 @@ public enum Proto {
     /// throttling threshold, so higher is hotter. The receiver's own badge uses the same number.
     public static let hotHeadroom = 0.7
 
+    /// Asks the receiver for its heat badge in this session (`"watch_device":true`, PROTOCOL.md 5). Off adds
+    /// nothing: a start without it is what older senders send, and gets no badge.
+    public static func watchDevice(_ start: inout [String: Any], _ on: Bool) {
+        if on { start["watch_device"] = true }
+    }
+
     /// 24-byte big-endian datagram header. `delay`: the playout delay D in 0.1 ms (PROTOCOL.md 4k), 0 = at once.
     public static func header(kind: MediaKind, flags: PacketFlags, shard: UInt16, shards: UInt16,
                               seq: UInt32, ptsUS: UInt32, frameLen: UInt32, hostLat: UInt16,

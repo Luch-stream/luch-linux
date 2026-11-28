@@ -21,6 +21,7 @@ enum Complete {
         ("media", "play, pause, seek what a receiver plays"), ("volume", "a receiver's volume"),
         ("page", "turn a document's pages"), ("blank", "black out a receiver's screen"),
         ("present", "a presentation with the presenter view here"), ("quiet", "hide notifications while showing"),
+        ("watch-device", "watch the TV's heat and battery"),
         ("sleep", "put a receiver to sleep"), ("wake", "turn a receiver on"), ("find", "look harder for receivers"),
         ("add", "a receiver by its QR link or address"), ("refresh", "look for receivers again"),
         ("info", "what a receiver is and can do"), ("id", "this Mac's id"), ("known", "receivers met before"),
@@ -115,6 +116,7 @@ enum Complete {
             receiverThen([("auto", "held where the sound lags"), ("on", ""), ("off", "picture only"),
                           ("sync", "always held")])
         case "quiet": if before.isEmpty { out.add([("ask", "ask once"), ("on", ""), ("off", "")]) }
+        case "watch-device": if before.isEmpty { out.add([("on", "a badge on a hot TV"), ("off", "")]) }
         case "browser": if before.isEmpty { out.add([("install", "Chrome, Firefox and others")]) }
         case "calibrate": if before.isEmpty { out.add([("self", "this Mac's speaker to its microphone")]) }
         case "completion": if before.isEmpty { out.add("zsh", "bash", "fish") }

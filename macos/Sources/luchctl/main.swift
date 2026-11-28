@@ -184,11 +184,15 @@ case "stats":
         let mbps = (stats["mbps"] as? NSNumber)?.doubleValue ?? 0
         var line = String(format: "≈ %.0f ms · host %.1f · rtt %.1f · %.0f fps · %.1f Mbit/s", est, host, rtt, fps, mbps)
         if let decode { line += String(format: " · decode %.1f", decode) }
+        // The TV's own numbers, raw, whether or not "Watch the TV's Heat and Battery" is on.
         if let battery = (stats["battery"] as? NSNumber)?.intValue {
-            line += " · phone \(battery)%"
+            line += " · TV \(battery)%"
             if (stats["charging"] as? NSNumber)?.boolValue == true { line += "⚡" }
         }
         if let thermal = stats["thermal"] as? String, thermal != "none" { line += " · \(thermal)" }
+        if let headroom = (stats["thermal_headroom"] as? NSNumber)?.doubleValue {
+            line += String(format: " · headroom %.2f", headroom)
+        }
         print(line)
     }
     printGroup()
@@ -321,6 +325,12 @@ case "blank" where (2...3).contains(args.count):
     guard word == "on" || word == "off" else { print("error: blank on|off, not \(word)"); exit(1) }
     fail(callPicking(withReceiver(["cmd": "annotate", "msg": ["t": "blank", "on": word == "on"]], name)))
 
+case "watch-device" where args.count == 1 || (args.count == 2 && ["on", "off"].contains(args[1])):
+    // Watch the TV's heat and battery: a badge on a hot TV and notes in the menu, from the next start (off by default).
+    let r = call(args.count == 2 ? ["cmd": "watch_device", "on": args[1] == "on"] : ["cmd": "watch_device"])
+    fail(r)
+    print((r["watch_device"] as? Bool) == true ? "on" : "off")
+
 case "quiet" where args.count <= 2:
     // Do not disturb while presenting or mirroring; ask: the app asks once.
     let r = call(args.count == 2 ? ["cmd": "quiet", "mode": args[1]] : ["cmd": "quiet"])
@@ -416,7 +426,7 @@ default:
                    | cast <file|link>... [--to r] [--title T] [--start m:ss] [--sub file] [--relay] | stop-cast [r]
                    | media [r] [play|pause|toggle|seek m:ss|skip s|rate x|audio id|sub id|sub off]
                    | volume [r] [0..100|+|-|mute|unmute] | page [r] next|prev|<n> | blank [r] on|off
-                   | present [r] <file> | quiet [ask|on|off] | sleep [r] | browser install
+                   | present [r] <file> | quiet [ask|on|off] | watch-device [on|off] | sleep [r] | browser install
                    | find [auto|all|mdns,scan,ble,sound,qr] | add <link|host[:port]> | refresh | id | info [r]
                    | known | wake [r] | wake <r> learn | wake <r> mac|ble <value>|off
                    | pair [r] [code] | paired | forget <r> | reports | report <n> [open|dismiss]
@@ -426,6 +436,8 @@ default:
            next slide, notes, timer; the mouse is a laser pointer, dragging draws, a clicker turns the slides)
            quiet: hide notification banners while presenting or mirroring (ask: the app asks once); macOS allows it
            only through Shortcuts, so the app adds two shortcuts the first time
+           watch-device: watch the TV's heat and battery (off by default): on, a hot TV shows a badge over the
+           picture and the menu tells the TV's battery and heat
            pair: the first connection to a receiver shows a code on the TV, typed here (any command that connects
            asks for it too); both then know each other and later connections need nothing. forget: pair again next time
            report: this Mac's log and its paired receivers' logs in one zip in Downloads, for a chat or an issue;

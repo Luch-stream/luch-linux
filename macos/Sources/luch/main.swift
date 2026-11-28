@@ -23,6 +23,7 @@ func usage() -> Never {
                   [--codec auto|h264|hevc] [--profile baseline|main|high] [--synthetic]
                   [--extend]   (a screen of its own for the TV, beside this Mac's)
                   [--ultra quality|mac|speed]   (the desktop drawn at one of the TV's own modes)
+                  [--watch-device]   (watch the TV's heat and battery: a badge on a hot TV)
       luch sound [<name>] [--ip A.B.C.D] [--port N] [--seconds N] [--synthetic]
     A receiver that asks for pairing shows a code: it is asked for here, then the command goes on.
     """
@@ -94,6 +95,7 @@ func parse(_ argv: [String]) -> Args {
             a.options.profile = profile
         case "--synthetic": a.options.synthetic = true
         case "--extend": a.options.extend = true
+        case "--watch-device": a.options.watchDevice = true
         case "--ultra":
             guard let p = UltraPriority(rawValue: next()) else { usage() }
             a.options.ultra = p

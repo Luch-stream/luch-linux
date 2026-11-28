@@ -76,6 +76,12 @@ final class Preferences {
         get { (defaults.object(forKey: "mirrorOnLaunch") as? NSNumber)?.boolValue ?? false }
         set { defaults.set(newValue, forKey: "mirrorOnLaunch") }
     }
+
+    /// "Watch the TV's Heat and Battery" (MirrorOptions.watchDevice); off until chosen.
+    var watchDevice: Bool {
+        get { (defaults.object(forKey: "watchDevice") as? NSNumber)?.boolValue ?? false }
+        set { defaults.set(newValue, forKey: "watchDevice") }
+    }
 }
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -278,6 +284,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             engine?.warmth = warmth     // live: the next frame is already warmer
             rebuildMenu()
             return ["ok": true, "warmth": warmth]
+        case "watch_device":
+            if let on = request["on"] as? Bool, on != Preferences.shared.watchDevice {
+                Preferences.shared.watchDevice = on
+                log("app: luchctl watch device -> \(on)")
+                restartIfStreaming()
+            }
+            return ["ok": true, "watch_device": Preferences.shared.watchDevice]
         case "stop":
             stopMirror()
             return ["ok": true]
@@ -294,6 +307,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                   "rtt_ms": stats.rttMs, "fps": stats.fps, "mbps": stats.mbps,
                                   "audio": stats.audioPackets]
         if let decode = stats.decodeMs { out["decode_ms"] = decode }
+        // The TV's own numbers as they came, whether or not the menu talks about them.
+        if let battery = stats.battery { out["battery"] = battery }
+        if let charging = stats.charging { out["charging"] = charging }
+        if let thermal = stats.thermal { out["thermal"] = thermal }
+        if let headroom = stats.thermalHeadroom { out["thermal_headroom"] = headroom }
         return out
     }
 
@@ -418,6 +436,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         display.submenu = displayMenu
         settings.addItem(display)
+        let watch = NSMenuItem(title: "Watch the TV's Heat and Battery", action: #selector(toggleWatchDevice),
+                               keyEquivalent: "")
+        watch.target = self
+        watch.state = Preferences.shared.watchDevice ? .on : .off
+        watch.toolTip = "A 🔥 on the TV when it runs hot, and its battery in this menu. Off: nothing about them is shown"
+        settings.addItem(watch)
 
         settings.addItem(.separator())
         settings.addItem(quietItem())
@@ -571,6 +595,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         options.sizeMode = sizeModeOverride ?? (SizeMode(rawValue: Preferences.shared.sizeMode) ?? .fit)
         options.preset = presetOverride ?? (QualityPreset.parse(Preferences.shared.preset) ?? .balanced)
         options.warmth = Preferences.shared.warmth
+        options.watchDevice = Preferences.shared.watchDevice
         if let frameMs = frameMsOverride { options.audioFrameMs = frameMs }
         options.profile = profileOverride
         options.soundOnly = soundOnly
@@ -640,7 +665,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func apply(_ stats: SessionStats) {
-        let (line, details) = Plain.session(stats)
+        let (line, details) = Plain.session(stats, watch: engine?.options.watchDevice ?? false)
         let first = statsLine.isEmpty
         statsLine = line
         statsItem?.title = line
@@ -727,6 +752,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         // A window shown stays shown.
         if let window = engine?.options.window { startMirror(receiver, extend: false, window: window) }
         else { startMirror(receiver) }
+    }
+
+    @objc private func toggleWatchDevice() {
+        Preferences.shared.watchDevice.toggle()
+        log("app: menu watch device -> \(Preferences.shared.watchDevice)")
+        restartIfStreaming() // the TV hears it in the start
     }
 
     @objc private func toggleMirrorOnLaunch() {
@@ -1070,6 +1101,7 @@ extension AppDelegate {
             o.sizeMode = SizeMode(rawValue: Preferences.shared.sizeMode) ?? .fit
             o.preset = QualityPreset.parse(Preferences.shared.preset) ?? .balanced
             o.warmth = Preferences.shared.warmth
+            o.watchDevice = Preferences.shared.watchDevice
             return o
         }
         together.hooks.restart = { [weak self] _ in self?.restartIfStreaming() }

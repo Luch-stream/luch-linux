@@ -100,6 +100,9 @@ public struct MirrorOptions {
     public var soundOnly = false
     /// Ask the receiver's decoder to run flat out (an experiment of the receiver's; off: it made a MediaTek TV slower).
     public var operatingRate = false
+    /// "Watch the TV's Heat and Battery": the receiver's heat badge, and the TV's battery and heat in the menu and
+    /// the log's hints (PROTOCOL.md 5). Off by default: the numbers still come, nothing is said about them.
+    public var watchDevice = false
     /// A screen of its own for the TV, beside this Mac's (a virtual display), instead of a copy of this one.
     public var extend = false
     /// Ultra-low latency: the desktop drawn at exactly one of the TV's own modes (UltraMode), chosen by this.
@@ -207,7 +210,7 @@ public final class Engine {
     public private(set) var streaming = false
     public private(set) var lastStats: SessionStats?
     public private(set) var plan: CodecPlan?
-    /// True when the client said it runs on its own battery; drives the menu's suggestion.
+    /// True when the client said it runs on its own battery and the person watches it; drives the menu's suggestion.
     public private(set) var deviceOnBattery = false
     /// Colour temperature of the outgoing picture; can be changed while streaming.
     /// 0 = untouched, 1 = strong night mode.
@@ -353,7 +356,7 @@ public final class Engine {
         }
         let plan = CodecPlanner.plan(caps: caps, receiverID: r.id, options: planned)
         self.plan = plan
-        deviceOnBattery = caps.onBattery
+        deviceOnBattery = options.watchDevice && caps.onBattery
         log("plan: \(plan.codec.label) \(plan.width)x\(plan.height)@\(plan.fps) audio=\(plan.audio) — \(plan.reason)")
         if options.extend || options.ultra != nil {
             // This Mac's own screen, taken before the TV's appears: macOS may make the new one the main display
@@ -387,6 +390,7 @@ public final class Engine {
         if plan.audio, let audio = options.audioMode.startBlock(limits: caps.limits, frameMs: options.audioFrameMs) {
             start["audio"] = audio
         }
+        Proto.watchDevice(&start, options.watchDevice)
         let ready = try startWhenAllowed(ctl, start)
         guard let videoPort = (ready["video_port"] as? NSNumber)?.uint16Value, videoPort > 0 else {
             throw EngineError.noReady
@@ -433,8 +437,10 @@ public final class Engine {
     /// Sound only: an `audio` block and no `video`; the receiver shows what plays instead of a picture.
     private func startSound(_ ctl: ControlChannel, caps: ReceiverCaps, receiver r: Receiver) throws {
         guard caps.modes.contains("audio"), caps.hasOpus else { throw EngineError.noSoundOnly }
-        let ready = try startWhenAllowed(ctl, ["t": "start", "mode": "audio",
-            "audio": ["codec": "audio/opus", "rate": 48_000, "channels": 2, "frame_ms": options.audioFrameMs]])
+        var start: [String: Any] = ["t": "start", "mode": "audio",
+            "audio": ["codec": "audio/opus", "rate": 48_000, "channels": 2, "frame_ms": options.audioFrameMs]]
+        Proto.watchDevice(&start, options.watchDevice)
+        let ready = try startWhenAllowed(ctl, start)
         guard let port = (ready["audio_port"] as? NSNumber)?.uint16Value, port > 0 else {
             throw EngineError.noReady
         }
@@ -750,7 +756,9 @@ public final class Engine {
         }
         if let thermal = deviceThermal, thermal != "none" { line += ", thermal \(thermal)" }
         if let headroom = deviceHeadroom { line += String(format: ", headroom %.2f", headroom) }
-        if Heat.isHot(headroom: deviceHeadroom, thermal: deviceThermal) { line += " (hot: 720p or 30 fps would help)" }
+        if options.watchDevice, Heat.isHot(headroom: deviceHeadroom, thermal: deviceThermal) {
+            line += " (hot: 720p or 30 fps would help)"
+        }
         log(line)
         let snapshot = SessionStats(fps: Double(df), mbps: mbps, hostMs: hostMs,
                                     rttMs: control?.rttMs ?? 0, decodeMs: decodeMs,

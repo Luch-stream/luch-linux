@@ -42,13 +42,27 @@ final class PlainTests: XCTestCase {
         s.battery = 80
         s.charging = true
         s.thermalHeadroom = 0.2
-        // A cool TV: headroom rises toward 1 as it heats.
-        XCTAssertEqual(Plain.session(s).line, "Delay ≈ 71 ms · 60 fps · TV battery 80%, charging")
+        // A cool TV (headroom rises toward 1 as it heats): its battery only, and only while it is watched.
+        XCTAssertEqual(Plain.session(s, watch: true).line, "Delay ≈ 71 ms · 60 fps · TV battery 80%, charging")
         s.thermalHeadroom = 0.8
-        XCTAssertEqual(Plain.session(s).line, "Delay ≈ 71 ms · 60 fps · TV battery 80%, charging · the TV is hot: lower the quality")
+        XCTAssertEqual(Plain.session(s, watch: true).line,
+                       "Delay ≈ 71 ms · 60 fps · TV battery 80%, charging · the TV is hot: lower the quality")
         s.thermalHeadroom = nil
         s.thermal = "severe"
-        XCTAssertTrue(Plain.session(s).line.hasSuffix(" · the TV is hot: lower the quality"))
+        XCTAssertTrue(Plain.session(s, watch: true).line.hasSuffix(" · the TV is hot: lower the quality"))
+    }
+
+    /// Off by default: nothing about the TV's battery or heat in the line, the numbers stay in the tooltip.
+    func testAnUnwatchedTvIsNotTalkedAbout() {
+        var s = SessionStats(fps: 59.6, mbps: 18.2, hostMs: 3.1, rttMs: 2.04, decodeMs: 4.0, audioPackets: 0, estMs: 71.4)
+        s.battery = 40
+        s.charging = false
+        s.thermal = "severe"
+        s.thermalHeadroom = 0.9
+        XCTAssertEqual(Plain.session(s).line, "Delay ≈ 71 ms · 60 fps")
+        XCTAssertEqual(Plain.session(s).details,
+                       "≈ 71 ms: this Mac 3.1 ms, network round trip 2.0 ms, TV decoding 4.0 ms · 60 fps · 18.2 Mbit/s"
+                       + " · TV battery 40% · TV thermal: severe · headroom 0.90")
     }
 
     func testEveryPictureFitHasWords() {

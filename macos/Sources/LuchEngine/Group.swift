@@ -284,6 +284,7 @@ public final class GroupSession {
         if p.role.audio, let audioBlock { start["audio"] = audioBlock }
         start["group"] = Sync.groupBlock(id: id, timeline: timeline, role: p.role, mode: mode,
                                          toleranceMs: Self.toleranceMs, offsetMs: p.offset.ms)
+        Proto.watchDevice(&start, options.watchDevice)
         let ready = try startWhenAllowed(ctl, start, name: p.receiver.name)
         let r = p.receiver
         // Each member's media sealed with the key of its own ready (PROTOCOL.md 4).
