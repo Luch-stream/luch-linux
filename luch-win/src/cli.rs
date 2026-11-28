@@ -6,10 +6,11 @@ use luch_proto::CONTROL_PORT;
 
 use crate::shell;
 
-pub const USAGE: &str = "usage: luch-win [mirror] --to IP[:PORT] [--from LOCAL_IP] [--output N] [--codec avc|hevc] [--size WxH|auto]
+pub const USAGE: &str = "usage: luch-win [mirror] --to IP[:PORT] [--from LOCAL_IP] [--output N] [--codec avc|hevc] [--size WxH|auto] [--watch-device]
        luch-win cast --to IP[:PORT] [--from LOCAL_IP] FILE...   photos (a slideshow), a video, a sound or a PDF
        luch-win install-shell [--to IP[:PORT] [--name NAME]]   Show on TV in Explorer's menu and in Send To
        luch-win uninstall-shell
+  --watch-device: watch the TV's heat and battery (a badge on a hot TV; off by default).
   The TV asks its person to Allow this PC each time (no pairing from Windows yet). install-shell adds a receiver
   each time it is run with --to; without, it writes the menus again (after luch-win.exe was moved).";
 
@@ -96,6 +97,8 @@ pub struct Options {
     pub codec: String,
     /// As LUCH_SIZE for luchd: unset, `auto`, or `WxH`.
     pub size: Option<String>,
+    /// Ask for the receiver's heat badge (PROTOCOL.md 5); off by default.
+    pub watch_device: bool,
 }
 
 pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> {
@@ -106,6 +109,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> 
         output: 0,
         codec: String::new(),
         size: None,
+        watch_device: false,
     };
     let mut it = args.into_iter();
     while let Some(k) = it.next() {
@@ -131,6 +135,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> 
                 }
             }
             "--size" => o.size = Some(v()?),
+            "--watch-device" => o.watch_device = true,
             _ => return Err(format!("unknown option {k}\n{USAGE}")),
         }
     }
@@ -152,18 +157,20 @@ mod tests {
         let o = parse(args("--to 192.168.1.20")).unwrap();
         assert_eq!(o.to, "192.168.1.20:47800".parse().unwrap());
         assert_eq!((o.output, o.codec.as_str(), o.from), (0, "", None));
+        assert!(!o.watch_device, "off by default");
     }
 
     #[test]
     fn every_option() {
         let o = parse(args(
-            "--to 192.168.1.20:5000 --from 192.168.1.10 --output 1 --codec hevc --size auto",
+            "--to 192.168.1.20:5000 --from 192.168.1.10 --output 1 --codec hevc --size auto --watch-device",
         ))
         .unwrap();
         assert_eq!(o.to.port(), 5000);
         assert_eq!(o.from, Some(Ipv4Addr::new(192, 168, 1, 10)));
         assert_eq!((o.output, o.codec.as_str()), (1, "hevc"));
         assert_eq!(o.size.as_deref(), Some("auto"));
+        assert!(o.watch_device);
     }
 
     #[test]

@@ -97,8 +97,11 @@ impl Channel {
     }
 
     /// Sends `start` and waits for `ready`, answering pings on the way. Returns the video and audio ports.
-    pub fn start(&mut self, video: &control::Video) -> io::Result<(u16, u16)> {
-        self.send(&control::start(Some(video), None))?;
+    /// `watch_device`: ask for the receiver's heat badge (PROTOCOL.md 5).
+    pub fn start(&mut self, video: &control::Video, watch_device: bool) -> io::Result<(u16, u16)> {
+        let mut start = control::start(Some(video), None);
+        control::watch_device(&mut start, watch_device);
+        self.send(&start)?;
         loop {
             let v = read_msg(&mut self.rd)?.ok_or_else(|| bad("closed before ready".into()))?;
             match v["t"].as_str() {
@@ -205,7 +208,7 @@ mod tests {
             luch_proto::session::choose_codec(&ch.welcome, ""),
             "video/avc"
         );
-        assert_eq!(ch.start(&video()).unwrap(), (47802, 47803));
+        assert_eq!(ch.start(&video(), false).unwrap(), (47802, 47803));
         let signals = Arc::new(Signals::default());
         let _wr = ch.follow(signals.clone()).unwrap();
         let got = rx.join().unwrap();
@@ -221,6 +224,10 @@ mod tests {
         assert_eq!(kinds, ["hello", "start", "pong", "pong"]);
         assert_eq!(got[0]["name"], "Linux Laptop");
         assert_eq!(got[1]["video"]["fps"], 60);
+        assert!(
+            got[1].get("watch_device").is_none(),
+            "off: as an older sender"
+        );
         assert_eq!(got[3]["n"], 2, "the follower answers pings too");
     }
 
@@ -228,9 +235,11 @@ mod tests {
     fn a_refused_start_is_an_error() {
         let (addr, rx) = receiver(vec![json!({"t": "error", "code": "start_failed"})]);
         let mut ch = Channel::open(addr, None, "id-1", "Linux Laptop", &["mirror"]).unwrap();
-        let e = ch.start(&video()).unwrap_err();
+        let e = ch.start(&video(), true).unwrap_err();
         assert!(e.to_string().contains("start_failed"), "{e}");
         drop(ch);
-        assert_eq!(rx.join().unwrap().len(), 2);
+        let got = rx.join().unwrap();
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[1]["watch_device"], true);
     }
 }

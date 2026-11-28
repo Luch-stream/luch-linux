@@ -81,7 +81,9 @@ pub fn run(o: &Options) -> Result<(), String> {
         screen.1,
         enc.name()
     );
-    let (vport, _aport) = ch.start(&video).map_err(|e| format!("start: {e}"))?;
+    let (vport, _aport) = ch
+        .start(&video, o.watch_device)
+        .map_err(|e| format!("start: {e}"))?;
     let signals = Arc::new(Signals::default());
     let _ctl = ch.follow(signals.clone()).map_err(|e| e.to_string())?;
 
