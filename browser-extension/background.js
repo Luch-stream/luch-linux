@@ -193,10 +193,11 @@ async function castFromTab(tabId, frameId, frameUrl, req) {
   }
   const src = LuchCore.pickSource(req.video, seen.get(tabId), frameId);
   if (!src) {
-    // A player that has not started yet loads nothing (most iframe players wait for their first click).
-    if (!req.video.currentSrc) throw new Error(req.page && /^ru/i.test(req.page.lang || "")
-      ? "Видео ещё не загрузилось: запустите его на странице и нажмите снова"
-      : "The video has not loaded yet: start it on the page, then send it again");
+    // A player that has not started yet loads nothing (most iframe players wait for their first click, some
+    // show an ad first, from a blob of its own).
+    if (!req.video.currentSrc || !(seen.get(tabId) || []).length) throw new Error(req.page && /^ru/i.test(req.page.lang || "")
+      ? "Видео ещё не загрузилось (или идёт реклама): запустите его на странице и нажмите снова"
+      : "The video has not loaded yet (or an ad plays first): start it on the page, then send it again");
     throw new Error("no link to this video (it may be protected)");
   }
   const { relay, trusted = [] } = await B.storage.local.get(["relay", "trusted"]);
