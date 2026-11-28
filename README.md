@@ -104,8 +104,9 @@ git clone https://github.com/Toxblh/luch-linux && cd luch-linux
 ```
 
 `install.sh` builds and installs `luchd`, `luchctl` and `luch-kms` into `~/.cargo/bin`, grants
-`luch-kms` `CAP_SYS_ADMIN` (asks for sudo), installs and starts the `luchd` user service, and
-installs the GNOME extension. Log out and back in once so GNOME Shell loads the extension.
+`luch-kms` `CAP_SYS_ADMIN` (asks for sudo), installs and starts the `luchd` user service,
+installs the GNOME extension and puts *Show on TV* into the file managers (below). Log out and back in once so
+GNOME Shell loads the extension.
 
 Manual steps, if you prefer:
 
@@ -182,6 +183,15 @@ site that needs your login). Android receivers play MP4, MKV, WebM, MPEG-TS and 
 **Presenting.** `luchctl present talk.odp` (or *Present…* in the GNOME menu) shows the slides sharp on the TV and
 opens a presenter view here: the next slide, your speaker notes, a timer; the mouse is a laser pointer drawn by the
 TV, dragging draws, a clicker turns the slides, notifications stay hidden. See [docs/presenting.md](docs/presenting.md).
+
+**From the file manager.** Right-click photos, videos, music, a PDF or an office file: *Show on Living room TV*
+(with several receivers, *Show on TV* and their names), and for a PDF or a presentation also *Present on …*, which
+opens the presenter view. Several photos are one slideshow. In GNOME Files the menu lists the receivers luchd sees
+(the `nautilus-python` package, then `nautilus -q`; [contrib/file-managers/nautilus/luch.py](contrib/file-managers/nautilus/luch.py));
+in Dolphin *Show on TV with Luch* and *Present on TV with Luch…* ask which receiver in a dialog; anywhere else
+*Open With → Show on TV* does the same. They all run `luchctl --pick cast …` or `luchctl --pick present …`: with no
+terminal, luchctl asks which receiver, a pairing code and says what went wrong through zenity or kdialog. The
+*Show on TV* launcher asks for the files first.
 
 **From the browser.** The extension in [browser-extension/](browser-extension/README.md) puts a *To TV* button on
 every web video and the TV's controls over the page's player (`luchctl browser install` connects it to luchd).

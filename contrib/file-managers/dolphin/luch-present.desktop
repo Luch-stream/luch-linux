@@ -1,0 +1,14 @@
+# Dolphin's context menu (KDE): Present on TV with Luch, for a PDF or a presentation.
+# SPDX-License-Identifier: GPL-3.0-or-later
+[Desktop Entry]
+Type=Service
+X-KDE-ServiceTypes=KonqPopupMenu/Plugin
+MimeType=application/pdf;application/vnd.oasis.opendocument.presentation;application/vnd.openxmlformats-officedocument.presentationml.presentation;application/vnd.ms-powerpoint;application/vnd.apple.keynote;application/x-iwork-keynote-sffkey;
+Actions=present
+X-KDE-Priority=TopLevel
+X-KDE-RequiredNumberOfUrls=1
+
+[Desktop Action present]
+Name=Present on TV with Luch…
+Icon=luch
+Exec=luchctl --pick present %f

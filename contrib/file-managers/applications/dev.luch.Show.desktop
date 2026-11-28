@@ -1,0 +1,14 @@
+# "Open With → Show on TV" in any file manager, and a launcher that asks for the files. install.sh puts the full
+# path of luchctl in Exec. SPDX-License-Identifier: GPL-3.0-or-later
+[Desktop Entry]
+Type=Application
+Name=Show on TV
+GenericName=Show on TV with Luch
+Comment=Photos, videos, music and documents on a Luch receiver
+Icon=luch
+Exec=luchctl --pick cast %F
+Terminal=false
+Categories=AudioVideo;Video;
+Keywords=Luch;TV;cast;projector;slideshow;
+MimeType=image/jpeg;image/png;image/gif;image/webp;image/bmp;image/heic;image/heif;image/avif;video/mp4;video/x-m4v;video/quicktime;video/x-matroska;video/webm;video/x-msvideo;video/mpeg;video/mp2t;video/ogg;audio/mpeg;audio/mp4;audio/x-m4a;audio/aac;audio/flac;audio/x-flac;audio/ogg;audio/x-vorbis+ogg;audio/opus;audio/x-opus+ogg;audio/wav;audio/x-wav;application/pdf;application/vnd.oasis.opendocument.presentation;application/vnd.openxmlformats-officedocument.presentationml.presentation;application/vnd.ms-powerpoint;application/vnd.apple.keynote;application/x-iwork-keynote-sffkey;application/vnd.oasis.opendocument.text;application/vnd.oasis.opendocument.spreadsheet;application/vnd.openxmlformats-officedocument.wordprocessingml.document;application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;application/msword;application/vnd.ms-excel;application/rtf;
+StartupNotify=false
