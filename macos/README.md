@@ -244,6 +244,15 @@ own processes and returns nothing to other apps, so a small library (`libLuchNow
 Frameworks) is loaded into the system `/usr/bin/perl`, which is one of them, and reports changes as JSON lines; the
 open mediaremote-adapter does the same. If Apple closes that too, the TV simply shows no title.
 
+**From Finder.** Select photos, videos, music, a PDF or an office file, then right-click → *Quick Actions* (or
+*Services*) → **Show on TV with Luch**; a PDF or a presentation also has **Present on TV with Luch**, which opens the
+presenter view. Several photos are one slideshow. With one TV it goes there at once; with several, a short menu
+under the pointer asks which. Files dropped on the menu bar icon do the same (a presentation dropped there can be
+shown or presented). These are the app's Services (`NSServices` in Info.plist, written by `Tools/make-app.sh`); macOS
+lists them once Luch.app has run from its place, and `/System/Library/CoreServices/pbs -update` makes it look again.
+If they are not in the menu, turn them on in System Settings → Keyboard → Keyboard Shortcuts → Services → Files and
+Folders.
+
 ## Presenting
 
 `luchctl present [r] talk.pptx` (or *Present…* in a TV's menu) shows a PDF or a presentation on the TV and opens the

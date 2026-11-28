@@ -69,6 +69,50 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
         <string>_luch._tcp</string>
         <string>_luchsrc._tcp</string>
     </array>
+    <!-- Finder's Quick Actions / Services for selected files (Sources/LuchApp/ShowFiles.swift). -->
+    <key>NSServices</key>
+    <array>
+        <dict>
+            <key>NSMenuItem</key><dict><key>default</key><string>Show on TV with Luch</string></dict>
+            <key>NSMessage</key><string>showOnTV</string>
+            <key>NSPortName</key><string>Luch</string>
+            <key>NSRequiredContext</key><dict/>
+            <key>NSSendFileTypes</key>
+            <array>
+                <string>public.image</string>
+                <string>public.movie</string>
+                <string>public.audio</string>
+                <string>com.adobe.pdf</string>
+                <string>public.presentation</string>
+                <string>com.apple.keynote.key</string>
+                <string>org.openxmlformats.presentationml.presentation</string>
+                <string>com.microsoft.powerpoint.ppt</string>
+                <string>org.oasis-open.opendocument.presentation</string>
+                <string>org.openxmlformats.wordprocessingml.document</string>
+                <string>com.microsoft.word.doc</string>
+                <string>org.openxmlformats.spreadsheetml.sheet</string>
+                <string>com.microsoft.excel.xls</string>
+                <string>org.oasis-open.opendocument.text</string>
+                <string>org.oasis-open.opendocument.spreadsheet</string>
+                <string>public.rtf</string>
+            </array>
+        </dict>
+        <dict>
+            <key>NSMenuItem</key><dict><key>default</key><string>Present on TV with Luch</string></dict>
+            <key>NSMessage</key><string>presentOnTV</string>
+            <key>NSPortName</key><string>Luch</string>
+            <key>NSRequiredContext</key><dict/>
+            <key>NSSendFileTypes</key>
+            <array>
+                <string>com.adobe.pdf</string>
+                <string>public.presentation</string>
+                <string>com.apple.keynote.key</string>
+                <string>org.openxmlformats.presentationml.presentation</string>
+                <string>com.microsoft.powerpoint.ppt</string>
+                <string>org.oasis-open.opendocument.presentation</string>
+            </array>
+        </dict>
+    </array>
 </dict>
 </plist>
 PLIST
