@@ -16,6 +16,7 @@ import {QuickMenuToggle, SystemIndicator} from 'resource:///org/gnome/shell/ui/q
 import VirtualCursor from './cursor.js';
 import QuietAsker from './quiet.js';
 import Reporter from './report.js';
+import {plainProblem} from './plain.js';
 
 const IFACE = `<node>
   <interface name="dev.luch.Luch1">
@@ -58,39 +59,45 @@ let ICON = null; // Gio.Icon from the extension dir, set in enable()
 const RU = GLib.get_language_names().some(l => l.startsWith('ru'));
 const T = RU ? {
     title: 'Луч',
-    header: 'Трансляция на экран',
-    noDaemon: 'luchd не запущен',
+    header: 'Показ экрана на ТВ',
+    noDaemon: 'Служба Луча не запущена',
+    startDaemon: 'Запустить службу Луча',
     searching: 'Ищу приёмники…',
-    fast: 'Весь экран — минимальная задержка',
-    monitor: 'Экран (через портал)',
-    window: 'Окно',
-    extend: 'Расширить рабочий стол',
-    stop: 'Остановить',
+    firstRun: 'Откройте Луч на телевизоре: он появится здесь',
+    fast: 'Показать экран',
+    monitor: 'Показать другой монитор…',
+    window: 'Показать одно окно…',
+    extend: 'Как второй экран',
+    stop: 'Остановить показ',
+    stopOn: name => `Остановить показ на ${name}`,
+    mirroringNow: 'идёт показ',
     disconnect: 'Отключиться',
-    receivers: n => `Приёмников: ${n}`,
-    web: 'Веб-приёмник — откройте в браузере ТВ',
+    receivers: n => n === 0 ? 'Приёмников нет' : `Приёмников: ${n}`,
+    more: 'Ещё',
+    web: 'Веб-приёмник: откройте этот адрес в браузере ТВ',
     webOpen: 'Открыть в браузере этого компьютера',
     turnOn: name => `Включить ${name}`,
     waking: name => `Включаю ${name}…`,
     audio: 'Только звук (как колонка)',
     sendFile: 'Показать файл…',
-    stopCast: 'Закрыть показанное',
+    stopCast: 'Убрать файл с экрана ТВ',
     turnOff: 'Выключить ТВ',
     chooseFiles: 'Что показать на ТВ',
-    present: 'Презентация…',
+    present: 'Показать презентацию…',
     choosePresentation: 'Презентация для показа (PDF, ODP, PPTX)',
-    quiet: mode => `Не беспокоить при показе: ${{ask: 'спросить', on: 'да', off: 'нет'}[mode] ?? mode}`,
+    quiet: 'Не беспокоить при показе:',
+    quietModes: {ask: 'Спросить при первом показе', on: 'Всегда', off: 'Никогда'},
     quietTitle: 'Скрыть уведомления на время показа?',
     quietBody: 'Их увидят все, кто смотрит на экран. Ответ запомнится до выхода из сеанса.',
     quietHide: 'Скрыть',
     quietKeep: 'Оставить',
     failed: name => `${name}: не получилось`,
-    allowOnTv: name => `${name}: разрешите подключение на ТВ`,
-    codeTitle: name => `Сопряжение с ${name}`,
-    codeHint: 'Введите код, который показан на ТВ',
-    pair: 'Сопрячь',
+    allowOnTv: name => `${name}: нажмите на ТВ «Разрешить»`,
+    codeTitle: name => `Код с экрана ${name}`,
+    codeHint: 'Введите цифры, которые сейчас показывает ТВ. Это нужно только в первый раз.',
+    pair: 'Подключить',
     cancel: 'Отмена',
-    paired: name => `${name}: сопряжено`,
+    paired: name => `${name}: подключено, код больше не понадобится`,
     findHarder: 'Искать настойчивее (Bluetooth, звук, QR-код)',
     rungs: {mdns: 'сеть (mDNS)', scan: 'все адреса сети', ble: 'Bluetooth',
         sound: 'звук ТВ через микрофон — на ТВ выберите «Сказать адрес»', qr: 'QR-код ТВ через камеру',
@@ -129,39 +136,45 @@ const T = RU ? {
     close: 'Закрыть',
 } : {
     title: 'Luch',
-    header: 'Screen mirroring',
-    noDaemon: 'luchd is not running',
+    header: 'Show this screen on a TV',
+    noDaemon: 'Luch\u2019s service is not running',
+    startDaemon: 'Start Luch\u2019s service',
     searching: 'Searching for receivers…',
-    fast: 'Full screen — lowest latency',
-    monitor: 'Screen (portal)',
-    window: 'Window',
-    extend: 'Extend desktop',
-    stop: 'Stop',
+    firstRun: 'Open Luch on the TV: it shows up here',
+    fast: 'Mirror the screen',
+    monitor: 'Mirror another monitor…',
+    window: 'Show one window…',
+    extend: 'As a second screen',
+    stop: 'Stop mirroring',
+    stopOn: name => `Stop mirroring to ${name}`,
+    mirroringNow: 'mirroring',
     disconnect: 'Disconnect',
-    receivers: n => `${n} receiver${n === 1 ? '' : 's'}`,
-    web: 'Web receiver — open in the TV\u2019s browser',
+    receivers: n => n === 0 ? 'No receivers' : `${n} receiver${n === 1 ? '' : 's'}`,
+    more: 'More',
+    web: 'Web receiver: open this address in the TV\u2019s browser',
     webOpen: 'Open in this computer\u2019s browser',
     turnOn: name => `Turn on ${name}`,
     waking: name => `Turning on ${name}…`,
     audio: 'Sound only (as a speaker)',
     sendFile: 'Show a file…',
-    stopCast: 'Close what is shown',
+    stopCast: 'Stop showing the file',
     turnOff: 'Turn the TV off',
     chooseFiles: 'What to show on the TV',
     present: 'Present…',
     choosePresentation: 'A presentation to show (PDF, ODP, PPTX)',
-    quiet: mode => `Do not disturb while presenting: ${mode}`,
+    quiet: 'Do not disturb while presenting:',
+    quietModes: {ask: 'Ask the first time', on: 'Always', off: 'Never'},
     quietTitle: 'Hide notifications while presenting?',
     quietBody: 'Everyone looking at the screen would see them. The answer holds until you log out.',
     quietHide: 'Hide them',
     quietKeep: 'Keep them',
     failed: name => `${name}: that did not work`,
-    allowOnTv: name => `${name}: allow the connection on the TV`,
-    codeTitle: name => `Pair with ${name}`,
-    codeHint: 'Type the code the TV shows',
-    pair: 'Pair',
+    allowOnTv: name => `${name}: press Allow on the TV`,
+    codeTitle: name => `The code on ${name}`,
+    codeHint: 'Type the digits the TV shows now. This is needed only the first time.',
+    pair: 'Connect',
     cancel: 'Cancel',
-    paired: name => `${name}: paired`,
+    paired: name => `${name}: connected, no code next time`,
     findHarder: 'Search harder (Bluetooth, sound, QR code)',
     rungs: {mdns: 'the network (mDNS)', scan: 'every address of the network', ble: 'Bluetooth',
         sound: 'the TV\u2019s sound through the microphone: on the TV, choose \u201cSay the address\u201d',
@@ -229,6 +242,13 @@ function directLine(json, t) {
     }
     const step = t.directSteps[s?.step];
     return step ? t.directing(s.name ?? '', step) : null;
+}
+
+/** A refusal in plain words with what to do (plain.js); nothing when the person cancelled it themselves. */
+function tell(title, e) {
+    const text = plainProblem(reason(e), RU);
+    if (text !== null)
+        Main.notify(title, text);
 }
 
 // luchd's refusal while a receiver waits for the code on its screen (Connect, Mirror, Cast...).
@@ -404,6 +424,24 @@ function chooseFiles(title, multiple = true) {
     });
 }
 
+/** Starts luchd's user service (install.sh sets it up); it shows in the menu by itself once it is on the bus. */
+function startService() {
+    try {
+        Gio.Subprocess.new(['systemctl', '--user', 'start', 'luchd.service'], Gio.SubprocessFlags.STDERR_PIPE)
+            .communicate_utf8_async(null, null, (p, res) => {
+                try {
+                    const [, , err] = p.communicate_utf8_finish(res);
+                    if (!p.get_successful())
+                        Main.notify(T.noDaemon, err?.trim() ?? '');
+                } catch (e) {
+                    Main.notify(T.noDaemon, reason(e));
+                }
+            });
+    } catch (e) {
+        Main.notify(T.noDaemon, reason(e));
+    }
+}
+
 /** A notification with buttons, for QuietAsk. */
 function askQuestion(title, body, actions) {
     const source = MessageTray.getSystemSource();
@@ -463,7 +501,7 @@ class LuchToggle extends QuickMenuToggle {
                     this._render(null);
                 },
                 done: reportDone,
-                failed: e => Main.notify(T.failed(T.title), reason(e)),
+                failed: e => tell(T.failed(T.title), e),
             }, {
                 showFile,
                 copy: text => St.Clipboard.get_default().set_text(St.ClipboardType.CLIPBOARD, text),
@@ -494,14 +532,14 @@ class LuchToggle extends QuickMenuToggle {
                 this._afterPairing.delete(id);
                 await again?.();
             } catch (e) {
-                Main.notify(T.failed(name), reason(e));
+                tell(T.failed(name), e);
             } finally {
                 this._typing.delete(id);
             }
         } else if (state.step === 'failed') {
             this._afterPairing.delete(id);
             if (!this._typing.has(id))
-                Main.notify(T.failed(name), state.reason ?? '');
+                tell(T.failed(name), state.reason ?? '');
         }
     }
 
@@ -513,7 +551,7 @@ class LuchToggle extends QuickMenuToggle {
         if (s.step === 'on')
             Main.notify(T.directOn(name), '');
         else if (s.step === 'failed')
-            Main.notify(T.failed(name), s.reason ?? '');
+            tell(T.failed(name), s.reason ?? '');
         else if (s.step === 'back')
             Main.notify(T.title, s.note ?? '');
         this._render(null);
@@ -530,7 +568,7 @@ class LuchToggle extends QuickMenuToggle {
         try {
             await this._proxy.DirectAsync(key);
         } catch (e) {
-            Main.notify(T.failed(name ?? T.title), reason(e));
+            tell(T.failed(name ?? T.title), e);
         }
     }
 
@@ -578,10 +616,22 @@ class LuchToggle extends QuickMenuToggle {
         this._onMirroringChanged(this.checked);
 
         this._section.removeAll();
-        if (note || this._finding || (this._rows.length === 0 && this._asleep.length === 0)) {
+        // What is happening now comes first, with the way to stop it: no submenu to open for that.
+        for (const [id, name] of mirroring) {
+            const item = new PopupMenu.PopupImageMenuItem(T.stopOn(name), 'media-playback-stop-symbolic');
+            item.connect('activate', () => this._proxy.StopMirrorAsync(id).catch(e => tell(T.failed(name), e)));
+            this._section.addMenuItem(item);
+        }
+        const empty = this._rows.length === 0 && this._asleep.length === 0;
+        if (note || this._finding || empty) {
             const item = new PopupMenu.PopupMenuItem(note ?? this._finding ?? T.searching, {reactive: false});
             this._section.addMenuItem(item);
         }
+        if (note === T.noDaemon)
+            this._section.addAction(T.startDaemon, startService);
+        // The first time nothing is found: where the TV comes from, before any way to look harder.
+        if (!note && empty)
+            this._section.addMenuItem(new PopupMenu.PopupMenuItem(T.firstRun, {reactive: false}));
         // Nothing on the list and nothing being tried: the rest of the ladder, which needs the person (the TV's
         // sound through the microphone, its QR code through the camera).
         if (!note && !this._finding && this._rows.length === 0 && this._proxy?.g_name_owner) {
@@ -595,7 +645,7 @@ class LuchToggle extends QuickMenuToggle {
             this._section.addMenuItem(new PopupMenu.PopupMenuItem(directing, {reactive: false}));
         } else if (this._directState.step === 'on') {
             this._section.addAction(T.directOff(this._directState.previous), () => this._proxy.DirectOffAsync()
-                .catch(e => Main.notify(T.failed(T.title), reason(e))));
+                .catch(e => tell(T.failed(T.title), e)));
         } else if (this._proxy?.g_name_owner) {
             const listed = key => this._rows.some(r => r[0].replace(/-/g, '').startsWith(key));
             const offers = (this._direct.offers ?? []).filter(o => !listed(o.key));
@@ -610,18 +660,8 @@ class LuchToggle extends QuickMenuToggle {
                 sub.icon.icon_name = 'media-playback-start-symbolic';
             else
                 sub.icon.gicon = ICON;
-            if (model)
-                sub.label.text = `${name} · ${model}`;
-            // A refusal from luchd (an older receiver, the accessibility switch off...) is shown, not only logged.
-            const add = (label, fn) => sub.menu.addAction(label, () => fn().catch(e => {
-                // The TV shows a code: the dialog for it comes with PairChanged, and the action is done after.
-                if (asksForPairing(reason(e))) {
-                    this._afterPairing.set(id, fn);
-                    return;
-                }
-                logError(e, 'Luch');
-                Main.notify(T.failed(name), reason(e));
-            }));
+            sub.label.text = [name, model, isMirroring ? T.mirroringNow : ''].filter(Boolean).join(' · ');
+            const add = (label, fn) => sub.menu.addAction(label, this._guarded(id, name, fn));
             if (isMirroring) {
                 add(T.stop, () => this._proxy.StopMirrorAsync(id));
             } else if (!isTv(id)) {
@@ -668,33 +708,39 @@ class LuchToggle extends QuickMenuToggle {
             this._section.addMenuItem(item);
         }
 
-        // Do not disturb while presenting or mirroring: ask → on → off.
+        // The settings and the rarely used, out of the way: do not disturb, and the web receiver's address.
         const mode = this._proxy?.Quiet;
-        if (mode) {
-            const next = {ask: 'on', on: 'off', off: 'ask'}[mode] ?? 'ask';
-            const item = new PopupMenu.PopupImageMenuItem(T.quiet(mode), 'notifications-disabled-symbolic');
-            item.connect('activate', () => {
-                this._proxy.Quiet = next;
-            });
-            this._section.addMenuItem(item);
-        }
-
-        // Built-in web receiver: the URL for the TV; opening it on the PC is a quick test.
         const url = this._proxy?.WebUrl ?? '';
-        if (url) {
-            const web = new PopupMenu.PopupSubMenuMenuItem(T.web, true);
-            web.icon.gicon = ICON;
-            web.menu.addAction(T.webOpen, () => {
-                try {
-                    Gio.AppInfo.launch_default_for_uri(url, null);
-                } catch (e) {
-                    logError(e, 'Luch');
+        if (mode || url) {
+            const more = new PopupMenu.PopupSubMenuMenuItem(T.more, true);
+            more.icon.icon_name = 'view-more-symbolic';
+            // Do not disturb while presenting or mirroring: the three choices in sight, the one in use marked.
+            if (mode) {
+                more.menu.addMenuItem(new PopupMenu.PopupMenuItem(T.quiet, {reactive: false}));
+                for (const each of ['ask', 'on', 'off']) {
+                    const item = more.menu.addAction(T.quietModes[each], () => {
+                        this._proxy.Quiet = each;
+                    });
+                    item.setOrnament(each === mode ? PopupMenu.Ornament.DOT : PopupMenu.Ornament.NONE);
                 }
-            });
-            const item = new PopupMenu.PopupMenuItem(url, {reactive: false});
-            item.label.add_style_class_name('monospace');
-            web.menu.addMenuItem(item);
-            this._section.addMenuItem(web);
+            }
+            // Built-in web receiver: the URL for the TV; opening it on the PC is a quick test.
+            if (url) {
+                if (mode)
+                    more.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+                more.menu.addMenuItem(new PopupMenu.PopupMenuItem(T.web, {reactive: false}));
+                const item = new PopupMenu.PopupMenuItem(url, {reactive: false});
+                item.label.add_style_class_name('monospace');
+                more.menu.addMenuItem(item);
+                more.menu.addAction(T.webOpen, () => {
+                    try {
+                        Gio.AppInfo.launch_default_for_uri(url, null);
+                    } catch (e) {
+                        logError(e, 'Luch');
+                    }
+                });
+            }
+            this._section.addMenuItem(more);
         }
 
         // Everything a tester hands over, as one file; nothing is sent by itself.
@@ -722,6 +768,7 @@ class LuchToggle extends QuickMenuToggle {
             await this._proxy.WakeAsync(id);
         } catch (e) {
             logError(e, 'Luch: wake');
+            tell(T.failed(this._asleep.find(r => r[0] === id)?.[1] ?? T.title), e);
         }
         // It shows up through ReceiversChanged once it is on the LAN; until then the item says it is waking.
         GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 60, () => {
@@ -737,17 +784,33 @@ class LuchToggle extends QuickMenuToggle {
         return this._proxy.MirrorAsync(id, source);
     }
 
+    /**
+     * `fn` for a menu item or the tile: a refusal from luchd (the TV off, the accessibility switch off...) is told
+     * in plain words, not only logged; a TV that shows a code gets its dialog with PairChanged, and `fn` runs again
+     * once paired.
+     */
+    _guarded(id, name, fn) {
+        return () => fn().catch(e => {
+            if (asksForPairing(reason(e))) {
+                this._afterPairing.set(id, fn);
+                return;
+            }
+            logError(e, 'Luch');
+            tell(T.failed(name), e);
+        });
+    }
+
     _onClicked() {
         const mirroring = this._mirroring;
         if (mirroring.length > 0) {
-            for (const r of mirroring)
-                this._proxy.StopMirrorAsync(r[0]).catch(e => logError(e, 'Luch'));
+            for (const [id, name] of mirroring)
+                this._proxy.StopMirrorAsync(id).catch(e => tell(T.failed(name), e));
             return;
         }
         // One tap = the lowest-latency mode to the last (or only/first) receiver.
         const target = this._rows.find(r => r[0] === this._lastId) ?? this._rows.find(r => !isTv(r[0]));
         if (target)
-            this._mirror(target[0], 'fast').catch(e => logError(e, 'Luch'));
+            this._guarded(target[0], target[1], () => this._mirror(target[0], 'fast'))();
         else
             this.menu.open();
     }
