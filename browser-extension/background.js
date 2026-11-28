@@ -210,7 +210,18 @@ async function castFromTab(tabId, frameId, frameUrl, req) {
   const options = LuchCore.castOptions(Object.assign({}, request, { cookie }));
   if (sources.length > 1) options.sources = sources;
   casts.set(receiver, { tabId, frameId, frameUrl, via, request, sources, state: null, retried: false });
-  await ask("cast", { receiver, items: [src.url], options });
+  try {
+    await ask("cast", { receiver, items: [src.url], options });
+  } catch (e) {
+    casts.delete(receiver);
+    // The Luch receiver plays HLS and files; a DASH-only site (VK Video, ok.ru, Dzen, Vimeo) is said as such.
+    if (src.kind === "dash" && /media_failed|no source/i.test(e.message)) {
+      throw new Error(/^ru/i.test((req.page && req.page.lang) || "")
+        ? "Сайт отдаёт видео в DASH, а этот ТВ его пока не играет"
+        : "This site streams in DASH, which this TV cannot play yet");
+    }
+    throw e;
+  }
   await B.storage.local.set({ receiver });
   const name = (list.find((r) => r.id === receiver) || {}).name || "TV";
   return { receiver, name, via, kind: src.kind, url: src.url, qualities: sources.map((s) => ({ url: s.url, h: s.h })) };
