@@ -46,9 +46,14 @@ extension AppDelegate {
         panel.prompt = "Present"
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
-        panel.allowedContentTypes = ["pdf", "pptx", "ppt", "odp"].compactMap { UTType(filenameExtension: $0) }
+        panel.allowedContentTypes = ["pdf", "pptx", "ppt", "odp", "key"].compactMap { UTType(filenameExtension: $0) }
         NSApp.activate(ignoringOtherApps: true)
         guard panel.runModal() == .OK, let file = panel.url else { return }
+        present(file, on: r)
+    }
+
+    /// The slides on `r`, then the presenter view opened here; a refusal is shown.
+    func present(_ file: URL, on r: Receiver) {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
             let response = self.caster.run(["cmd": "present", "file": file.path], on: r)

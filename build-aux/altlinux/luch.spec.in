@@ -37,6 +37,13 @@ install -Dm755 target/release/luch-recv %buildroot%_bindir/luch-recv
 mkdir -p %buildroot%_userunitdir
 sed 's|%%h/.cargo/bin/luchd|%_bindir/luchd|' contrib/luchd.service > %buildroot%_userunitdir/luchd.service
 install -Dm644 /dev/stdin %buildroot%_prefix/lib/systemd/user-preset/90-luch.preset <<< 'enable luchd.service'
+# "Show on TV" from the file managers (README.md, "From the file manager").
+install -Dm644 assets/luch.svg %buildroot%_iconsdir/hicolor/scalable/apps/luch.svg
+install -Dm644 contrib/file-managers/applications/dev.luch.Show.desktop %buildroot%_desktopdir/dev.luch.Show.desktop
+install -Dm644 contrib/file-managers/applications/dev.luch.Present.desktop %buildroot%_desktopdir/dev.luch.Present.desktop
+install -Dm644 contrib/file-managers/nautilus/luch.py %buildroot%_datadir/nautilus-python/extensions/luch.py
+install -Dm755 contrib/file-managers/dolphin/luch-show.desktop %buildroot%_datadir/kio/servicemenus/luch-show.desktop
+install -Dm755 contrib/file-managers/dolphin/luch-present.desktop %buildroot%_datadir/kio/servicemenus/luch-present.desktop
 
 %post
 # luch-kms reads the scanout framebuffer of other clients, which only a privileged process may do.
@@ -50,5 +57,9 @@ setcap cap_sys_admin+ep %_bindir/luch-kms || :
 %_bindir/luch-recv
 %_userunitdir/luchd.service
 %_prefix/lib/systemd/user-preset/90-luch.preset
+%_iconsdir/hicolor/scalable/apps/luch.svg
+%_desktopdir/dev.luch.*.desktop
+%_datadir/nautilus-python/extensions/luch.py
+%_datadir/kio/servicemenus/luch-*.desktop
 
 %changelog

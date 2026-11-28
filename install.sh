@@ -1,6 +1,6 @@
 #!/bin/sh
 # Builds and installs Luch for the current user: binaries, luch-kms capability, user service,
-# GNOME extension. SPDX-License-Identifier: GPL-3.0-or-later
+# GNOME extension, "Show on TV" in the file managers. SPDX-License-Identifier: GPL-3.0-or-later
 set -eu
 cd "$(dirname "$0")"
 
@@ -24,6 +24,28 @@ if command -v gnome-shell >/dev/null 2>&1; then
     cp -r gnome-extension/luch@toxblh.github.io "$EXT"
     gnome-extensions enable luch@toxblh.github.io 2>/dev/null ||
         echo "Log out and back in, then: gnome-extensions enable luch@toxblh.github.io"
+fi
+
+# "Show on TV" from the file managers: Open With in any of them, the menu of GNOME Files (with nautilus-python) and
+# of Dolphin. They run luchctl by its full path: a desktop session's PATH often lacks ~/.cargo/bin.
+FM=contrib/file-managers
+DATA="${XDG_DATA_HOME:-$HOME/.local/share}"
+put() { # file, where, mode
+    install -Dm"$3" "$1" "$2"
+    sed -i "s|^Exec=luchctl |Exec=$BIN/luchctl |" "$2"
+}
+install -Dm644 assets/luch.svg "$DATA/icons/hicolor/scalable/apps/luch.svg"
+for f in "$FM"/applications/*.desktop; do put "$f" "$DATA/applications/${f##*/}" 644; done
+update-desktop-database "$DATA/applications" 2>/dev/null || :
+if command -v nautilus >/dev/null 2>&1; then
+    install -Dm644 "$FM/nautilus/luch.py" "$DATA/nautilus-python/extensions/luch.py"
+    echo "GNOME Files: 'Show on TV' in the menu once nautilus-python is installed and Files restarted (nautilus -q)"
+fi
+if command -v dolphin >/dev/null 2>&1; then
+    # Plasma 6 reads kio/servicemenus (and wants them executable), Plasma 5 kservices5/ServiceMenus.
+    for dir in kio/servicemenus kservices5/ServiceMenus; do
+        for f in "$FM"/dolphin/*.desktop; do put "$f" "$DATA/$dir/${f##*/}" 755; done
+    done
 fi
 
 echo "Done. Try: luchctl"

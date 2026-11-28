@@ -42,12 +42,13 @@ fn read_msg(rd: &mut BufReader<TcpStream>) -> io::Result<Option<Value>> {
 
 impl Channel {
     /// Connects from `local` (the address of the interface the receiver was found on, PROTOCOL.md section 2) and
-    /// says hello.
+    /// says hello, wanting `want` ("mirror", or "media" and "photo" for a cast).
     pub fn open(
         to: SocketAddrV4,
         local: Option<Ipv4Addr>,
         id: &str,
         name: &str,
+        want: &[&str],
     ) -> io::Result<Channel> {
         use socket2::{Domain, Protocol, Socket, Type};
         let s = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
@@ -60,7 +61,7 @@ impl Channel {
         wr.set_read_timeout(Some(ANSWER))?;
         let mut rd = BufReader::new(wr.try_clone()?);
         let mut w = &wr;
-        w.write_all(control::line(&control::hello(id, name, &["mirror"])).as_bytes())?;
+        w.write_all(control::line(&control::hello(id, name, want)).as_bytes())?;
         let welcome = read_msg(&mut rd)?.ok_or_else(|| bad("closed before welcome".into()))?;
         if welcome["t"] != "welcome" {
             return Err(bad(format!("expected welcome, got {welcome}")));
@@ -70,6 +71,29 @@ impl Channel {
 
     pub fn send(&mut self, v: &Value) -> io::Result<()> {
         self.wr.write_all(control::line(v).as_bytes())
+    }
+
+    /// The next line within `wait`, pings answered on the way; Ok(None) at the end of the connection.
+    pub fn recv(&mut self, wait: Duration) -> io::Result<Option<Value>> {
+        self.rd.get_ref().set_read_timeout(Some(wait))?;
+        loop {
+            let Some(v) = read_msg(&mut self.rd)? else {
+                return Ok(None);
+            };
+            if v["t"] == "ping" {
+                self.send(&json!({"t": "pong", "n": v["n"]}))?;
+                continue;
+            }
+            return Ok(Some(v));
+        }
+    }
+
+    /// This computer's address as the receiver sees it: where it fetches cast files from.
+    pub fn local_ip(&self) -> io::Result<Ipv4Addr> {
+        match self.wr.local_addr()? {
+            std::net::SocketAddr::V4(a) => Ok(*a.ip()),
+            a => Err(bad(format!("not IPv4: {a}"))),
+        }
     }
 
     /// Sends `start` and waits for `ready`, answering pings on the way. Returns the video and audio ports.
@@ -169,8 +193,14 @@ mod tests {
             json!({"t": "ping", "n": 2}),
             json!({"t": "stop", "by": "receiver", "reason": "back"}),
         ]);
-        let mut ch =
-            Channel::open(addr, Some(Ipv4Addr::LOCALHOST), "id-1", "Linux Laptop").unwrap();
+        let mut ch = Channel::open(
+            addr,
+            Some(Ipv4Addr::LOCALHOST),
+            "id-1",
+            "Linux Laptop",
+            &["mirror"],
+        )
+        .unwrap();
         assert_eq!(
             luch_proto::session::choose_codec(&ch.welcome, ""),
             "video/avc"
@@ -197,7 +227,7 @@ mod tests {
     #[test]
     fn a_refused_start_is_an_error() {
         let (addr, rx) = receiver(vec![json!({"t": "error", "code": "start_failed"})]);
-        let mut ch = Channel::open(addr, None, "id-1", "Linux Laptop").unwrap();
+        let mut ch = Channel::open(addr, None, "id-1", "Linux Laptop", &["mirror"]).unwrap();
         let e = ch.start(&video()).unwrap_err();
         assert!(e.to_string().contains("start_failed"), "{e}");
         drop(ch);

@@ -127,6 +127,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.toolTip = "Luch"
         statusItem.menu = menu
         menu.delegate = self
+        setUpShowFiles(statusItem.button)
 
         discovery.onUpdate = { [weak self] in
             DispatchQueue.main.async { self?.refreshReceivers() }
