@@ -3,13 +3,17 @@
 //! access unit the moment it is out. docs/windows.md says why each part is the way it is.
 //!
 //! The parts that are not Windows (the pipeline loop, pacing, the UDP sender, the control channel, the encoder
-//! settings) build and are tested on Linux too; `win` holds the Windows API calls.
+//! settings, casting files and what Explorer's menu is made of) build and are tested on Linux too; `win` holds the
+//! Windows API calls.
 
+pub mod cast;
 pub mod cli;
 pub mod control;
+pub mod gather;
 pub mod pace;
 pub mod pipeline;
 pub mod settings;
+pub mod shell;
 pub mod tx;
 
 #[cfg(windows)]

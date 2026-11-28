@@ -296,6 +296,10 @@ behind `cfg(windows)`, so a Linux `cargo test` runs its platform-independent hal
 | `win::audio` | WASAPI loopback, event-driven, MMCSS Pro Audio | same |
 | `win::sys` | QPC clock, timer resolution, priority, display awake, MMCSS, input desktop, high-res timer, qWAVE | same |
 | `win::wgc` | `IsSupported` and the plan | same |
+| `cast` | photos, a video, a sound or a PDF handed to the receiver (PROTOCOL.md 4a, 4b, 4g); the HTTP file server with `Range`, to the receiver's address only; sent again until Allow is pressed on the TV | yes, against a scripted receiver that fetches the file |
+| `gather` | one slideshow from the processes Explorer starts for a selection | yes, on loopback |
+| `shell` | the registry keys and Send To shortcuts of `install-shell` | yes, as data |
+| `win::shell` | writing them under HKCU, `IShellLinkW`, `SHChangeNotify`; no console and a message box when started from Explorer | `cargo check`/`clippy` |
 
 Not yet: the DDA cursor blend, Opus and the audio stream, NVENC/AMF/oneVPL direct, WGC capture, mDNS discovery
 (`DnsServiceBrowse` on Windows 10+), the service for the secure desktop, and HDR.
@@ -309,6 +313,38 @@ docker run --rm -v "$PWD":/src -w /src -v luch-cargo:/root/.cargo/registry -v lu
 ```
 
 The `.exe` link also needs `gcc-mingw-w64-x86-64`.
+
+## 10a. Showing files: `cast` and Explorer's menu
+
+```bat
+luch-win cast --to 192.168.1.20 film.mkv            :: the TV plays it itself, in the file's own quality
+luch-win cast --to 192.168.1.20 a.jpg b.jpg c.jpg   :: photos, left and right on the remote
+luch-win cast --to 192.168.1.20 talk.pdf            :: page by page
+luch-win install-shell --to 192.168.1.20 --name "Living room"
+luch-win install-shell                              :: the menus written again, after luch-win.exe was moved
+luch-win uninstall-shell
+```
+
+`cast` connects to the receiver's plain control port (there is no pairing from Windows yet), so the TV asks its
+person to Allow this PC each time; luch-win sends the cast again every 1.5 s for a minute until they do, as the Mac
+does. The files are served from this PC on a free port to the receiver's address only, under a random token, until
+the receiver is done: Back on the remote, the end of the video, another show taking the screen, or 35 s without a
+line from it. Office files are refused with a hint to save them as PDF (there is no LibreOffice to count on).
+Windows Defender Firewall asks once to let luch-win.exe accept connections: allow it on private networks, or the TV
+cannot fetch the files.
+
+`install-shell` needs no administrator: it writes only HKCU keys and the user's Send To folder.
+
+- **Context menu** of photos, videos, sounds and PDFs (`HKCU\Software\Classes\SystemFileAssociations\{image,video,
+  audio,.pdf}\shell\LuchShow`): with one receiver the item is *Show on Living room*; with several, *Show on TV*
+  opens a submenu of their names (`SubCommands` and the item's own `shell` key). On Windows 11 it is under *Show
+  more options*: the new menu only takes handlers of packaged apps (an `IExplorerCommand` in an MSIX), which is for
+  later. Explorer starts the command once per selected file; the first process listens on 127.0.0.1:47819 for a
+  moment and the others hand it their files, so ten photos are one slideshow in name order.
+- **Send To**: a shortcut per receiver (*Living room (Luch TV)*), which gets every selected file in one process.
+
+The receivers are kept in `%APPDATA%\Luch\receivers`, a line per receiver (name, a tab, address:port). With mDNS
+discovery (`DnsServiceBrowse`) the list can later come from the network, as on Linux and the Mac.
 
 ## 11. Real-device test plan (sender)
 
