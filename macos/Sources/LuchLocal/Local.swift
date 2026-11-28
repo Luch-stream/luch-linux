@@ -6,10 +6,7 @@ import Foundation
 import LuchProto
 
 public func defaultSocketPath() -> String {
-    let dir = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Library/Application Support/Luch", isDirectory: true)
-    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-    return dir.appendingPathComponent("control.sock").path
+    Home.support.appendingPathComponent("control.sock").path
 }
 
 public final class LocalServer {

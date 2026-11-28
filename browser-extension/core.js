@@ -252,6 +252,34 @@
   }
 
   /**
+   * Why there is nothing to cast for a video: "not_started" (it has no source yet, or the page loaded nothing: an
+   * iframe player waiting for its first click, an ad first), "pieces" (the page loaded pieces of a stream but no
+   * playlist for them: Bilibili's player puts its DASH together from data in the page), else "hidden".
+   */
+  function whyNoSource(video, seenCount, piecesCount) {
+    if (piecesCount > 0 && !seenCount) return "pieces";
+    if (!(video && video.currentSrc) || !seenCount) return "not_started";
+    return "hidden";
+  }
+
+  const NO_SOURCE = {
+    en: {
+      not_started: "The video has not loaded yet (or an ad plays first): start it on the page, then send it again",
+      pieces: "This player builds its video from pieces with no playlist the TV could use: it cannot be sent",
+      hidden: "no link to this video (it may be protected)",
+    },
+    ru: {
+      not_started: "Видео ещё не загрузилось (или идёт реклама): запустите его на странице и нажмите снова",
+      pieces: "Этот плеер собирает видео из кусков без плейлиста, который мог бы открыть ТВ: показать его нельзя",
+      hidden: "Ссылки на это видео нет (возможно, оно защищено)",
+    },
+  };
+
+  function noSourceText(why, lang) {
+    return NO_SOURCE[/^ru/i.test(lang || "") ? "ru" : "en"][why];
+  }
+
+  /**
    * Whether a receiver plays DASH, from the MIME types its welcome listed (`media_types`): true, false, or null when
    * its sender has not talked to it yet.
    */
@@ -344,12 +372,12 @@
   /** "subtitles" for a link the page loaded: WebVTT, SubRip or ASS by its extension or type. */
   function isSubtitle(url, type) {
     const c = (type || "").toLowerCase();
-    // A player's preview pictures and chapter marks come as WebVTT too (Mux's storyboard.vtt).
-    if (/storyboard|thumbnail|sprite|chapters|preview/i.test(pathOf(url))) return false;
+    // A player's preview pictures and chapter marks come as WebVTT too (Mux's storyboard.vtt, JW Player's strips/).
+    if (/storyboard|thumbnail|sprite|chapters|preview|\/strips?\//i.test(pathOf(url))) return false;
     return /\.(vtt|srt|ass|ssa)(\?|$)/i.test(pathOf(url)) || c.includes("text/vtt") || c.includes("subrip");
   }
 
-  const api = { playsDash, youtubeLink, isSegment, mediaElements, chooseVideo, qualityOf, variantLinks, sourcesOf, isSubtitle, kindOf, mimeOf, isPrivateHost, chooseVia, pickSource, castOptions, shouldRetryRelayed, clock,
+  const api = { whyNoSource, noSourceText, playsDash, youtubeLink, isSegment, mediaElements, chooseVideo, qualityOf, variantLinks, sourcesOf, isSubtitle, kindOf, mimeOf, isPrivateHost, chooseVia, pickSource, castOptions, shouldRetryRelayed, clock,
     positionNow, MIME };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.LuchCore = api;

@@ -3,6 +3,7 @@
 // together (docs/research/sync-multiroom.md 6.7). The microphone is opened only then, and macOS asks only then.
 // SPDX-License-Identifier: GPL-3.0-or-later
 import AppKit
+import LuchProto
 import LuchEngine
 import LuchFind
 import LuchLocal
@@ -19,8 +20,7 @@ extension Together {
             let results = try calibrator.run()
             // Kept for a look afterwards: the recording, and where each sweep was expected and found.
             let stamp = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-")
-            let dir = FileManager.default.homeDirectoryForCurrentUser
-                .appendingPathComponent("Library/Application Support/Luch/calibration/\(stamp)")
+            let dir = Home.support.appendingPathComponent("calibration/\(stamp)")
             try? calibrator.save(to: dir)
             show("Playing")
             onMain(hooks.changed)

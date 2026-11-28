@@ -5,14 +5,12 @@
 import CryptoKit
 import Darwin
 import Foundation
+import LuchProto
 import Security
 
 /// ~/Library/Application Support/Luch: the sender's id, certificate, pins and reports.
 public func supportDirectory() -> URL {
-    let dir = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent("Library/Application Support/Luch", isDirectory: true)
-    try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-    return dir
+    Home.support
 }
 
 public typealias Fingerprint = [UInt8]

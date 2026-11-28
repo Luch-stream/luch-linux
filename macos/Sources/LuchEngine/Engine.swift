@@ -178,9 +178,7 @@ public func ensureScreenRecording(wait: Bool) -> Bool {
 /// Stable sender identity, `~/Library/Application Support/Luch/id`.
 public func senderIdentity() -> (id: String, name: String) {
     let fm = FileManager.default
-    let dir = fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Luch", isDirectory: true)
-    try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
-    let file = dir.appendingPathComponent("id")
+    let file = Home.support.appendingPathComponent("id")
     if let s = try? String(contentsOf: file, encoding: .utf8), !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
         return (s.trimmingCharacters(in: .whitespacesAndNewlines), hostName())
     }

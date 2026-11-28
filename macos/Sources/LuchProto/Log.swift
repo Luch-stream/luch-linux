@@ -19,7 +19,7 @@ private var sink: RotatingLog?
 
 /// The app's log: `~/Library/Logs/Luch/luch.log`, where Console.app lists it under Log Reports.
 public func defaultLogFile() -> String {
-    let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/Luch", isDirectory: true)
+    let dir = Home.logs
     try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
     return dir.appendingPathComponent("luch.log").path
 }
