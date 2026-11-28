@@ -278,11 +278,16 @@ impl Server {
             .unwrap_or("")
             .to_string();
         if is_playlist(&final_url, &ctype) && status < 300 {
+            let gzip = res
+                .headers()
+                .get("content-encoding")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.to_ascii_lowercase().contains("gzip"));
             let body = res.bytes().await.map_err(io::Error::other)?;
-            if body.len() > MAX_PLAYLIST {
+            let Some(body) = playlist_text(&body, gzip) else {
                 respond(wr, 502, &[], b"").await?;
                 return Ok(true);
-            }
+            };
             let text = String::from_utf8_lossy(&body);
             let out = rewrite_playlist(&text, &final_url, |abs| {
                 let t = self.share(
@@ -597,6 +602,22 @@ async fn send_file(
 }
 
 // ---------- playlists ----------
+
+/// A playlist's bytes as text: some servers gzip it whether asked or not (a TV channel's CDN), and reqwest here
+/// does not unpack. None when it is too big.
+fn playlist_text(body: &[u8], gzip: bool) -> Option<Vec<u8>> {
+    use std::io::Read;
+    if !gzip && !body.starts_with(&[0x1f, 0x8b]) {
+        return (body.len() <= MAX_PLAYLIST).then(|| body.to_vec());
+    }
+    let mut out = Vec::new();
+    let mut dec = flate2::read::MultiGzDecoder::new(body).take(MAX_PLAYLIST as u64 + 1);
+    match dec.read_to_end(&mut out) {
+        Ok(_) if out.len() <= MAX_PLAYLIST => Some(out),
+        Ok(_) => None,
+        Err(_) => (body.len() <= MAX_PLAYLIST).then(|| body.to_vec()),
+    }
+}
 
 pub fn is_playlist(url: &str, ctype: &str) -> bool {
     let c = ctype.to_ascii_lowercase();
@@ -1267,6 +1288,14 @@ mod tests {
                     } else if path == "/v/index.m3u8" {
                         (200, "application/vnd.apple.mpegurl",
                          b"#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n#EXTINF:4,\nseg0.ts\n#EXTINF:4,\n/v/seg1.ts?x=1\n".to_vec())
+                    } else if path == "/v/gz.m3u8" {
+                        let mut gz = flate2::write::GzEncoder::new(
+                            Vec::new(),
+                            flate2::Compression::default(),
+                        );
+                        std::io::Write::write_all(&mut gz, b"#EXTM3U\n#EXTINF:4,\nseg0.ts\n")
+                            .unwrap();
+                        (200, "application/vnd.apple.mpegurl", gz.finish().unwrap())
                     } else if path.starts_with("/v/seg") || path == "/v/key.bin" {
                         (
                             if range.is_empty() { 200 } else { 206 },
@@ -1276,7 +1305,13 @@ mod tests {
                     } else {
                         (404, "text/plain", Vec::new())
                     };
-                    let head = format!("HTTP/1.1 {code} X\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+                    // A CDN that gzips its playlists whether asked or not.
+                    let enc = if path == "/v/gz.m3u8" {
+                        "Content-Encoding: gzip\r\n"
+                    } else {
+                        ""
+                    };
+                    let head = format!("HTTP/1.1 {code} X\r\nContent-Type: {ctype}\r\n{enc}Content-Length: {}\r\nConnection: close\r\n\r\n", body.len());
                     let _ = wr.write_all(head.as_bytes()).await;
                     let _ = wr.write_all(&body).await;
                 });
@@ -1320,6 +1355,21 @@ mod tests {
             String::from_utf8(body).unwrap(),
             "data /v/seg1.ts?x=1 bytes=0-9"
         );
+
+        // A playlist gzipped without being asked is unpacked before it is rewritten.
+        let gz = srv.share(
+            Item::Relay {
+                url: format!("http://{up}/v/gz.m3u8"),
+                headers: vec![("Cookie".to_string(), "s=1".to_string())],
+            },
+            me,
+            "",
+        );
+        let (code, _, body) = get(addr, &format!("/{gz}/gz.m3u8"), None).await;
+        assert_eq!(code, 200);
+        let text = String::from_utf8(body).unwrap();
+        assert!(text.starts_with("#EXTM3U\n"), "{text}");
+        assert!(text.lines().nth(2).unwrap().starts_with(&ours), "{text}");
 
         // Without the page's cookie the origin refuses, and that is passed on.
         let bare = srv.share(
