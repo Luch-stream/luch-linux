@@ -208,3 +208,13 @@ test("JW Player's thumbnail strips are no subtitles", () => {
   assert.equal(c.isSubtitle("https://cdn.player.example/strips/LraA0yKW-120.vtt", "text/vtt"), false);
   assert.equal(c.isSubtitle("https://cdn.player.example/tracks/LraA0yKW-en.vtt", "text/vtt"), true);
 });
+
+test("why nothing can be cast: not started, pieces without a playlist (Bilibili), or hidden", () => {
+  const blobVideo = blob("bilibili.example");
+  assert.equal(c.whyNoSource(blobVideo, 0, 37), "pieces");
+  assert.equal(c.whyNoSource(blobVideo, 0, 0), "not_started");
+  assert.equal(c.whyNoSource({ currentSrc: "", src: "", sources: [] }, 3, 0), "not_started");
+  assert.equal(c.whyNoSource(blobVideo, 2, 5), "hidden");
+  assert.match(c.noSourceText("pieces", "ru-RU"), /кусков/);
+  assert.match(c.noSourceText("not_started", "en-GB"), /start it on the page/);
+});

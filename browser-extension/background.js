@@ -10,6 +10,7 @@ const HOST = "dev.luch.host";
 
 const seen = new Map(); // tabId -> [{url, kind, type, frameId}], oldest first, at most 40
 const subsSeen = new Map(); // tabId -> subtitle links the page loaded (VTT, SRT, ASS)
+const pieces = new Map(); // tabId -> how many pieces of streams the page loaded (none of them castable)
 function remember(tabId, url, type, frameId) {
   if (tabId < 0) return;
   if (LuchCore.isSubtitle(url, type)) {
@@ -20,7 +21,10 @@ function remember(tabId, url, type, frameId) {
   }
   const kind = LuchCore.kindOf(url, type);
   if (!kind) return;
-  if (kind === "file" && LuchCore.isSegment(url)) return; // a piece of a stream, not a file to cast
+  if (kind === "file" && LuchCore.isSegment(url)) {
+    pieces.set(tabId, (pieces.get(tabId) || 0) + 1); // a piece of a stream, not a file to cast
+    return;
+  }
   const list = seen.get(tabId) || [];
   if (list.some((s) => s.url === url)) return;
   list.push({ url, kind, type: type || "", frameId });
@@ -40,11 +44,13 @@ B.webNavigation &&
     if (d.frameId === 0) {
       seen.delete(d.tabId);
       subsSeen.delete(d.tabId);
+      pieces.delete(d.tabId);
     }
   });
 B.tabs.onRemoved.addListener((tabId) => {
   seen.delete(tabId);
   subsSeen.delete(tabId);
+  pieces.delete(tabId);
 });
 
 /** Which of a file's sibling qualities exist: a 1-byte request each, 3 s at most for all. */
@@ -194,12 +200,8 @@ async function castFromTab(tabId, frameId, frameUrl, req) {
   const dash = LuchCore.playsDash(list.find((r) => r.id === receiver));
   const src = LuchCore.pickSource(req.video, seen.get(tabId), frameId, dash);
   if (!src) {
-    // A player that has not started yet loads nothing (most iframe players wait for their first click, some
-    // show an ad first, from a blob of its own).
-    if (!req.video.currentSrc || !(seen.get(tabId) || []).length) throw new Error(req.page && /^ru/i.test(req.page.lang || "")
-      ? "Видео ещё не загрузилось (или идёт реклама): запустите его на странице и нажмите снова"
-      : "The video has not loaded yet (or an ad plays first): start it on the page, then send it again");
-    throw new Error("no link to this video (it may be protected)");
+    const why = LuchCore.whyNoSource(req.video, (seen.get(tabId) || []).length, pieces.get(tabId) || 0);
+    throw new Error(LuchCore.noSourceText(why, req.page && req.page.lang));
   }
   const { relay, trusted = [] } = await B.storage.local.get(["relay", "trusted"]);
   const via = LuchCore.chooseVia(src.url, relay);
