@@ -322,8 +322,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             menu.addItem(.run("Stop Mirroring", symbol: "stop.circle") { [weak self] in self?.stopMirror() })
         }
+        let playingTogether = together.addStatusItems(to: menu)
         if needsScreenRecording { screenRecordingItems().forEach(menu.addItem) }
-        if busy || needsScreenRecording { menu.addItem(.separator()) }
+        if busy || playingTogether || needsScreenRecording { menu.addItem(.separator()) }
 
         // The first time: where a TV comes from, and the harder search right here, not two menus down.
         if receivers.isEmpty {
@@ -445,6 +446,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         bitrate.submenu = bitrateMenu
         settings.addItem(bitrate)
+        together.addAdvancedItems(to: settings, receivers: receivers)
 
         parent.submenu = settings
         return parent

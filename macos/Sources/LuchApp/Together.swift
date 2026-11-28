@@ -1,14 +1,19 @@
 // Playing in step on several receivers (PROTOCOL.md 4k), each receiver's sound mode and correction, and the latency
-// lab (4j): the local API's `group`, `offset`, `audio` and `latency` commands, and their places in the menu.
+// lab (4j): the local API's `group`, `group_add`, `group_remove`, `offset`, `audio` and `latency` commands, and their
+// places in the menu: one "Play on Several TVs…" with three ready choices, and while it plays who is in it with
+// Remove, Add for the others, how far behind the screen it is, and Calibrate with Microphone.
 // Runs the commands on the local socket's thread (a group waits for every receiver); AppKit only on the main one.
 // SPDX-License-Identifier: GPL-3.0-or-later
 import AppKit
 import LuchEngine
+import LuchLocal
 import LuchNet
 import LuchProto
+import LuchTV
 
 final class Together {
-    static let commands: Set<String> = ["group", "group_stats", "offset", "audio", "latency", "calibrate"]
+    static let commands: Set<String> = ["group", "group_add", "group_remove", "group_stats", "offset", "audio", "latency",
+                                        "calibrate"]
 
     /// What the app around it knows and does; set once at launch, called on the main thread.
     struct Hooks {
@@ -65,6 +70,8 @@ final class Together {
         do {
             switch request["cmd"] as? String ?? "" {
             case "group": return try startGroup(request)
+            case "group_add": return try addMember(request)
+            case "group_remove": return try removeMember(request)
             case "group_stats": return ["group": currentGroup()?.stats ?? [:]]
             case "offset": return try setOffset(request)
             case "audio": return try setAudio(request)
@@ -140,13 +147,13 @@ final class Together {
             self.lock.lock()
             if self.group === s { self.group = nil }
             self.lock.unlock()
-            self.show(reason == "menu" ? "" : "Ended: \(reason)")
+            self.show(Plain.stopped(reason) ?? "")
         }
         show("Connecting to \(members.map(\.receiver.name).joined(separator: ", "))…")
         do {
             try s.start()
         } catch {
-            show("Error: \(error.localizedDescription)")
+            show(Plain.problem(error.localizedDescription) ?? "")
             throw error
         }
         lock.lock()
@@ -155,6 +162,46 @@ final class Together {
         lock.unlock()
         if let labID { s.send(["t": "latency", "on": true], to: labID) }
         show("Playing")
+    }
+
+    /// `luchctl group add <r>[=role]`: one more receiver into the group that plays; no role is the group's default.
+    private func addMember(_ request: [String: Any]) throws -> [String: Any] {
+        guard let g = currentGroup() else { throw Failure("no group is playing: start one with `luchctl group`") }
+        let r = try find(request["r"] as? String)
+        let text = request["role"] as? String ?? ""
+        guard let role = text.isEmpty ? g.defaultJoinRole : GroupRole(rawValue: text) else {
+            throw Failure("role video|audio|both, not \(text)")
+        }
+        if onMain({ hooks.mirroring()?.id == r.id }) { throw Failure("\(r.name) is playing already: stop it first") }
+        show("Adding \(r.name)…")
+        do {
+            try g.add(GroupMember(r, role: role))
+        } catch {
+            show("")
+            throw error
+        }
+        show("Playing")
+        return ["ok": true]
+    }
+
+    /// `luchctl group remove <r>`: one out, the others play on; the last one out ends the group.
+    private func removeMember(_ request: [String: Any]) throws -> [String: Any] {
+        let r = try find(request["r"] as? String)
+        guard currentGroup()?.remove(r.id) != nil else { throw Failure("\(r.name) is not playing in a group") }
+        onMain(hooks.changed)
+        return ["ok": true]
+    }
+
+    /// From the menu, off the main thread: a refusal in plain words where the group's status shows.
+    private func change(_ run: @escaping () throws -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            do {
+                try run()
+            } catch {
+                self?.show(Plain.problem(error.localizedDescription) ?? "")
+            }
+            DispatchQueue.main.async { self?.hooks.changed() }
+        }
     }
 
     /// Ends the group, if one plays.
@@ -272,40 +319,115 @@ final class Together {
         DispatchQueue.main.async { [weak self] in self?.statusItem?.title = line }
     }
 
-    /// "In step · D 150 ms · 3 receivers", the picture's D too when it differs.
+    /// "On 3 TVs · All in step, 0.24 s behind this screen".
     static func delayLine(_ g: [String: Any]) -> String {
-        let dv = (g["d_video_ms"] as? NSNumber)?.doubleValue ?? 0
-        let da = (g["d_audio_ms"] as? NSNumber)?.doubleValue ?? 0
-        let n = (g["members"] as? [[String: Any]] ?? []).filter { $0["present"] as? Bool == true }.count
-        let d = dv == da ? String(format: "D %.0f ms", da) : String(format: "D picture %.0f, sound %.0f ms", dv, da)
-        return "In step · \(d) · \(n) receivers"
+        let n = (g["members"] as? [[String: Any]] ?? []).count
+        return "On \(n) TVs · " + GroupWords.delay(g)
     }
 
-    /// The top of the menu: Play Together, and while a group plays its D and Stop.
+    /// Luch receivers that can play in a group (not TVs without Luch, not a browser).
+    private func candidates(_ receivers: [Receiver]) -> [Receiver] {
+        receivers.filter { TVKind.of($0.id) == .luch && $0.service != "web" }
+    }
+
+    /// The top of the menu while a group plays: what it is doing and Stop, as for a single session. False when none
+    /// plays.
+    @discardableResult
+    func addStatusItems(to menu: NSMenu) -> Bool {
+        guard let g = currentGroup() else { return false }
+        let item = NSMenuItem.label(Self.delayLine(g.stats["group"] as? [String: Any] ?? [:]))
+        statusItem = item
+        menu.addItem(item)
+        menu.addItem(.run("Stop on All TVs", symbol: "stop.circle") { [weak self] in
+            DispatchQueue.global(qos: .userInitiated).async { self?.stop() }
+        })
+        return true
+    }
+
+    /// After the TVs: Play on Several TVs…, or while a group plays its TVs with Remove, Add for the others, and
+    /// Calibrate with Microphone.
     func addMenuItems(to menu: NSMenu, receivers: [Receiver]) {
         lock.lock()
         let (g, text) = (group, status)
         lock.unlock()
-        menu.addItem(.run("Play Together…", enabled: receivers.count >= 2, symbol: "hifispeaker.2") { [weak self] in
-            self?.choose(from: receivers)
-        })
-        if let g {
-            let names = receivers.filter { g.receiverIDs.contains($0.id) }.map(\.name).joined(separator: ", ")
-            menu.addItem(.label("\(g.soundOnly ? "Sound" : "Screen") on \(names) (\(g.mode == .watching ? "watching" : "interactive"))"))
-            let item = NSMenuItem.label(Self.delayLine(g.stats["group"] as? [String: Any] ?? [:]))
-            statusItem = item
-            menu.addItem(item)
-            menu.addItem(calibrateItem(g))
-            menu.addItem(.run("Stop Playing Together", symbol: "stop.circle") { [weak self] in
-                DispatchQueue.global(qos: .userInitiated).async { self?.stop() }
+        guard let g else {
+            let can = candidates(receivers)
+            menu.addItem(.run("Play on Several TVs…", enabled: can.count >= 2, symbol: "hifispeaker.2") { [weak self] in
+                self?.choose(from: can)
             })
-        } else if !text.isEmpty {
-            menu.addItem(.label(text))
+            if !text.isEmpty { menu.addItem(.label(text)) }
+            return
+        }
+        let members = (g.stats["group"] as? [String: Any])?["members"] as? [[String: Any]] ?? []
+        let names = Dictionary(receivers.map { ($0.id, $0.name) }, uniquingKeysWith: { a, _ in a })
+        let playing = g.members
+        let parent = NSMenuItem(title: GroupWords.title(playing.map { names[$0.receiver.id] ?? $0.receiver.name }),
+                                action: nil, keyEquivalent: "")
+        parent.image = NSImage(systemSymbolName: "hifispeaker.2", accessibilityDescription: nil)
+        let sub = NSMenu()
+        for m in playing {
+            let role = members.first { $0["id"] as? String == m.receiver.id }?["role"] as? String ?? m.role.rawValue
+            let id = m.receiver.id
+            sub.addItem(.run("Remove \(m.receiver.name) (\(GroupWords.role(role)))", symbol: "minus.circle") { [weak self] in
+                self?.change { _ = g.remove(id) }
+            })
+        }
+        let others = candidates(receivers).filter { r in !playing.contains { $0.receiver.id == r.id } }
+        if !others.isEmpty { sub.addItem(.separator()) }
+        for r in others { sub.addItem(addItem(r, to: g)) }
+        sub.addItem(.separator())
+        sub.addItem(calibrateItem(g))
+        parent.submenu = sub
+        menu.addItem(parent)
+        if !text.isEmpty && text != "Playing" { menu.addItem(.label(text)) }
+    }
+
+    private func addItem(_ r: Receiver, to g: GroupSession, title: String? = nil) -> NSMenuItem {
+        .run(title ?? "Add \(r.name)", symbol: "plus.circle") { [weak self] in
+            self?.change {
+                self?.show("Adding \(r.name)…")
+                try g.add(GroupMember(r, role: g.defaultJoinRole))
+                self?.show("Playing")
+            }
         }
     }
 
-    /// A receiver's own items: its sound, its correction in a group, the latency lab.
+    /// Settings ▸ Advanced: the latency lab, a tool for measuring, per receiver.
+    func addAdvancedItems(to menu: NSMenu, receivers: [Receiver]) {
+        let parent = NSMenuItem(title: "Latency Lab", action: nil, keyEquivalent: "")
+        parent.image = NSImage(systemSymbolName: "stopwatch", accessibilityDescription: nil)
+        let sub = NSMenu()
+        lock.lock()
+        let labID = lab?.id
+        lock.unlock()
+        for r in candidates(receivers) {
+            let on = labID == r.id
+            let item = NSMenuItem.run(r.name) { [weak self] in
+                DispatchQueue.global(qos: .userInitiated).async {
+                    guard let url = try? self?.setLab(!on, for: r.id), let link = URL(string: url) else { return }
+                    DispatchQueue.main.async { NSWorkspace.shared.open(link) }
+                }
+            }
+            item.state = on ? .on : .off
+            sub.addItem(item)
+        }
+        parent.submenu = sub
+        parent.isEnabled = !sub.items.isEmpty
+        menu.addItem(parent)
+    }
+
+    /// A receiver's own items: in or out of the group that plays, its sound, and its timing in a group.
     func addReceiverItems(to m: NSMenu, receiver r: Receiver) {
+        if let g = currentGroup() {
+            if g.receiverIDs.contains(r.id) {
+                m.addItem(.run("Remove from Several TVs", symbol: "minus.circle") { [weak self] in
+                    self?.change { _ = g.remove(r.id) }
+                })
+                m.addItem(offsetItem(r))
+            } else if onMain({ hooks.mirroring()?.id != r.id }) {
+                m.addItem(addItem(r, to: g, title: "Add to Several TVs"))
+            }
+        }
         let current = store.audioMode(r.id)
         let sound = NSMenuItem(title: "Sound: \(current.rawValue)", action: nil, keyEquivalent: "")
         let soundMenu = NSMenu()
@@ -320,25 +442,13 @@ final class Together {
         }
         sound.submenu = soundMenu
         m.addItem(sound)
-        m.addItem(offsetItem(r))
-        lock.lock()
-        let labOn = lab?.id == r.id
-        lock.unlock()
-        let labItem = NSMenuItem.run("Latency Lab", symbol: "stopwatch") { [weak self] in
-            DispatchQueue.global(qos: .userInitiated).async {
-                guard let url = try? self?.setLab(!labOn, for: r.id), let link = URL(string: url) else { return }
-                DispatchQueue.main.async { NSWorkspace.shared.open(link) }
-            }
-        }
-        labItem.state = labOn ? .on : .off
-        m.addItem(labItem)
     }
 
-    /// "Offset" and a slider of ±300 ms: this receiver's sound and picture later (right) or sooner, in a group.
+    /// "Timing" and a slider of ±300 ms: this receiver's sound and picture later (right) or sooner, in a group.
     private func offsetItem(_ r: Receiver) -> NSMenuItem {
         let ms = store.currentOffset(r.id)
         let row = NSView(frame: NSRect(x: 0, y: 0, width: 260, height: 26))
-        let label = NSTextField(labelWithString: "Offset")
+        let label = NSTextField(labelWithString: "Timing")
         label.font = .menuFont(ofSize: 13)
         label.frame = NSRect(x: 22, y: 5, width: 44, height: 16)
         row.addSubview(label)
@@ -363,58 +473,110 @@ final class Together {
         let item = NSMenuItem()
         item.view = row
         item.representedObject = action
-        item.toolTip = "This receiver's own correction in a group (positive = later), for its output route"
+        item.toolTip = "Later (right) or sooner (left) than the other TVs, when it does not sound together with them"
         return item
     }
 
     private static func ms(_ v: Double) -> String { String(format: "%+.0f ms", v) }
 
-    /// The Play Together dialog: which receivers, what each presents, the screen or the sound, and the timing.
+    /// The Play on Several TVs dialog: one of three ready choices, the TVs (all ticked), the picture's TV for "Screen
+    /// Here, Sound There", and the timing under More Options. No roles or modes to understand.
     private func choose(from receivers: [Receiver]) {
+        var choice = GroupChoice(receivers.map { ($0.id, $0.name) })
         let alert = NSAlert()
-        alert.messageText = "Play Together"
-        alert.informativeText = "The receivers play in step. The first one with the picture shows it; with every one on Sound, this Mac's sound plays on all of them."
+        alert.messageText = "Play on Several TVs"
+        alert.informativeText = "Pick what to play and where. The TVs play it at the same moment."
         alert.addButton(withTitle: "Play")
         alert.addButton(withTitle: "Cancel")
-        let roles: [(String, GroupRole)] = [("Picture and Sound", .both), ("Picture", .video), ("Sound", .audio)]
-        let rowH: CGFloat = 26
-        let height = CGFloat(receivers.count + 2) * rowH + 8
-        let view = NSView(frame: NSRect(x: 0, y: 0, width: 380, height: height))
-        var rows: [(NSButton, NSPopUpButton)] = []
-        for (i, r) in receivers.enumerated() {
-            let y = height - CGFloat(i + 1) * rowH
-            let check = NSButton(checkboxWithTitle: r.name, target: nil, action: nil)
-            check.frame = NSRect(x: 0, y: y, width: 200, height: 22)
-            let role = NSPopUpButton(frame: NSRect(x: 210, y: y - 2, width: 170, height: 24))
-            role.addItems(withTitles: roles.map(\.0))
-            role.selectItem(at: i == 0 ? 0 : 2)
-            view.addSubview(check)
-            view.addSubview(role)
-            rows.append((check, role))
-        }
-        let what = NSPopUpButton(frame: NSRect(x: 0, y: rowH, width: 380, height: 24))
-        what.addItems(withTitles: ["This Mac's screen and sound", "This Mac's sound only"])
-        let timing = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 380, height: 24))
-        timing.addItems(withTitles: ["Interactive: the picture as fast as alone, the sound waits for it",
-                                     "Watching: every receiver at the same delay (rooms, TV walls)"])
-        view.addSubview(what)
-        view.addSubview(timing)
-        alert.accessoryView = view
-        NSApp.activate(ignoringOtherApps: true)
-        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let rowH: CGFloat = 24
+        let width: CGFloat = 400
+        let height = CGFloat(GroupPreset.allCases.count) * 40 + 24 + CGFloat(receivers.count) * rowH + 70
+        let view = NSView(frame: NSRect(x: 0, y: 0, width: width, height: height))
+        var y = height
+        // Radio buttons of one superview act as one group: the choices apart from the picture's TV.
+        let presetBox = NSView(frame: view.bounds)
+        view.addSubview(presetBox)
+        var presetButtons: [NSButton] = []
+        var rows: [(check: NSButton, picture: NSButton)] = []
+        let timing = NSPopUpButton(frame: .zero)
+        let note = NSTextField(labelWithString: "")
+        let actions = Actions()
 
-        var members = zip(receivers, rows).filter { $0.1.0.state == .on }
-            .map { GroupMember($0.0, role: roles[$0.1.1.indexOfSelectedItem].1) }
-        guard members.count >= 2 else { return show("Tick two or more receivers") }
-        // Nobody shows the picture: music on every receiver, this Mac's sound only, all at one delay.
-        let soundOnly = what.indexOfSelectedItem == 1 || !members.contains { $0.role.video }
-        // The picture's receiver leads (luchd: the first one shows it).
-        if let lead = members.firstIndex(where: { $0.role.video }) { members.insert(members.remove(at: lead), at: 0) }
-        let mode: SyncMode = soundOnly || timing.indexOfSelectedItem == 1 ? .watching : .interactive
+        func draw() {
+            for (b, p) in zip(presetButtons, GroupPreset.allCases) { b.state = p == choice.preset ? .on : .off }
+            for (row, r) in zip(rows, receivers) {
+                row.check.state = choice.ticked.contains(r.id) ? .on : .off
+                row.picture.isHidden = choice.preset != .split || !choice.ticked.contains(r.id)
+                row.picture.state = choice.picture == r.id ? .on : .off
+            }
+            timing.isEnabled = choice.preset != .music
+            timing.selectItem(at: (choice.timing ?? choice.preset.mode) == .watching ? 0 : 1)
+            if case .failure(let why) = choice.plan() { note.stringValue = why.description } else { note.stringValue = "" }
+            alert.buttons.first?.isEnabled = (try? choice.plan().get()) != nil
+        }
+
+        for p in GroupPreset.allCases {
+            y -= 40
+            let b = NSButton(radioButtonWithTitle: p.title, target: actions, action: #selector(Actions.run(_:)))
+            b.frame = NSRect(x: 0, y: y + 18, width: width, height: 20)
+            actions.add(b) { choice.preset = p; draw() }
+            let detail = NSTextField(labelWithString: p.detail)
+            detail.font = .systemFont(ofSize: 11)
+            detail.textColor = .secondaryLabelColor
+            detail.frame = NSRect(x: 20, y: y + 2, width: width - 20, height: 16)
+            presetBox.addSubview(b)
+            presetBox.addSubview(detail)
+            presetButtons.append(b)
+        }
+        y -= 24
+        let which = NSTextField(labelWithString: "On which TVs:")
+        which.frame = NSRect(x: 0, y: y + 2, width: width, height: 18)
+        view.addSubview(which)
+        for r in receivers {
+            y -= rowH
+            let check = NSButton(checkboxWithTitle: r.name, target: actions, action: #selector(Actions.run(_:)))
+            check.frame = NSRect(x: 0, y: y, width: 260, height: 22)
+            actions.add(check) { [weak check] in choice.tick(r.id, check?.state == .on); draw() }
+            // "Screen Here, Sound There": which TV shows the picture; the others play its sound.
+            let picture = NSButton(radioButtonWithTitle: "Picture here", target: actions, action: #selector(Actions.run(_:)))
+            picture.frame = NSRect(x: 270, y: y, width: 130, height: 22)
+            actions.add(picture) { choice.setPicture(r.id); draw() }
+            view.addSubview(check)
+            view.addSubview(picture)
+            rows.append((check, picture))
+        }
+        y -= 34
+        let more = NSTextField(labelWithString: "More options — when the TVs lag behind each other:")
+        more.font = .systemFont(ofSize: 11)
+        more.textColor = .secondaryLabelColor
+        more.frame = NSRect(x: 0, y: y + 14, width: width, height: 16)
+        view.addSubview(more)
+        timing.frame = NSRect(x: 0, y: y - 10, width: width, height: 24)
+        timing.addItems(withTitles: ["All in step (rooms, a wall of TVs)", "Picture without delay (work, games)"])
+        timing.target = actions
+        timing.action = #selector(Actions.run(_:))
+        actions.add(timing) { [weak timing] in choice.timing = timing?.indexOfSelectedItem == 1 ? .interactive : .watching }
+        view.addSubview(timing)
+        note.textColor = .systemRed
+        note.frame = NSRect(x: 0, y: y - 34, width: width, height: 18)
+        view.addSubview(note)
+        alert.accessoryView = view
+        draw()
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn, let plan = try? choice.plan().get() else { return }
+        let byID = Dictionary(receivers.map { ($0.id, $0) }, uniquingKeysWith: { a, _ in a })
+        let members = plan.members.compactMap { m in byID[m.id].map { GroupMember($0, role: m.role) } }
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-            try? self?.play(members, mode: mode, soundOnly: soundOnly)
+            try? self?.play(members, mode: plan.mode, soundOnly: plan.soundOnly)
         }
     }
+}
+
+/// The dialog's buttons' actions as closures, kept alive while it is open.
+private final class Actions: NSObject {
+    private var runs: [ObjectIdentifier: () -> Void] = [:]
+    func add(_ control: NSControl, _ run: @escaping () -> Void) { runs[ObjectIdentifier(control)] = run }
+    @objc func run(_ sender: NSControl) { runs[ObjectIdentifier(sender)]?() }
 }
 
 private struct Failure: Error, LocalizedError {

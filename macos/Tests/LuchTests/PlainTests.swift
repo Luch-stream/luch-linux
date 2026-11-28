@@ -57,6 +57,7 @@ final class PlainTests: XCTestCase {
             "sleepOld": "too old to be put to sleep", "wrongCode": "wrong code: try again",
             "codeDigits": "the code is 6 digits", "codeLate": "no code was entered for TV in time",
             "refused": "TV refused the connection", "busy": "TV is busy", "already": "already mirroring to x",
+            "playingHere": "TV is playing already: stop it first", "codec": "TV cannot decode HEVC, the picture of this group",
             "update": "this receiver version cannot sleep yet: update it", "unreachable": "receiver went away",
         ][kind] ?? kind
     }

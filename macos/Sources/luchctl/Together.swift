@@ -14,10 +14,12 @@ latency lab on: the page opens in the browser, the TV draws its own pattern in a
 let togetherUsage = """
        | audio [r] auto|on|off|sync | latency [on|off] [r] | latency analyze <video> [--out prefix] [--fps n]
          [--readout-ms ms] | group interactive|watch <r>[=role] <r>[=role]... [--source fast|monitor|audio]
-         | offset <r> <ms>
+         | group add <r>[=role] | group remove <r> | offset <r> <ms>
        group: several receivers in step, the first one shows the picture; role video|audio|both (first: both,
        others: audio, a speaker); interactive keeps the picture as fast as alone, watch delays all alike (rooms,
-       TV walls); offset: a receiver's own correction in ms (positive = later), for its output route
+       TV walls); group add: one more receiver into the group that plays (role: the picture and its sound, or a
+       speaker when the group plays sound only); group remove: one out, the others play on, the last one out ends
+       the group; offset: a receiver's own correction in ms (positive = later), for its output route
        audio: auto (held to match where the sound lags, Android 5 and 6), on, off (picture only), sync (always held)
        latency: photon-to-photon latency with a phone filming both screens at 240 fps (docs/latency-lab.md)
 """
@@ -30,6 +32,23 @@ private func failWith(_ text: String, code: Int32 = 1) -> Never {
 /// `luchctl group interactive|watch <r>[=role] <r>[=role]... [--source S]`: the first shows the picture (role both
 /// unless named), the others are speakers (audio). Waits while each receiver's person is asked to Allow.
 func groupCommand(_ args: [String]) {
+    switch (args.count, args.count > 1 ? args[1] : "") {
+    case (3, "add"):
+        do {
+            let (key, role) = try GroupArgs.member(args[2])
+            let request: [String: Any] = ["cmd": "group_add", "r": key, "role": role ?? ""]
+            fail((try? LocalClient.request(request, timeout: 70))
+                 ?? ["error": "Luch.app is not running: start it with `open -a Luch`"])
+        } catch {
+            failWith("error: \(error)")
+        }
+        return
+    case (3, "remove"):
+        fail(call(["cmd": "group_remove", "r": args[2]]))
+        return
+    default:
+        break
+    }
     guard args.count >= 4 else { failWith(togetherUsage, code: 2) }
     do {
         let (members, source) = try GroupArgs.parse(Array(args.dropFirst(2)))
@@ -37,7 +56,7 @@ func groupCommand(_ args: [String]) {
             ["r": m.0, "role": m.1 ?? (i == 0 ? "both" : "audio")]
         }
         let r = (try? LocalClient.request(["cmd": "group", "mode": args[1], "members": list, "source": source],
-                                          timeout: 70 * Double(members.count))) ?? ["error": "Luch.app is not running"]
+                                          timeout: 70 * Double(members.count))) ?? ["error": "Luch.app is not running: start it with `open -a Luch`"]
         fail(r)
     } catch {
         failWith("error: \(error)")

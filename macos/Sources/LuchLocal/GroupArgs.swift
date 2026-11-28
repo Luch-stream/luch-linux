@@ -18,17 +18,19 @@ public enum GroupArgs {
                 source = s
                 continue
             }
-            if let eq = a.range(of: "=", options: .backwards) {
-                let role = String(a[eq.upperBound...])
-                guard ["video", "audio", "both"].contains(role) else {
-                    throw Bad(description: "role video|audio|both, not \(role)")
-                }
-                members.append((String(a[..<eq.lowerBound]), role))
-            } else {
-                members.append((a, nil))
-            }
+            members.append(try member(a))
         }
         guard members.count >= 2 else { throw Bad(description: "a group has two or more receivers") }
         return (members, source)
+    }
+
+    /// One receiver, `name` or `name=role` (`group`, and `group add`, where no role is the group's own default).
+    public static func member(_ a: String) throws -> (String, String?) {
+        guard let eq = a.range(of: "=", options: .backwards) else { return (a, nil) }
+        let role = String(a[eq.upperBound...])
+        guard ["video", "audio", "both"].contains(role) else {
+            throw Bad(description: "role video|audio|both, not \(role)")
+        }
+        return (String(a[..<eq.lowerBound]), role)
     }
 }
