@@ -166,3 +166,21 @@ test("a '.m3u8' that answers with XML is an ad schedule, not a playlist (Dailymo
   assert.equal(c.kindOf("https://cdn.example/a.m3u8", "text/plain"), "hls");
   assert.equal(c.kindOf("https://cdn.example/a.m3u8"), "hls");
 });
+
+test("a player's preview pictures in WebVTT are no subtitles (Mux's storyboard)", () => {
+  assert.equal(c.isSubtitle("https://image.video.example/61zK/storyboard.vtt?format=webp", "text/vtt"), false);
+  assert.equal(c.isSubtitle("https://cdn.example/v/thumbnails.vtt"), false);
+  assert.equal(c.isSubtitle("https://stream.video.example/61zK/text/OAuM02.vtt", "text/vtt"), true);
+});
+
+test("a live channel's master playlist wins over its subtitle and variant playlists (smotrim's)", () => {
+  const base = "https://live.tv.example/vgtrk/0/ch1-hd/";
+  const seen = ["index.m3u8", "rus_subs.m3u8", "792000_576p.m3u8", "2081200_576p.m3u8"].map((n) => ({ url: base + n, kind: "hls" }));
+  assert.equal(c.pickSource(blob("tv.example"), seen.slice(1).concat(seen[0])).url, base + "index.m3u8");
+});
+
+test("without a master, a subtitle or sound-only playlist is not the one cast", () => {
+  const seen = [{ url: "https://cdn.example/live/rus_subs.m3u8", kind: "hls" }, { url: "https://cdn.example/live/audio_ru.m3u8", kind: "hls" },
+    { url: "https://cdn.example/live/2081200_576p.m3u8", kind: "hls" }];
+  assert.equal(c.pickSource(blob("tv.example"), seen).url, "https://cdn.example/live/2081200_576p.m3u8");
+});

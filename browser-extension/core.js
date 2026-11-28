@@ -163,7 +163,10 @@
     if (frameId != null && list.some((s) => s.frameId === frameId)) list = list.filter((s) => s.frameId === frameId);
     const hls = list.filter((s) => s.kind === "hls");
     if (hls.length) {
-      const master = hls.find((s) => /master|index|playlist|manifest/i.test(pathOf(s.url))) || hls[0];
+      // A subtitle or sound-only rendition's playlist is never the one to cast.
+      const name = (s) => pathOf(s.url).slice(pathOf(s.url).lastIndexOf("/") + 1);
+      const whole = hls.filter((s) => !/sub|caption|audio/i.test(name(s)));
+      const master = hls.find((s) => /master|index|playlist|manifest/i.test(pathOf(s.url))) || whole[0] || hls[0];
       return { url: master.url, kind: "hls", mime: MIME.hls };
     }
     const isVideo = !(video && video.audio);
@@ -334,6 +337,8 @@
   /** "subtitles" for a link the page loaded: WebVTT, SubRip or ASS by its extension or type. */
   function isSubtitle(url, type) {
     const c = (type || "").toLowerCase();
+    // A player's preview pictures and chapter marks come as WebVTT too (Mux's storyboard.vtt).
+    if (/storyboard|thumbnail|sprite|chapters|preview/i.test(pathOf(url))) return false;
     return /\.(vtt|srt|ass|ssa)(\?|$)/i.test(pathOf(url)) || c.includes("text/vtt") || c.includes("subrip");
   }
 
