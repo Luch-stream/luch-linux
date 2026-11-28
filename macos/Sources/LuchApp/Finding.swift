@@ -26,7 +26,10 @@ final class Finding {
 
     init(discovery: Discovery) {
         let me = senderIdentity()
-        finder = Finder(me: ProbeIdentity(id: me.id, name: me.name)) { discovery.all() }
+        // LUCH_NO_MDNS=1 (tests with an emulator, whose mDNS names an address this Mac cannot reach): only receivers
+        // added by hand are listed.
+        let noMdns = ProcessInfo.processInfo.environment["LUCH_NO_MDNS"] == "1"
+        finder = Finder(me: ProbeIdentity(id: me.id, name: me.name)) { noMdns ? [] : discovery.all() }
         direct = DirectUI(finder: finder, me: ProbeIdentity(id: me.id, name: me.name))
         // A QR code's or the TV's sound's token goes into the next hello to that receiver (PROTOCOL.md 1e).
         Connector.shared.takeToken = { [finder] id in finder.takeToken(for: id) }

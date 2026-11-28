@@ -65,7 +65,9 @@ send({ op: "receivers" }).then((r) => {
 $("cast").onclick = async () => {
   const [tab] = await B.tabs.query({ active: true, currentWindow: true });
   await send({ op: "choose", receiver: chosen });
-  B.tabs.sendMessage(tab.id, { luch: "castBiggest", receiver: chosen }).catch((e) => ($("err").textContent = String(e)));
+  // The background asks every frame of the page which video it has and casts from the right one.
+  const r = await send({ op: "castPage", tabId: tab.id, receiver: chosen });
+  if (!r.ok) return ($("err").textContent = r.error);
   window.close();
 };
 

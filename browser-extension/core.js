@@ -35,6 +35,9 @@
     if (!/^https?:/i.test(url || "")) return null;
     const c = (contentType || "").toLowerCase().split(";")[0].trim();
     const ext = extension(url);
+    // A link named like a playlist that answered with a page or a document is something else (Dailymotion's ad
+    // schedule, VMAP XML, behind a ".m3u8").
+    if (/^(text\/html|application\/(xml|json)|text\/xml)/.test(c)) return null;
     if (c.includes("mpegurl") || ext === "m3u8") return "hls";
     if (c === "application/dash+xml" || ext === "mpd") return "dash";
     if (FILE_TYPES[ext] || /^(video|audio)\//.test(c)) return "file";
@@ -87,12 +90,66 @@
   }
 
   /**
-   * What to cast for a <video>: its own link when it has one (not a blob: of a page's own player), else what the
-   * page fetched for it: an HLS playlist (a master one first), then DASH, then a plain file. `video` is
-   * {currentSrc, src, sources: [{src, type}]}; `seen` the media links the page loaded, oldest first:
-   * [{url, kind, type}]. Returns {url, kind, mime} or null.
+   * A piece of a stream rather than a whole file: an HLS or DASH segment (`.ts`, `.m4s`, `segment.mp4`, `init.mp4`,
+   * `seg-12-v1.mp4`, `chunk_3.mp4`, `frag5.mp4`), or a byte range a player asks for in the link itself
+   * (`?bytes=0-6938`, `&range=100-200`). Casting one would play a second or two.
    */
-  function pickSource(video, seen) {
+  function isSegment(url) {
+    const p = pathOf(url);
+    if (/\.(ts|m4s|aac|m4f|cmfv|cmfa)$/.test(p)) return true;
+    const name = p.slice(p.lastIndexOf("/") + 1);
+    if (/^(init|segment|seg|chunk|frag|fragment)([-_.]?\d+)?([-_.][^/]*)?\.(mp4|m4v|m4a|webm)$/.test(name)) return true;
+    if (/(^|[-_])(seg|segment|chunk|frag|fragment)[-_]?\d+[^/]*\.(mp4|m4v|m4a|webm)$/.test(name)) return true;
+    try {
+      const q = new URL(url).searchParams;
+      // CMCD: the data a DASH or HLS player adds to every piece it asks for (CTA-5004).
+      return ["bytes", "range"].some((k) => /^\d+-\d*$/.test(q.get(k) || "")) || q.has("CMCD");
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /** The link's origin and folder: "https://cdn.example/a/b/" for "https://cdn.example/a/b/c.mp4?x". */
+  function dirOf(url) {
+    try {
+      const u = new URL(url);
+      return u.origin + u.pathname.slice(0, u.pathname.lastIndexOf("/") + 1);
+    } catch (e) {
+      return "";
+    }
+  }
+
+  /**
+   * A YouTube video's link in the form both senders open in the TV's own YouTube app, from a watch, shorts, embed
+   * or youtu.be page; null for anything else. The site hides its streams from a page's video element.
+   */
+  function youtubeLink(pageUrl) {
+    let u;
+    try {
+      u = new URL(pageUrl);
+    } catch (e) {
+      return null;
+    }
+    const host = u.hostname.replace(/^(www|m|music)\./, "");
+    const parts = u.pathname.split("/").filter(Boolean);
+    let id = null;
+    if (host === "youtu.be") id = parts[0];
+    else if (host === "youtube.com" || host === "youtube-nocookie.com") {
+      if (parts[0] === "watch") id = u.searchParams.get("v");
+      else if (["embed", "shorts", "live", "v"].includes(parts[0])) id = parts[1];
+    }
+    return id && /^[\w-]{6,20}$/.test(id) ? `https://www.youtube.com/watch?v=${id}` : null;
+  }
+
+  /**
+   * What to cast for a <video>: its own link when it has one (not a blob: of a page's own player), else what the
+   * page fetched for it: an HLS playlist (a master one first), then a plain file, then DASH (which the Luch
+   * receiver cannot play; a Chromecast can). `video` is {currentSrc, src, sources: [{src, type}], audio}; `seen` the
+   * media links the page loaded, oldest first: [{url, kind, type, frameId}]. What the video's own frame loaded wins
+   * over other frames' (an ad's player in another iframe); pieces of streams never count as files, nor sounds for a
+   * video (a site's interface beeps). Returns {url, kind, mime} or null.
+   */
+  function pickSource(video, seen, frameId) {
     const own = [video && video.currentSrc, video && video.src]
       .concat(((video && video.sources) || []).map((s) => s.src))
       .filter((u) => kindOf(u));
@@ -102,23 +159,66 @@
       const kind = kindOf(url, type);
       return { url, kind, mime: mimeOf(url, kind, type) };
     }
-    const list = (seen || []).filter((s) => s && s.kind);
+    let list = (seen || []).filter((s) => s && s.kind);
+    if (frameId != null && list.some((s) => s.frameId === frameId)) list = list.filter((s) => s.frameId === frameId);
     const hls = list.filter((s) => s.kind === "hls");
     if (hls.length) {
-      const master = hls.find((s) => /master|index|playlist|manifest/i.test(pathOf(s.url))) || hls[0];
+      // A subtitle or sound-only rendition's playlist is never the one to cast.
+      const name = (s) => pathOf(s.url).slice(pathOf(s.url).lastIndexOf("/") + 1);
+      const whole = hls.filter((s) => !/sub|caption|audio/i.test(name(s)));
+      const master = hls.find((s) => /master|index|playlist|manifest/i.test(pathOf(s.url))) || whole[0] || hls[0];
       return { url: master.url, kind: "hls", mime: MIME.hls };
+    }
+    const isVideo = !(video && video.audio);
+    // A file next to a playlist the page loaded, or in a folder under it, is one of its pieces, whatever its name (a
+    // live DASH stream's "…_001236492.mp4", a DASH track's "v/3_0171f8/v2.mp4").
+    const dirs = list.filter((s) => s.kind !== "file").map((s) => dirOf(s.url)).filter((d) => !/^[^/]+\/\/[^/]+\/$/.test(d));
+    const files = list.filter((s) => s.kind === "file" && !isSegment(s.url) && !dirs.some((d) => dirOf(s.url).startsWith(d))
+      && !(isVideo && /^audio\//.test(mimeOf(s.url, "file", s.type))));
+    if (files.length) {
+      const f = files[files.length - 1];
+      return { url: f.url, kind: "file", mime: mimeOf(f.url, "file", f.type) };
     }
     const dash = list.filter((s) => s.kind === "dash");
     if (dash.length) {
       const d = dash[dash.length - 1];
       return { url: d.url, kind: "dash", mime: MIME.dash };
     }
-    const files = list.filter((s) => s.kind === "file");
-    if (files.length) {
-      const f = files[files.length - 1];
-      return { url: f.url, kind: "file", mime: mimeOf(f.url, "file", f.type) };
-    }
     return null;
+  }
+
+  /**
+   * Every <video> and <audio> under `root`, also inside shadow roots: players built as web components keep theirs
+   * there (VK's). `shadowOf(el)` reaches closed roots where the browser lets an extension do so.
+   */
+  function mediaElements(root, shadowOf) {
+    const out = [];
+    const walk = (r) => {
+      for (const el of r.querySelectorAll("*")) {
+        if (el.tagName === "VIDEO" || el.tagName === "AUDIO") out.push(el);
+        const sr = el.shadowRoot || (shadowOf && shadowOf(el));
+        if (sr) walk(sr);
+      }
+    };
+    walk(root);
+    return out;
+  }
+
+  /**
+   * Which video "send this page's video" means, among [{area, playing, muted}] (one per frame, or per video): one
+   * playing with its sound first (what the person watches; a muted one playing by itself is a site's teaser or an
+   * ad), then the biggest. Videos smaller than a thumbnail never count. Returns the index, or -1.
+   */
+  function chooseVideo(list) {
+    let best = -1;
+    const score = (c) => [c.playing && !c.muted ? 1 : 0, c.area];
+    (list || []).forEach((c, i) => {
+      if (!c || !(c.area >= 160 * 90)) return;
+      if (best < 0) return (best = i);
+      const [a, b] = [score(c), score(list[best])];
+      if (a[0] > b[0] || (a[0] === b[0] && a[1] > b[1])) best = i;
+    });
+    return best;
   }
 
   /**
@@ -237,10 +337,12 @@
   /** "subtitles" for a link the page loaded: WebVTT, SubRip or ASS by its extension or type. */
   function isSubtitle(url, type) {
     const c = (type || "").toLowerCase();
+    // A player's preview pictures and chapter marks come as WebVTT too (Mux's storyboard.vtt).
+    if (/storyboard|thumbnail|sprite|chapters|preview/i.test(pathOf(url))) return false;
     return /\.(vtt|srt|ass|ssa)(\?|$)/i.test(pathOf(url)) || c.includes("text/vtt") || c.includes("subrip");
   }
 
-  const api = { qualityOf, variantLinks, sourcesOf, isSubtitle, kindOf, mimeOf, isPrivateHost, chooseVia, pickSource, castOptions, shouldRetryRelayed, clock,
+  const api = { youtubeLink, isSegment, mediaElements, chooseVideo, qualityOf, variantLinks, sourcesOf, isSubtitle, kindOf, mimeOf, isPrivateHost, chooseVia, pickSource, castOptions, shouldRetryRelayed, clock,
     positionNow, MIME };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.LuchCore = api;

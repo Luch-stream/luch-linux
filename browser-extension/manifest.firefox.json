@@ -26,6 +26,7 @@
         "<all_urls>"
       ],
       "js": [
+        "core.js",
         "content.js"
       ],
       "all_frames": true,
