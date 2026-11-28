@@ -91,10 +91,10 @@ public enum Cast {
         }
     }
 
-    /// Text macOS itself turns into PDF (cupsfilter); office files need LibreOffice, as on Linux.
+    /// Text macOS itself turns into PDF (cupsfilter); office files and Keynote need LibreOffice, as on Linux.
     static let textLike: Set<String> = ["txt", "md", "log", "csv", "json", "yaml", "yml", "toml", "xml", "py", "rs",
                                         "js", "ts", "c", "h", "cpp", "swift", "go", "sh", "java", "kt", "rb", "sql"]
-    static let office: Set<String> = ["doc", "docx", "odt", "rtf", "xls", "xlsx", "ods", "ppt", "pptx", "odp"]
+    static let office: Set<String> = ["doc", "docx", "odt", "rtf", "xls", "xlsx", "ods", "ppt", "pptx", "odp", "key"]
 
     public static func kind(_ s: String) -> CastKind {
         let e = ext(s)

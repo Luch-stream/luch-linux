@@ -1,0 +1,13 @@
+# "Open With → Present on TV" for a PDF or a presentation: the slides on the TV, the presenter view here.
+# SPDX-License-Identifier: GPL-3.0-or-later
+[Desktop Entry]
+Type=Application
+Name=Present on TV
+GenericName=Present on TV with Luch
+Comment=The slides on a Luch receiver, notes and the next slide here
+Icon=luch
+Exec=luchctl --pick present %f
+Terminal=false
+NoDisplay=true
+MimeType=application/pdf;application/vnd.oasis.opendocument.presentation;application/vnd.openxmlformats-officedocument.presentationml.presentation;application/vnd.ms-powerpoint;application/vnd.apple.keynote;application/x-iwork-keynote-sffkey;
+StartupNotify=false

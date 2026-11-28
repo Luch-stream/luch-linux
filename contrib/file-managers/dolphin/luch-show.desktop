@@ -1,0 +1,14 @@
+# Dolphin's context menu (KDE): Show on TV with Luch. Several receivers: luchctl asks which with kdialog.
+# install.sh puts it in ~/.local/share/kio/servicemenus (Plasma 6) and kservices5/ServiceMenus (Plasma 5).
+# SPDX-License-Identifier: GPL-3.0-or-later
+[Desktop Entry]
+Type=Service
+X-KDE-ServiceTypes=KonqPopupMenu/Plugin
+MimeType=image/jpeg;image/png;image/gif;image/webp;image/bmp;image/heic;image/heif;image/avif;video/mp4;video/x-m4v;video/quicktime;video/x-matroska;video/webm;video/x-msvideo;video/mpeg;video/mp2t;video/ogg;audio/mpeg;audio/mp4;audio/x-m4a;audio/aac;audio/flac;audio/x-flac;audio/ogg;audio/x-vorbis+ogg;audio/opus;audio/x-opus+ogg;audio/wav;audio/x-wav;application/pdf;application/vnd.oasis.opendocument.presentation;application/vnd.openxmlformats-officedocument.presentationml.presentation;application/vnd.ms-powerpoint;application/vnd.apple.keynote;application/x-iwork-keynote-sffkey;application/vnd.oasis.opendocument.text;application/vnd.oasis.opendocument.spreadsheet;application/vnd.openxmlformats-officedocument.wordprocessingml.document;application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;application/msword;application/vnd.ms-excel;application/rtf;
+Actions=show
+X-KDE-Priority=TopLevel
+
+[Desktop Action show]
+Name=Show on TV with Luch
+Icon=luch
+Exec=luchctl --pick cast %F

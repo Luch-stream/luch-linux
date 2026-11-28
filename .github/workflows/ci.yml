@@ -46,6 +46,9 @@ jobs:
       - name: Test the GNOME extension
         run: node --test gnome-extension/tests/*.mjs
 
+      - name: Test the GNOME Files menu
+        run: python3 -m unittest discover -s contrib/file-managers/nautilus
+
       - name: Package
         run: |
           name=luch-linux-${GITHUB_REF_NAME//\//-}-x86_64

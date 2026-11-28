@@ -5,6 +5,7 @@ pub mod audio;
 pub mod convert;
 pub mod dda;
 pub mod mf;
+pub mod shell;
 pub mod sys;
 pub mod wgc;
 
@@ -20,7 +21,7 @@ use crate::settings::LowLatency;
 use crate::tx::{open_udp, Tx};
 
 /// The sender's id, made once and kept (PROTOCOL.md section 1), in %APPDATA%\\Luch.
-fn sender_id() -> String {
+pub fn sender_id() -> String {
     let file = std::env::var_os("APPDATA")
         .map(|d| std::path::PathBuf::from(d).join("Luch").join("sender-id"));
     if let Some(id) = file.as_ref().and_then(|f| std::fs::read_to_string(f).ok()) {
@@ -28,7 +29,7 @@ fn sender_id() -> String {
             return id.trim().to_string();
         }
     }
-    let id = sender_id();
+    let id = uuid::Uuid::new_v4().to_string();
     if let Some(f) = file {
         let _ = f.parent().map(std::fs::create_dir_all);
         let _ = std::fs::write(f, &id);
@@ -36,7 +37,7 @@ fn sender_id() -> String {
     id
 }
 
-fn host_name() -> String {
+pub fn host_name() -> String {
     std::env::var("COMPUTERNAME").unwrap_or_else(|_| "Windows PC".into())
 }
 
@@ -56,7 +57,7 @@ pub fn run(o: &Options) -> Result<(), String> {
     let mut first = Some(first);
 
     let id = sender_id();
-    let mut ch = crate::control::Channel::open(o.to, o.from, &id, &host_name())
+    let mut ch = crate::control::Channel::open(o.to, o.from, &id, &host_name(), &["mirror"])
         .map_err(|e| format!("control channel: {e}"))?;
     let codec = session::choose_codec(&ch.welcome, &o.codec);
     let codec = if codec == "video/hevc" {

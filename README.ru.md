@@ -99,8 +99,8 @@ git clone https://github.com/Toxblh/luch-linux && cd luch-linux
 
 `install.sh` собирает и ставит `luchd`, `luchctl` и `luch-kms` в `~/.cargo/bin`, выдаёт
 `luch-kms` право `CAP_SYS_ADMIN` (спросит sudo), ставит и запускает пользовательскую службу
-`luchd` и ставит расширение GNOME. Выйдите из сеанса и войдите снова, чтобы GNOME Shell подхватил
-расширение.
+`luchd`, ставит расширение GNOME и добавляет «Показать на ТВ» в файловые менеджеры (ниже). Выйдите из сеанса и
+войдите снова, чтобы GNOME Shell подхватил расширение.
 
 Вручную:
 
@@ -174,6 +174,15 @@ luchctl latency analyze clip.mov          # задержка от экрана �
 на TCP-порту 47810 только этому приёмнику; `--relay` пропускает через luchd и ссылку — для ссылок, которые открываются
 только с этого компьютера (рабочий VPN, сайт с вашим логином). Приёмник на Android играет MP4, MKV, WebM, MPEG-TS и
 HLS; DASH пока нет.
+
+**Из файлового менеджера.** Правый клик по фото, видео, музыке, PDF или офисному файлу: *Show on Living room TV*
+(при нескольких приёмниках — *Show on TV* и их имена), а для PDF и презентации ещё *Present on …*, который открывает
+окно докладчика. Несколько фото — одно слайд-шоу. В GNOME Files меню показывает приёмники, которые видит luchd
+(пакет `nautilus-python`, затем `nautilus -q`; [contrib/file-managers/nautilus/luch.py](contrib/file-managers/nautilus/luch.py));
+в Dolphin *Show on TV with Luch* и *Present on TV with Luch…* спрашивают приёмник в диалоге; в остальных — *Открыть
+с помощью → Show on TV*. Все они запускают `luchctl --pick cast …` или `luchctl --pick present …`: без терминала
+luchctl спрашивает приёмник и код сопряжения и сообщает об ошибке через zenity или kdialog. Значок *Show on TV* в
+меню приложений сначала спрашивает файлы.
 
 **Из браузера.** Расширение из [browser-extension/](browser-extension/README.md) добавляет на каждое видео на сайте
 кнопку *На ТВ*, а поверх плеера страницы — управление тем, что играет на ТВ (`luchctl browser install` связывает

@@ -683,11 +683,12 @@ pub enum Kind {
     Unknown,
 }
 
-/// Extensions LibreOffice turns into PDF: office files, text and code (shown as plain text).
-const CONVERTIBLE: [&str; 40] = [
+/// Extensions LibreOffice turns into PDF: office files, Keynote, text and code (shown as plain text).
+const CONVERTIBLE: [&str; 41] = [
     "doc", "docx", "odt", "rtf", "txt", "md", "xls", "xlsx", "ods", "csv", "ppt", "pptx", "odp",
-    "odg", "fodt", "py", "rs", "js", "ts", "c", "h", "cpp", "hpp", "java", "go", "sh", "json",
-    "yaml", "yml", "toml", "xml", "html", "css", "kt", "swift", "rb", "php", "sql", "lua", "log",
+    "key", "odg", "fodt", "py", "rs", "js", "ts", "c", "h", "cpp", "hpp", "java", "go", "sh",
+    "json", "yaml", "yml", "toml", "xml", "html", "css", "kt", "swift", "rb", "php", "sql", "lua",
+    "log",
 ];
 
 fn extension(s: &str) -> String {
@@ -1507,6 +1508,7 @@ mod tests {
         assert_eq!(kind_of("IMG_1.JPG"), Kind::Image);
         assert_eq!(kind_of("film.en.srt"), Kind::Subtitle);
         assert_eq!(kind_of("notes.txt"), Kind::Document);
+        assert_eq!(kind_of("talk.key"), Kind::Document);
         assert_eq!(kind_of("archive.zip"), Kind::Unknown);
         assert_eq!(sub_lang("film.en.srt"), "en");
         assert_eq!(sub_lang("film.srt"), "");
