@@ -48,8 +48,9 @@ How the video gets to the TV:
   on the page, then send it.
 - Players built as web components (VK Video): their video is found inside the component.
 - YouTube, on its own pages and embedded in others: the TV's own YouTube app opens the video, from the same moment.
-- DASH (`.mpd`, VK Video, ok.ru, CNN, BBC) is found, but the Luch receiver cannot play it yet (a Chromecast can).
-  Nor can it play HLS whose pieces are fragmented MP4 instead of MPEG-TS (Dailymotion's).
+- DASH (`.mpd`: VK Video, ok.ru, Dzen, CNN, BBC) plays on a Luch receiver whose welcome lists it (built with
+  Media3) and on a Chromecast; an older Luch receiver says so instead. The same receivers play HLS in fragmented MP4
+  (PeerTube) and with separate sound tracks. Relayed, a manifest's pieces come through this computer too.
 - Sites with DRM (Netflix and the like) cannot be cast this way.
 
 ## Tests

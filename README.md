@@ -182,7 +182,9 @@ show, so a 4K file plays in 4K on a 4K TV even from a laptop with a 1080p screen
 a link) or stay free. The TV's remote controls it (OK pauses, left/right skip, down opens speed, sound track and
 subtitles); luchctl and the D-Bus API see the same state. Local files are served by luchd on TCP port 47810 to that
 receiver only; `--relay` passes a link through luchd too, for links only this computer can open (a company VPN, a
-site that needs your login). Android receivers play MP4, MKV, WebM, MPEG-TS and HLS; DASH is not supported yet.
+site that needs your login). Android receivers play MP4, MKV, WebM, MPEG-TS, HLS (fragmented MP4 too, with separate
+sound tracks) and DASH (with Media3; older receivers: no DASH, no fragmented HLS). A relayed DASH manifest's pieces go
+through luchd as well.
 
 **Presenting.** `luchctl present talk.odp` (or *Present…* in the GNOME menu) shows the slides sharp on the TV and
 opens a presenter view here: the next slide, your speaker notes, a timer; the mouse is a laser pointer drawn by the
