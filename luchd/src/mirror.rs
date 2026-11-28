@@ -36,6 +36,24 @@ use luch_proto::wire::{
 /// Latest numbers for one mirroring session, shared with D-Bus `Stats`.
 pub type Stats = Arc<Mutex<Value>>;
 
+/// The web receiver's media, one bounded queue per kind to its websocket writer: a sound frame never takes a picture's
+/// place, and either kind keeps its order.
+#[derive(Clone)]
+pub struct WebMedia {
+    pub video: mpsc::Sender<Vec<u8>>,
+    pub audio: mpsc::Sender<Vec<u8>>,
+}
+
+impl WebMedia {
+    /// The queues and their ends for the writer: a few frames of picture (a browser that lags must skip to a keyframe
+    /// rather than fall behind) and more of sound, whose frames are small and frequent.
+    pub fn new() -> (Self, mpsc::Receiver<Vec<u8>>, mpsc::Receiver<Vec<u8>>) {
+        let (video, vrx) = mpsc::channel(4);
+        let (audio, arx) = mpsc::channel(8);
+        (WebMedia { video, audio }, vrx, arx)
+    }
+}
+
 /// Where and what to mirror.
 pub struct Target {
     pub name: String,
@@ -50,7 +68,7 @@ pub struct Target {
     /// Web receiver: browsers take no UDP, media goes over its websocket instead.
     pub niri_virtual: bool,
     pub mirror169: bool,
-    pub ws: Option<mpsc::Sender<Vec<u8>>>,
+    pub ws: Option<WebMedia>,
     /// The `audio` part of `start` (limits::start_audio), or None for the picture only.
     pub audio: Option<Value>,
     /// Sound only, like a speaker (PROTOCOL.md 4d): no capture of the screen, no video stream.
@@ -769,9 +787,9 @@ struct Tx {
 enum Out {
     /// Every receiver of this kind: one, or the members of a group.
     Udp(Vec<Dest>),
-    /// Whole frame per message (websocket framing is reliable and ordered); on a full channel
-    /// drop the frame and ask for an IDR — the browser lags, the stream must not.
-    Ws(mpsc::Sender<Vec<u8>>, Arc<IdrGate>),
+    /// Whole frame per message (websocket framing is reliable and ordered); on a full queue the frame is dropped — the
+    /// browser lags, the stream must not — and a picture's asks for an IDR (none for the sound's: it needs none).
+    Ws(mpsc::Sender<Vec<u8>>, Option<Arc<IdrGate>>),
 }
 
 /// Shards per burst before a short pause, so a big IDR doesn't overflow the Wi-Fi queue.
@@ -859,7 +877,7 @@ impl Tx {
         }
     }
 
-    fn ws(kind: u8, tx: mpsc::Sender<Vec<u8>>, idr: Arc<IdrGate>) -> Self {
+    fn ws(kind: u8, tx: mpsc::Sender<Vec<u8>>, idr: Option<Arc<IdrGate>>) -> Self {
         Tx {
             out: Out::Ws(tx, idr),
             kind,
@@ -973,7 +991,9 @@ impl Tx {
                     host_lat,
                 ));
                 msg.extend_from_slice(data);
-                if let Err(TrySendError::Full(_) | TrySendError::Closed(_)) = tx.try_send(msg) {
+                if let (Err(TrySendError::Full(_) | TrySendError::Closed(_)), Some(idr)) =
+                    (tx.try_send(msg), idr)
+                {
                     idr.request();
                 }
             }
@@ -1858,8 +1878,8 @@ pub async fn run(
     let (mut video_of, mut audio_of): (Vec<usize>, Vec<usize>) = (vec![0], vec![0]);
     let (video, audio) = if let Some(ws) = t.ws.clone() {
         (
-            Arc::new(Tx::ws(KIND_VIDEO, ws.clone(), idr.clone())),
-            Arc::new(Tx::ws(KIND_AUDIO, ws, idr.clone())),
+            Arc::new(Tx::ws(KIND_VIDEO, ws.video, Some(idr.clone()))),
+            Arc::new(Tx::ws(KIND_AUDIO, ws.audio, None)),
         )
     } else {
         let (vp, ap) = control::ready_ports(&ready).ok_or(format!("bad ready: {ready}"))?;
@@ -2443,8 +2463,8 @@ mod tests {
             .unwrap();
         let (tx, mut rx) = mpsc::channel(8);
         let idr = Arc::new(IdrGate::new(IDR_COOLDOWN));
-        let video = Arc::new(Tx::ws(KIND_VIDEO, tx.clone(), idr.clone()));
-        let audio = Arc::new(Tx::ws(KIND_AUDIO, tx, idr.clone()));
+        let video = Arc::new(Tx::ws(KIND_VIDEO, tx.clone(), Some(idr.clone())));
+        let audio = Arc::new(Tx::ws(KIND_AUDIO, tx, None));
         let need_head = wire(&pipeline, video, audio, idr.clone(), Size::default());
         pipeline.set_state(gst::State::Playing).unwrap();
         for _ in 0..2 {
@@ -2472,18 +2492,50 @@ mod tests {
     async fn ws_frame_is_one_whole_message() {
         let (tx, mut rx) = mpsc::channel(1);
         let idr = Arc::new(IdrGate::new(IDR_COOLDOWN));
-        let t = Tx::ws(KIND_AUDIO, tx, idr.clone());
+        let t = Tx::ws(KIND_VIDEO, tx, Some(idr.clone()));
         let frame: Vec<u8> = (0..SHARD * 2 + 100).map(|i| i as u8).collect();
-        t.send_frame(&frame, F_CONFIG, 42, 3); // fills the channel
+        t.send_frame(&frame, F_IDR, 42, 3); // fills the channel
         t.send_frame(&frame, 0, 43, 3); // full: dropped, an IDR is requested instead of stalling
         let msg = rx.recv().await.unwrap();
         assert!(rx.try_recv().is_err());
         assert_eq!(
             &msg[..HEADER],
-            &header(KIND_AUDIO, F_CONFIG, 0, 1, 0, 42, frame.len() as u32, 3)
+            &header(KIND_VIDEO, F_IDR, 0, 1, 0, 42, frame.len() as u32, 3)
         );
         assert_eq!(&msg[HEADER..], &frame[..]);
         assert!(idr.due(std::time::Instant::now()));
+    }
+
+    #[tokio::test]
+    async fn the_web_receivers_sound_never_takes_the_pictures_place() {
+        let (ws, mut vrx, mut arx) = WebMedia::new();
+        let idr = Arc::new(IdrGate::new(IDR_COOLDOWN));
+        let video = Tx::ws(KIND_VIDEO, ws.video, Some(idr.clone()));
+        let audio = Tx::ws(KIND_AUDIO, ws.audio, None);
+        // A browser that stopped reading: the sound's queue fills, its frames are refused, and nothing asks for a
+        // keyframe nor holds back the picture.
+        for i in 0..20 {
+            audio.send_frame(&[i], 0, i as u64, 0);
+        }
+        assert!(!idr.due(std::time::Instant::now()));
+        video.send_frame(b"idr", F_IDR, 0, 0);
+        for i in 1..4 {
+            video.send_frame(&[i], 0, i as u64, 0);
+        }
+        assert!(!idr.due(std::time::Instant::now()), "4 frames fit");
+        video.send_frame(b"late", 0, 9, 0);
+        assert!(
+            idr.due(std::time::Instant::now()),
+            "a picture refused asks for a keyframe"
+        );
+        // Each kind in its order.
+        let seqs = |rx: &mut mpsc::Receiver<Vec<u8>>| {
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .map(|m| u32::from_be_bytes(m[8..12].try_into().unwrap()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(seqs(&mut vrx), [0, 1, 2, 3]);
+        assert_eq!(seqs(&mut arx), (0..8).collect::<Vec<_>>());
     }
 
     #[test]

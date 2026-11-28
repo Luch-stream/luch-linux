@@ -76,7 +76,7 @@ struct Conn {
     cmd: mpsc::Sender<Cmd>,
     events: broadcast::Sender<Value>,
     /// Web receiver only: media frames (header + data) to its websocket writer task.
-    media: Option<mpsc::Sender<Vec<u8>>>,
+    media: Option<mirror::WebMedia>,
     /// This machine's and the receiver's address on the control connection: what a receiver fetches cast files from,
     /// and whom they are served to. None for the web receiver.
     addrs: Option<(std::net::IpAddr, std::net::IpAddr)>,
@@ -2851,7 +2851,7 @@ async fn run_web<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     let mode = hello["mode"].as_str().unwrap_or("fast").to_string();
     let (cmd_tx, cmd_rx) = mpsc::channel(8);
     let (events, _) = broadcast::channel(16);
-    let (media_tx, media_rx) = mpsc::channel(16);
+    let (media_tx, mut video_rx, mut audio_rx) = mirror::WebMedia::new();
     // Browsers: H.264 everywhere (WebCodecs HEVC support is not universal).
     let welcome = json!({"t": "welcome", "v": p::VERSION, "id": sender_id, "name": host, "app": p::APP,
                          "bench": {"prefer": "video/avc"}, "hw": {"display": hello["display"]}});
@@ -2889,15 +2889,20 @@ async fn run_web<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(
     // Writer: control JSON and media binary share the socket.
     let wname = name.clone();
     tokio::spawn(async move {
-        let (mut cmd_rx, mut media_rx, mut sink) = (cmd_rx, media_rx, sink);
+        let (mut cmd_rx, mut sink) = (cmd_rx, sink);
         let why = loop {
             tokio::select! {
+                biased;
                 c = cmd_rx.recv() => match c {
                     Some(Cmd::Send(v)) => { if sink.send(Message::Text(v.to_string().into())).await.is_err() { break "write failed"; } }
                     Some(Cmd::Bye) => { let _ = sink.send(Message::Text(json!({"t": "bye"}).to_string().into())).await; break "disconnect requested"; }
                     None => break "control closed",
                 },
-                m = media_rx.recv() => match m {
+                m = audio_rx.recv() => match m {
+                    Some(b) => { if sink.send(Message::Binary(b.into())).await.is_err() { break "write failed"; } }
+                    None => break "media closed",
+                },
+                m = video_rx.recv() => match m {
                     Some(b) => { if sink.send(Message::Binary(b.into())).await.is_err() { break "write failed"; } }
                     None => break "media closed",
                 },
