@@ -19,7 +19,7 @@ public enum Rung: String, CaseIterable {
         case .mdns: return "asking the network (mDNS)"
         case .scan: return "asking every address of this network"
         case .ble: return "listening for receivers over Bluetooth"
-        case .sound: return "listening on the microphone: on the TV, open Luch and choose \"Say the address\""
+        case .sound: return "listening on the microphone: on the TV, open Luch and choose \"Say the address by sound\""
         case .qr: return "looking through the camera: hold it up to the QR code on the TV"
         case .direct: return "asking to connect directly to a receiver heard over Bluetooth (Wi-Fi Direct)"
         }

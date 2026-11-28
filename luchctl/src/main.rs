@@ -298,7 +298,7 @@ async fn find_id(p: &Luch1Proxy<'_>, key: Option<&str>) -> Result<String, String
     let Some(key) = key else {
         return match rows.as_slice() {
             [one] => Ok(one.0.clone()),
-            [] => Err("no receivers found (is the receiver app running?)".into()),
+            [] => Err("no receivers found: open Luch on the TV, or try `luchctl find`".into()),
             _ => {
                 let all: Vec<_> = rows.iter().map(|r| (r.0.clone(), r.1.clone())).collect();
                 choice::ask(&all).ok_or_else(|| {
@@ -343,7 +343,7 @@ async fn run(args: &[String]) -> Result<(), String> {
         {
             detail.clone()
         }
-        _ => format!("{e} (is luchd running?)"),
+        _ => format!("{e} (is luchd running? `systemctl --user start luchd`)"),
     };
     match args
         .iter()

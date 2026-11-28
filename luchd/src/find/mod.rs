@@ -77,7 +77,7 @@ impl Rung {
             Rung::Scan => "asking every address of this network",
             Rung::Ble => "listening for receivers over Bluetooth",
             Rung::Sound => {
-                "listening on the microphone: on the TV, open Luch and choose \"Say the address\""
+                "listening on the microphone: on the TV, open Luch and choose \"Say the address by sound\""
             }
             Rung::Qr => "looking through the camera: hold it up to the QR code on the TV",
             Rung::Direct => {
