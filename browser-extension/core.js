@@ -344,8 +344,8 @@
   /** "subtitles" for a link the page loaded: WebVTT, SubRip or ASS by its extension or type. */
   function isSubtitle(url, type) {
     const c = (type || "").toLowerCase();
-    // A player's preview pictures and chapter marks come as WebVTT too (Mux's storyboard.vtt).
-    if (/storyboard|thumbnail|sprite|chapters|preview/i.test(pathOf(url))) return false;
+    // A player's preview pictures and chapter marks come as WebVTT too (Mux's storyboard.vtt, JW Player's strips/).
+    if (/storyboard|thumbnail|sprite|chapters|preview|\/strips?\//i.test(pathOf(url))) return false;
     return /\.(vtt|srt|ass|ssa)(\?|$)/i.test(pathOf(url)) || c.includes("text/vtt") || c.includes("subrip");
   }
 

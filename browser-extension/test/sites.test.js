@@ -203,3 +203,8 @@ test("whether a receiver plays DASH comes from its welcome's media_types", () =>
   assert.equal(c.playsDash({ media_types: null }), null);
   assert.equal(c.playsDash(undefined), null);
 });
+
+test("JW Player's thumbnail strips are no subtitles", () => {
+  assert.equal(c.isSubtitle("https://cdn.player.example/strips/LraA0yKW-120.vtt", "text/vtt"), false);
+  assert.equal(c.isSubtitle("https://cdn.player.example/tracks/LraA0yKW-en.vtt", "text/vtt"), true);
+});
