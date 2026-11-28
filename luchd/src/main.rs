@@ -1059,6 +1059,18 @@ impl Luch {
         mirror::sync_mute(active);
     }
 
+    /// "Watch the TV's heat and battery": the next start asks the receiver for its heat badge (PROTOCOL.md 5).
+    /// Off by default; saved across restarts.
+    #[zbus(property)]
+    async fn watch_device(&self) -> bool {
+        mirror::watch_device()
+    }
+
+    #[zbus(property)]
+    async fn set_watch_device(&self, on: bool) {
+        mirror::set_watch_device(on);
+    }
+
     #[zbus(property)]
     async fn sender_id(&self) -> String {
         self.sender_id.clone()

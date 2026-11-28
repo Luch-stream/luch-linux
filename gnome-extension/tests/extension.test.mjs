@@ -66,3 +66,21 @@ test('the menu follows a direct connection, and only while it is under way', () 
     assert.match(ext, /<signal name="DirectChanged">/);
     assert.match(luchd, /async fn direct_changed\(e: &SignalEmitter<'_>, status: &str\)/);
 });
+
+test('every property the menu reads or sets is one luchd serves', () => {
+    const properties = [...ext.matchAll(/<property name="(\w+)" type="(\w)" access="(\w+)"/g)];
+    assert.ok(properties.some(p => p[1] === 'WatchDevice' && p[2] === 'b' && p[3] === 'readwrite'));
+    for (const [, name, , access] of properties) {
+        const snake = name.replace(/[A-Z]/g, (c, i) => (i ? '_' : '') + c.toLowerCase());
+        assert.match(luchd, new RegExp(`#\\[zbus\\(property\\)\\]\\s+async fn ${snake}\\(`), name);
+        if (access === 'readwrite')
+            assert.match(luchd, new RegExp(`#\\[zbus\\(property\\)\\]\\s+async fn set_${snake}\\(`), `set ${name}`);
+    }
+});
+
+test('watching the TV has words in both languages', () => {
+    const words = [...ext.matchAll(/watchDevice: '([^']+)'/g)].map(m => m[1]);
+    assert.equal(words.length, 2);
+    assert.ok(words.some(w => w.startsWith('Watch the TV')));
+    assert.ok(words.some(w => w.startsWith('Следить')));
+});

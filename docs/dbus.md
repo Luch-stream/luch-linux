@@ -526,6 +526,12 @@ Do not disturb while presenting (`Present`) or mirroring (not sound only): `on` 
 signals `QuietAsk`. Banners the person had turned off stay off. A crash mid-session is undone at the next `luchd`
 start (`~/.config/luch/restore-banners`). Saved in `~/.config/luch/quiet`.
 
+### `WatchDevice` (`b`, read/write, default `false`)
+
+"Watch the TV's heat and battery": a mirroring start asks the receiver for its heat badge over the picture
+(`"watch_device":true`, PROTOCOL.md in luch-android, section 5). Off, a hot receiver shows nothing; it reports its
+battery and heat in `Stats` either way. Applies from the next start. Saved in `~/.config/luch/watch-device`.
+
 ### `SenderId` (`s`, read)
 
 This machine's id (UUID kept in `~/.config/luch/id`). It is also announced as `_luchsrc._tcp`, so

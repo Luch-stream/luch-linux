@@ -65,6 +65,10 @@ trait Luch1 {
     fn quiet(&self) -> zbus::Result<String>;
     #[zbus(property)]
     fn set_quiet(&self, mode: &str) -> zbus::Result<()>;
+    #[zbus(property)]
+    fn watch_device(&self) -> zbus::Result<bool>;
+    #[zbus(property)]
+    fn set_watch_device(&self, on: bool) -> zbus::Result<()>;
     fn latency_lab(&self, id: &str, on: bool) -> zbus::Result<String>;
     fn mirror_group(
         &self,
@@ -92,7 +96,7 @@ const USAGE: &str = "usage: luchctl [--pick] [list | refresh | find [auto|all|md
                 | cast [r] <file|link>... [--title T] [--start m:ss] [--sub file] [--relay] [--paused]
                 | media [r] [play|pause|toggle|seek m:ss|skip s|rate x|audio id|sub id|sub off|watch]
                 | volume [r] [0..100|+|-|mute|unmute] | page [r] next|prev|<n> | blank [r] on|off
-                | present [r] <file> | quiet [ask|on|off] | browser install
+                | present [r] <file> | quiet [ask|on|off] | watch-device [on|off] | browser install
                 | pair [r] [code] | paired | forget <r> | web [allow|deny <code> | forget <n>]
                 | latency [on|off] [r] | latency analyze <video> [--out prefix] [--fps n] [--readout-ms ms]
                 | group interactive|watch <r>[=role] <r>[=role]... [--source S] | group add <r>[=role]
@@ -114,6 +118,8 @@ const USAGE: &str = "usage: luchctl [--pick] [list | refresh | find [auto|all|md
        present: shows a PDF or a presentation on the receiver and opens the presenter view here (current and
        next slide, notes, timer; the mouse is a laser pointer, dragging draws, a clicker turns the slides)
        quiet: hide notification banners while presenting or mirroring (ask: the GNOME extension asks once)
+       watch-device: watch the TV's heat and battery (off by default): on, a hot TV shows a badge over the picture
+       from the next mirroring on
        browser install: lets the Luch browser extension reach luchd (Chrome, Chromium, Brave, Edge, Yandex, Firefox)
        pair: the first connection to a receiver shows a code on the TV, typed here (any command that connects asks
        for it too); both then know each other and later connections need nothing. forget: pair again next time
@@ -561,6 +567,13 @@ async fn run(args: &[String]) -> Result<(), String> {
             }
         }
         ["quiet"] => println!("{}", p.quiet().await.map_err(e)?),
+        ["watch-device"] => {
+            let on = p.watch_device().await.map_err(e)?;
+            println!("{}", if on { "on" } else { "off" })
+        }
+        ["watch-device", w] if *w == "on" || *w == "off" => {
+            p.set_watch_device(*w == "on").await.map_err(e)?
+        }
         ["quiet", mode] if ["ask", "on", "off"].contains(mode) => {
             p.set_quiet(mode).await.map_err(e)?
         }

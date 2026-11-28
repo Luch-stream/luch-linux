@@ -67,6 +67,14 @@ pub fn start(video: Option<&Video>, audio: Option<&Value>) -> Value {
     v
 }
 
+/// Asks the receiver for its heat badge in this session (`"watch_device":true`, PROTOCOL.md 5). Off adds nothing:
+/// a start without it is what older senders send, and gets no badge.
+pub fn watch_device(start: &mut Value, on: bool) {
+    if on {
+        start["watch_device"] = Value::Bool(true);
+    }
+}
+
 /// The UDP ports of a `ready`, both of them valid, or None.
 pub fn ready_ports(ready: &Value) -> Option<(u16, u16)> {
     let port = |k: &str| {
@@ -127,6 +135,15 @@ mod tests {
         assert_eq!(s["audio"], audio);
         let s = start(None, None);
         assert_eq!(s, json!({"t": "start", "mode": "audio"}));
+    }
+
+    #[test]
+    fn watching_the_device_is_asked_for_or_left_out() {
+        let mut s = start(None, None);
+        watch_device(&mut s, false);
+        assert_eq!(s, json!({"t": "start", "mode": "audio"}));
+        watch_device(&mut s, true);
+        assert_eq!(s["watch_device"], true);
     }
 
     #[test]

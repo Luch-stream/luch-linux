@@ -49,6 +49,7 @@ const IFACE = `<node>
     <method name="RemoveFromGroup"><arg name="id" type="s" direction="in"/></method>
     <property name="WebUrl" type="s" access="read"/>
     <property name="Quiet" type="s" access="readwrite"/>
+    <property name="WatchDevice" type="b" access="readwrite"/>
     <signal name="ReceiversChanged"/>
     <signal name="FindProgress"><arg name="status" type="s"/></signal>
     <signal name="PairChanged"><arg name="id" type="s"/><arg name="state" type="s"/></signal>
@@ -97,6 +98,7 @@ const T = RU ? {
     quietBody: 'Их увидят все, кто смотрит на экран. Ответ запомнится до выхода из сеанса.',
     quietHide: 'Скрыть',
     quietKeep: 'Оставить',
+    watchDevice: 'Следить за нагревом и батареей ТВ',
     failed: name => `${name}: не получилось`,
     allowOnTv: name => `${name}: нажмите на ТВ «Разрешить»`,
     codeTitle: name => `Код с экрана ${name}`,
@@ -174,6 +176,7 @@ const T = RU ? {
     quietBody: 'Everyone looking at the screen would see them. The answer holds until you log out.',
     quietHide: 'Hide them',
     quietKeep: 'Keep them',
+    watchDevice: 'Watch the TV\u2019s heat and battery',
     failed: name => `${name}: that did not work`,
     allowOnTv: name => `${name}: press Allow on the TV`,
     codeTitle: name => `The code on ${name}`,
@@ -739,10 +742,11 @@ class LuchToggle extends QuickMenuToggle {
 
         this._renderGroup(group);
 
-        // The settings and the rarely used, out of the way: do not disturb, and the web receiver's address.
+        // The settings and the rarely used, out of the way: do not disturb, watching the TV, the web receiver's address.
         const mode = this._proxy?.Quiet;
+        const watch = this._proxy?.WatchDevice; // null from a luchd without it
         const url = this._proxy?.WebUrl ?? '';
-        if (mode || url) {
+        if (mode || typeof watch === 'boolean' || url) {
             const more = new PopupMenu.PopupSubMenuMenuItem(T.more, true);
             more.icon.icon_name = 'view-more-symbolic';
             // Do not disturb while presenting or mirroring: the three choices in sight, the one in use marked.
@@ -755,9 +759,19 @@ class LuchToggle extends QuickMenuToggle {
                     item.setOrnament(each === mode ? PopupMenu.Ornament.DOT : PopupMenu.Ornament.NONE);
                 }
             }
+            // Off by default: a hot TV then shows no badge over the picture (PROTOCOL.md 5); from the next start on.
+            if (typeof watch === 'boolean') {
+                if (mode)
+                    more.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+                const item = new PopupMenu.PopupSwitchMenuItem(T.watchDevice, watch);
+                item.connect('toggled', (_item, on) => {
+                    this._proxy.WatchDevice = on;
+                });
+                more.menu.addMenuItem(item);
+            }
             // Built-in web receiver: the URL for the TV; opening it on the PC is a quick test.
             if (url) {
-                if (mode)
+                if (mode || typeof watch === 'boolean')
                     more.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
                 more.menu.addMenuItem(new PopupMenu.PopupMenuItem(T.web, {reactive: false}));
                 const item = new PopupMenu.PopupMenuItem(url, {reactive: false});

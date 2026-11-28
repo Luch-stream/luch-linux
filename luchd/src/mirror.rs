@@ -169,6 +169,7 @@ fn member_start(
     }
     start["group"] =
         crate::sync::group_block(id, timeline, &who.role, mode, tolerance_ms, who.offset_ms);
+    control::watch_device(&mut start, watch_device());
     start
 }
 
@@ -320,6 +321,21 @@ pub fn set_local_audio(on: bool) {
     }
 }
 
+static WATCH_DEVICE: AtomicBool = AtomicBool::new(false);
+
+/// "Watch the TV's heat and battery": a start asks the receiver for its heat badge (PROTOCOL.md 5). Off by default.
+pub fn watch_device() -> bool {
+    WATCH_DEVICE.load(Ordering::Relaxed)
+}
+
+/// Saved in ~/.config/luch/watch-device; the next start follows it.
+pub fn set_watch_device(on: bool) {
+    WATCH_DEVICE.store(on, Ordering::Relaxed);
+    if let Ok(d) = crate::config_dir() {
+        let _ = std::fs::write(d.join("watch-device"), if on { "1" } else { "0" });
+    }
+}
+
 fn pactl(args: &[&str]) -> Option<String> {
     let o = std::process::Command::new("pactl")
         .args(args)
@@ -446,13 +462,17 @@ impl Drop for MuteSession {
     }
 }
 
-/// At start: read the saved setting, and undo a mute a crash left behind.
+/// At start: read the saved settings, and undo a mute a crash left behind.
 pub fn restore_audio() {
     let Ok(d) = crate::config_dir() else { return };
     LOCAL_AUDIO.store(
         std::fs::read_to_string(d.join("local-audio"))
             .map(|t| t.trim() != "0")
             .unwrap_or(true),
+        Ordering::Relaxed,
+    );
+    WATCH_DEVICE.store(
+        std::fs::read_to_string(d.join("watch-device")).is_ok_and(|t| t.trim() == "1"),
         Ordering::Relaxed,
     );
     let f = d.join("restore-audio");
@@ -2020,6 +2040,7 @@ pub async fn run(
     // In a group the target sends its sound only when its role has sound (PROTOCOL.md 4k).
     let primary_audio = group.as_ref().is_none_or(|g| g.primary.audio());
     let mut start = control::start(video.as_ref(), t.audio.as_ref().filter(|_| primary_audio));
+    control::watch_device(&mut start, watch_device());
     if let Some(g) = &group {
         start["group"] = crate::sync::group_block(
             &g.id,
@@ -2895,6 +2916,7 @@ mod tests {
             (Some("mirror"), Some(60))
         );
         assert!(s.get("audio").is_none());
+        assert!(s.get("watch_device").is_none(), "off by default");
     }
 
     #[tokio::test]
