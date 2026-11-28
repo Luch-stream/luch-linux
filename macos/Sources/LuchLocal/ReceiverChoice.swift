@@ -2,6 +2,7 @@
 // a name to pick, Enter for the one picked last time.
 // SPDX-License-Identifier: GPL-3.0-or-later
 import Foundation
+import LuchProto
 
 public struct ReceiverEntry: Equatable {
     public var id: String
@@ -29,8 +30,7 @@ public enum ReceiverChoice {
     }
 
     static var lastFile: URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/Luch/last-receiver")
+        Home.support.appendingPathComponent("last-receiver")
     }
 
     public static var last: String? {

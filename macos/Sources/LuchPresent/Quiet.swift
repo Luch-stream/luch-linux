@@ -141,10 +141,7 @@ public final class Quiet {
     // MARK: - the app's one Quiet
 
     static var dir: URL {
-        let d = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/Luch", isDirectory: true)
-        try? FileManager.default.createDirectory(at: d, withIntermediateDirectories: true)
-        return d
+        Home.support
     }
 
     /// Made on first use from the saved setting, a crash's leftovers undone.

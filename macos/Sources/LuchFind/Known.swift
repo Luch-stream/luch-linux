@@ -6,6 +6,7 @@
 //   0x0046); XGIMI projectors and others switch Wi-Fi off in standby and wake only on it.
 // SPDX-License-Identifier: GPL-3.0-or-later
 import Foundation
+import LuchProto
 import LuchNet
 
 public final class KnownReceivers {
@@ -17,10 +18,7 @@ public final class KnownReceivers {
     }
 
     public static func defaultFile() -> URL {
-        let dir = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent("Library/Application Support/Luch", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent("known.json")
+        Home.support.appendingPathComponent("known.json")
     }
 
     public func load() -> [String: [String: Any]] {

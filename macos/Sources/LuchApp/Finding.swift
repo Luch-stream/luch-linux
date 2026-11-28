@@ -5,6 +5,7 @@
 import AppKit
 import LuchEngine
 import LuchFind
+import LuchProto
 import LuchNet
 
 final class Finding {
@@ -28,7 +29,7 @@ final class Finding {
         let me = senderIdentity()
         // LUCH_NO_MDNS=1 (tests with an emulator, whose mDNS names an address this Mac cannot reach): only receivers
         // added by hand are listed.
-        let noMdns = ProcessInfo.processInfo.environment["LUCH_NO_MDNS"] == "1"
+        let noMdns = ProcessInfo.processInfo.environment["LUCH_NO_MDNS"] == "1" || Home.isolated
         finder = Finder(me: ProbeIdentity(id: me.id, name: me.name)) { noMdns ? [] : discovery.all() }
         direct = DirectUI(finder: finder, me: ProbeIdentity(id: me.id, name: me.name))
         // A QR code's or the TV's sound's token goes into the next hello to that receiver (PROTOCOL.md 1e).

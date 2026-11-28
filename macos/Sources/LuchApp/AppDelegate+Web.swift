@@ -7,13 +7,13 @@ import LuchProto
 import LuchWeb
 
 /// Allowed browsers and the HTTPS identity live next to the control socket.
-let webReceiver = WebReceiver(dir: FileManager.default.homeDirectoryForCurrentUser
-    .appendingPathComponent("Library/Application Support/Luch", isDirectory: true))
+let webReceiver = WebReceiver(dir: Home.support)
 /// The question on screen now, to take away when it is answered elsewhere or nobody answered in time.
 private var askingAbout: String?
 
 extension AppDelegate {
     func startWebReceiver() {
+        if Home.isolated { return } // a test instance leaves the port to the installed app
         webReceiver.onAsk = { [weak self] q in DispatchQueue.main.async { self?.askAboutBrowser(q) } }
         webReceiver.onAskDone = { q in
             DispatchQueue.main.async { if askingAbout == q.id { NSApp.abortModal() } }

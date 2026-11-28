@@ -137,9 +137,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         finding.finder.isConnected = { [caster] id in caster.existing(id) != nil }
         finding.direct.direct.isBusy = { [weak self] id in DispatchQueue.main.sync { self?.currentReceiverID == id } }
         caster.onOpen = { [finding] r in finding.finder.remember(r) }
-        try? finding.finder.start("auto")
+        // A test instance (LUCH_HOME) keeps to itself: no climb over the network, no announcement.
+        if !Home.isolated { try? finding.finder.start("auto") }
         let identity = senderIdentity()
-        discovery.publish(name: identity.name, id: identity.id)
+        if !Home.isolated { discovery.publish(name: identity.name, id: identity.id) }
         startLocalServer()
         caster.onChange = { [weak self] in DispatchQueue.main.async { self?.rebuildMenu() } }
         pairPrompt.start()
@@ -215,7 +216,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case "ping":
             return ["ok": true]
         case "receivers":
-            try? finding.finder.start("auto") // as luchd's list: the automatic ladder, at most every 30 s
+            if !Home.isolated { try? finding.finder.start("auto") } // as luchd's list: the automatic ladder, at most every 30 s
             return ["receivers": receivers.map { receiver in
                 ["id": receiver.id, "name": receiver.name, "model": receiver.model,
                  "address": receiver.address, "iface": receiver.interfaceName,
