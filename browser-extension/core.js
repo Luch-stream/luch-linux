@@ -87,12 +87,33 @@
   }
 
   /**
-   * What to cast for a <video>: its own link when it has one (not a blob: of a page's own player), else what the
-   * page fetched for it: an HLS playlist (a master one first), then DASH, then a plain file. `video` is
-   * {currentSrc, src, sources: [{src, type}]}; `seen` the media links the page loaded, oldest first:
-   * [{url, kind, type}]. Returns {url, kind, mime} or null.
+   * A piece of a stream rather than a whole file: an HLS or DASH segment (`.ts`, `.m4s`, `segment.mp4`, `init.mp4`,
+   * `seg-12-v1.mp4`, `chunk_3.mp4`, `frag5.mp4`), or a byte range a player asks for in the link itself
+   * (`?bytes=0-6938`, `&range=100-200`). Casting one would play a second or two.
    */
-  function pickSource(video, seen) {
+  function isSegment(url) {
+    const p = pathOf(url);
+    if (/\.(ts|m4s|aac|m4f|cmfv|cmfa)$/.test(p)) return true;
+    const name = p.slice(p.lastIndexOf("/") + 1);
+    if (/^(init|segment|seg|chunk|frag|fragment)([-_.]?\d+)?([-_.][^/]*)?\.(mp4|m4v|m4a|webm)$/.test(name)) return true;
+    if (/(^|[-_])(seg|segment|chunk|frag|fragment)[-_]?\d+[^/]*\.(mp4|m4v|m4a|webm)$/.test(name)) return true;
+    try {
+      const q = new URL(url).searchParams;
+      return ["bytes", "range"].some((k) => /^\d+-\d*$/.test(q.get(k) || ""));
+    } catch (e) {
+      return false;
+    }
+  }
+
+  /**
+   * What to cast for a <video>: its own link when it has one (not a blob: of a page's own player), else what the
+   * page fetched for it: an HLS playlist (a master one first), then a plain file, then DASH (which the Luch
+   * receiver cannot play; a Chromecast can). `video` is {currentSrc, src, sources: [{src, type}], audio}; `seen` the
+   * media links the page loaded, oldest first: [{url, kind, type, frameId}]. What the video's own frame loaded wins
+   * over other frames' (an ad's player in another iframe); pieces of streams never count as files, nor sounds for a
+   * video (a site's interface beeps). Returns {url, kind, mime} or null.
+   */
+  function pickSource(video, seen, frameId) {
     const own = [video && video.currentSrc, video && video.src]
       .concat(((video && video.sources) || []).map((s) => s.src))
       .filter((u) => kindOf(u));
@@ -102,23 +123,60 @@
       const kind = kindOf(url, type);
       return { url, kind, mime: mimeOf(url, kind, type) };
     }
-    const list = (seen || []).filter((s) => s && s.kind);
+    let list = (seen || []).filter((s) => s && s.kind);
+    if (frameId != null && list.some((s) => s.frameId === frameId)) list = list.filter((s) => s.frameId === frameId);
     const hls = list.filter((s) => s.kind === "hls");
     if (hls.length) {
       const master = hls.find((s) => /master|index|playlist|manifest/i.test(pathOf(s.url))) || hls[0];
       return { url: master.url, kind: "hls", mime: MIME.hls };
+    }
+    const isVideo = !(video && video.audio);
+    const files = list.filter((s) => s.kind === "file" && !isSegment(s.url)
+      && !(isVideo && /^audio\//.test(mimeOf(s.url, "file", s.type))));
+    if (files.length) {
+      const f = files[files.length - 1];
+      return { url: f.url, kind: "file", mime: mimeOf(f.url, "file", f.type) };
     }
     const dash = list.filter((s) => s.kind === "dash");
     if (dash.length) {
       const d = dash[dash.length - 1];
       return { url: d.url, kind: "dash", mime: MIME.dash };
     }
-    const files = list.filter((s) => s.kind === "file");
-    if (files.length) {
-      const f = files[files.length - 1];
-      return { url: f.url, kind: "file", mime: mimeOf(f.url, "file", f.type) };
-    }
     return null;
+  }
+
+  /**
+   * Every <video> and <audio> under `root`, also inside shadow roots: players built as web components keep theirs
+   * there (VK's). `shadowOf(el)` reaches closed roots where the browser lets an extension do so.
+   */
+  function mediaElements(root, shadowOf) {
+    const out = [];
+    const walk = (r) => {
+      for (const el of r.querySelectorAll("*")) {
+        if (el.tagName === "VIDEO" || el.tagName === "AUDIO") out.push(el);
+        const sr = el.shadowRoot || (shadowOf && shadowOf(el));
+        if (sr) walk(sr);
+      }
+    };
+    walk(root);
+    return out;
+  }
+
+  /**
+   * Which video "send this page's video" means, among [{area, playing, muted}] (one per frame, or per video): one
+   * playing with its sound first (what the person watches; a muted one playing by itself is a site's teaser or an
+   * ad), then the biggest. Videos smaller than a thumbnail never count. Returns the index, or -1.
+   */
+  function chooseVideo(list) {
+    let best = -1;
+    const score = (c) => [c.playing && !c.muted ? 1 : 0, c.area];
+    (list || []).forEach((c, i) => {
+      if (!c || !(c.area >= 160 * 90)) return;
+      if (best < 0) return (best = i);
+      const [a, b] = [score(c), score(list[best])];
+      if (a[0] > b[0] || (a[0] === b[0] && a[1] > b[1])) best = i;
+    });
+    return best;
   }
 
   /**
@@ -240,7 +298,7 @@
     return /\.(vtt|srt|ass|ssa)(\?|$)/i.test(pathOf(url)) || c.includes("text/vtt") || c.includes("subrip");
   }
 
-  const api = { qualityOf, variantLinks, sourcesOf, isSubtitle, kindOf, mimeOf, isPrivateHost, chooseVia, pickSource, castOptions, shouldRetryRelayed, clock,
+  const api = { isSegment, mediaElements, chooseVideo, qualityOf, variantLinks, sourcesOf, isSubtitle, kindOf, mimeOf, isPrivateHost, chooseVia, pickSource, castOptions, shouldRetryRelayed, clock,
     positionNow, MIME };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.LuchCore = api;

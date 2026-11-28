@@ -8,10 +8,12 @@
   const T = RU
     ? { cast: "На ТВ", on: "Играет на", stop: "Остановить", speed: "Скорость", sound: "Звук", subs: "Субтитры",
         off: "Выкл.", choose: "Куда показать?", relay: "ТВ не смог открыть ссылку сам — идёт через этот компьютер",
-        loading: "Загрузка…", paused: "Пауза", ended: "Закончилось", quality: "Качество", best: "лучшее для ТВ" }
+        loading: "Загрузка…", paused: "Пауза", ended: "Закончилось", quality: "Качество", best: "лучшее для ТВ",
+        failed: "ТВ не смог это воспроизвести" }
     : { cast: "To TV", on: "Playing on", stop: "Stop", speed: "Speed", sound: "Sound", subs: "Subtitles",
         off: "Off", choose: "Show it where?", relay: "The TV could not open the link itself: it goes through this computer",
-        loading: "Loading…", paused: "Paused", ended: "Ended", quality: "Quality", best: "best for the TV" };
+        loading: "Loading…", paused: "Paused", ended: "Ended", quality: "Quality", best: "best for the TV",
+        failed: "The TV could not play it" };
   const RATES = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
 
   const send = (msg) => new Promise((res) => B.runtime.sendMessage(msg, (r) => res(r || { ok: false, error: "no answer" })));
@@ -73,8 +75,35 @@
   let cast = null; // {receiver, name, video, state, at}
 
   // ---- the button over a video -----------------------------------------------------------------------------
+  // Closed shadow roots too, where the browser lets an extension in (Chrome's dom API, Firefox's own property).
+  // Chrome's throws for elements that cannot have one (SVG's).
+  const shadowOf = (el) => {
+    try {
+      return (B.dom && B.dom.openOrClosedShadowRoot ? B.dom.openOrClosedShadowRoot(el) : el.openOrClosedShadowRoot) || null;
+    } catch (e) {
+      return null;
+    }
+  };
+  let listed = { at: 0, list: [] };
+  /** The page's videos, in shadow roots too; looked up again at most once a second (the pointer moves often). */
+  function videos() {
+    if (Date.now() - listed.at > 1000) {
+      listed = { at: Date.now(), list: LuchCore.mediaElements(document, shadowOf).filter((v) => v.tagName === "VIDEO") };
+    }
+    return listed.list;
+  }
+  /** The video the person most likely means here: one playing with sound, else the biggest; null when none. */
+  function best() {
+    const list = videos().filter((v) => v.isConnected);
+    const i = LuchCore.chooseVideo(list.map(about));
+    return i < 0 ? null : list[i];
+  }
+  function about(v) {
+    const r = v.getBoundingClientRect();
+    return { area: r.width * r.height, playing: !v.paused && !v.ended && v.readyState > 2, muted: v.muted || v.volume === 0 };
+  }
   function videoAt(x, y) {
-    for (const v of document.querySelectorAll("video")) {
+    for (const v of videos()) {
       const r = v.getBoundingClientRect();
       if (r.width > 160 && r.height > 90 && x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) return v;
     }
@@ -103,10 +132,13 @@
 
   function describe(v) {
     return {
-      video: { currentSrc: v.currentSrc, src: v.src, sources: [...v.querySelectorAll("source")].map((s) => ({ src: s.src, type: s.type })) },
+      video: { currentSrc: v.currentSrc, src: v.src, sources: [...v.querySelectorAll("source")].map((s) => ({ src: s.src, type: s.type })),
+        audio: v.tagName === "AUDIO" },
       page: {
         title: document.title, pageUrl: location.href, userAgent: navigator.userAgent, currentTime: v.currentTime,
-        paused: v.paused, playbackRate: v.playbackRate, poster: v.poster,
+        // A video the page never started (an iframe player waiting for its first click) plays on the TV; one paused
+        // part way stays paused there too.
+        paused: v.paused && v.played.length > 0 && v.currentTime > 0, playbackRate: v.playbackRate, poster: v.poster,
         subs: [...v.querySelectorAll("track")].filter((t) => /subtitles|captions/.test(t.kind || "subtitles")).map((t) => t.src),
       },
     };
@@ -178,6 +210,8 @@
 
   function holdPage(v) {
     v.pause();
+    // loadstart: a new source, even one this browser cannot play itself (HLS in a <video> outside Safari).
+    v.addEventListener("loadstart", onPageSource, true);
     v.addEventListener("loadedmetadata", onPageSource, true);
     v.dataset.luchMuted = v.muted ? "1" : "0";
     v.muted = true;
@@ -192,6 +226,7 @@
     if (!cast) return;
     const v = cast.video;
     v.removeEventListener("play", onPagePlay, true);
+    v.removeEventListener("loadstart", onPageSource, true);
     v.removeEventListener("loadedmetadata", onPageSource, true);
     v.muted = v.dataset.luchMuted === "1";
     // Take up where the TV left off.
@@ -303,9 +338,18 @@
     }
   });
 
-  B.runtime.onMessage.addListener((m) => {
+  B.runtime.onMessage.addListener((m, sender, reply) => {
+    if (m.luch === "best") {
+      // The popup asks every frame; the background picks the frame whose video casts.
+      const v = best();
+      reply(v ? about(v) : null);
+      return;
+    }
     if (m.luch === "state" && cast && m.receiver === cast.receiver) {
       if (m.state.state === "stopped") return releasePage();
+      if (m.state.state === "error" && (!cast.state || cast.state.state !== "error")) {
+        toast(`${T.failed}${m.state.detail ? ` (${m.state.detail})` : ""}`);
+      }
       cast.state = m.state;
       cast.at = m.at || Date.now();
       draw();
@@ -314,7 +358,7 @@
     } else if (m.luch === "error") {
       toast(m.text);
     } else if (m.luch === "castBiggest") {
-      const v = [...document.querySelectorAll("video")].sort((a, b) => b.clientWidth * b.clientHeight - a.clientWidth * a.clientHeight)[0];
+      const v = best();
       if (v) castVideo(v, m.receiver);
       else toast(RU ? "На странице нет видео" : "No video on this page");
     }
@@ -338,7 +382,7 @@
   // A page reloaded while casting picks the panel up again.
   send({ op: "active" }).then((r) => {
     if (r.ok && r.receiver) {
-      const v = document.querySelector("video");
+      const v = best();
       if (v) {
         start(v, r.receiver, "TV");
         cast.state = r.state;

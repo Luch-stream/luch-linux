@@ -8,9 +8,9 @@ const HOST = "dev.luch.host";
 
 // ---- media links seen per tab (a blob: player's real source) ----------------------------------------------
 
-const seen = new Map(); // tabId -> [{url, kind, type}], oldest first, at most 40
+const seen = new Map(); // tabId -> [{url, kind, type, frameId}], oldest first, at most 40
 const subsSeen = new Map(); // tabId -> subtitle links the page loaded (VTT, SRT, ASS)
-function remember(tabId, url, type) {
+function remember(tabId, url, type, frameId) {
   if (tabId < 0) return;
   if (LuchCore.isSubtitle(url, type)) {
     const subs = subsSeen.get(tabId) || [];
@@ -20,17 +20,17 @@ function remember(tabId, url, type) {
   }
   const kind = LuchCore.kindOf(url, type);
   if (!kind) return;
-  if (kind === "file" && /\.(ts|m4s|aac)(\?|$)/i.test(url)) return; // segments of a playlist, not a file to cast
+  if (kind === "file" && LuchCore.isSegment(url)) return; // a piece of a stream, not a file to cast
   const list = seen.get(tabId) || [];
   if (list.some((s) => s.url === url)) return;
-  list.push({ url, kind, type: type || "" });
+  list.push({ url, kind, type: type || "", frameId });
   if (list.length > 40) list.shift();
   seen.set(tabId, list);
 }
 B.webRequest.onHeadersReceived.addListener(
   (d) => {
     const type = ((d.responseHeaders || []).find((h) => h.name.toLowerCase() === "content-type") || {}).value;
-    remember(d.tabId, d.url, type);
+    remember(d.tabId, d.url, type, d.frameId);
   },
   { urls: ["<all_urls>"], types: ["media", "xmlhttprequest", "other"] },
   ["responseHeaders"]
@@ -176,12 +176,12 @@ async function chosenReceiver(list) {
   return list.length === 1 ? list[0].id : null;
 }
 
-/** Casts the video a tab describes ({video, page}) to `receiver` (or the chosen one). */
-async function castFromTab(tabId, req) {
+/** Casts the video a tab's frame describes ({video, page}) to `receiver` (or the chosen one). */
+async function castFromTab(tabId, frameId, frameUrl, req) {
   const list = await receivers();
   const receiver = req.receiver || (await chosenReceiver(list));
   if (!receiver) return { choose: list };
-  const src = LuchCore.pickSource(req.video, seen.get(tabId));
+  const src = LuchCore.pickSource(req.video, seen.get(tabId), frameId);
   if (!src) throw new Error("no link to this video (it may be protected)");
   const { relay, trusted = [] } = await B.storage.local.get(["relay", "trusted"]);
   const via = LuchCore.chooseVia(src.url, relay);
@@ -193,7 +193,7 @@ async function castFromTab(tabId, req) {
   const cookie = via === "sender" || trust ? await cookieFor(src.url) : "";
   const options = LuchCore.castOptions(Object.assign({}, request, { cookie }));
   if (sources.length > 1) options.sources = sources;
-  casts.set(receiver, { tabId, via, request, sources, state: null, retried: false });
+  casts.set(receiver, { tabId, frameUrl, via, request, sources, state: null, retried: false });
   await ask("cast", { receiver, items: [src.url], options });
   await B.storage.local.set({ receiver });
   const name = (list.find((r) => r.id === receiver) || {}).name || "TV";
@@ -217,6 +217,26 @@ async function recast(receiver, url, start) {
   return {};
 }
 
+/**
+ * The popup's "send this page's video": each frame says what its best video is, and only the frame with the one
+ * the person most likely watches casts it (not every frame with an ad's player in it).
+ */
+async function castPage(tabId, receiver) {
+  let frames = [{ frameId: 0 }];
+  try {
+    frames = (await B.webNavigation.getAllFrames({ tabId })) || frames;
+  } catch (e) {
+    // only the top frame then
+  }
+  const asked = await Promise.all(frames.map((f) =>
+    B.tabs.sendMessage(tabId, { luch: "best" }, { frameId: f.frameId }).then((r) => r && Object.assign({ frameId: f.frameId }, r), () => null)));
+  const found = asked.filter(Boolean);
+  const i = LuchCore.chooseVideo(found);
+  const frameId = i < 0 ? 0 : found[i].frameId;
+  await B.tabs.sendMessage(tabId, { luch: "castBiggest", receiver }, { frameId }).catch(() => {});
+  return { frameId };
+}
+
 B.runtime.onMessage.addListener((msg, sender, reply) => {
   const tabId = sender.tab ? sender.tab.id : msg.tabId;
   const run = async () => {
@@ -234,7 +254,9 @@ B.runtime.onMessage.addListener((msg, sender, reply) => {
         return {};
       }
       case "cast":
-        return castFromTab(tabId, msg);
+        return castFromTab(tabId, sender.frameId, sender.url, msg);
+      case "castPage":
+        return castPage(msg.tabId, msg.receiver);
       case "recast":
         return recast(msg.receiver, msg.url || null, msg.start || 0);
       case "cmd":
@@ -247,7 +269,8 @@ B.runtime.onMessage.addListener((msg, sender, reply) => {
         await ask("stop", { receiver: msg.receiver });
         return {};
       case "active": {
-        for (const [receiver, c] of casts) if (c.tabId === tabId) return { receiver, state: c.state };
+        // Only the frame that cast, reloaded: another page in the tab (the next episode) starts afresh.
+        for (const [receiver, c] of casts) if (c.tabId === tabId && c.frameUrl === sender.url) return { receiver, state: c.state };
         return {};
       }
       case "seen":
