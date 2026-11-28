@@ -86,14 +86,15 @@ fish at every launch (commands, each one's words, receivers' names from the app,
 shells ask `luchctl __complete`). A new terminal picks it up; `luchctl completion zsh|bash|fish` prints the shell's
 side by hand.
 
-Menu bar: pick a receiver → **Mirror Screen**. While streaming the menu shows the estimated latency
-(capture + encode + one-way network + the receiver's decode), host time, RTT, the decoder's own number,
-the receiver's battery and thermal headroom.
+Menu bar: pick a receiver → **Mirror Screen**. While streaming, the menu starts with what is going on, the delay
+and frame rate (the TV's battery, a hot TV) and **Stop Mirroring**; the numbers behind the delay (capture + encode
++ one-way network + the receiver's decode: this Mac's time, the round trip, the decoder's own number) are in that
+line's tooltip. A refusal is told in plain words with what to do (`Plain.swift`, the same kinds as GNOME's).
 
-Submenus: **Warm picture** (a slider: pulls the blue chroma down and the red up in the NV12 plane before
-the encoder, weighted by luma so dark UI stays neutral — for night viewing, applied live), **Quality**
-(`auto/720p/1080p/2K/4K`), **Size** (`source/fit/average/client`), **Codec** (`auto/H.264/HEVC`),
-**Bitrate**, **Display**, and the login item.
+**Settings**: **Send This Mac's Sound**, the warm picture (a slider: pulls the blue chroma down and the red up in
+the NV12 plane before the encoder, weighted by luma so dark UI stays neutral — for night viewing, applied live),
+**Quality** (`auto/720p/1080p/2K/4K`), **Picture Fit** (`fit/source/client/average`), **Display**, do not disturb,
+**Mirror When Luch Starts**, **Start at Login**, and under Advanced **Codec** (`auto/H.264/HEVC`) and **Bitrate**.
 
 Without the app:
 
@@ -136,7 +137,7 @@ python3 Tools/fakerecv.py --seconds 20 --out .tmp/capture.h264 &
 - display mirroring with the cursor, H.264 and HEVC, a size that follows the client;
 - codec choice by weighted grading, remembering what a real session measured;
 - system audio (Opus, 20 ms frames), `OpusHead` before every IDR;
-- sound only (`luch sound`, "Play Sound Only" in the menu): the TV plays this Mac's sound and shows what plays;
+- sound only (`luch sound`, "Sound Only (as a Speaker)" in the menu): the TV plays this Mac's sound and shows what plays;
 - what plays (title, artist, album, cover, position) goes to the TV as `now_playing` during any session (below);
 - VPN-safe: the control channel and both media sockets are bound to the interface the receiver was
   found on, never to the default route;

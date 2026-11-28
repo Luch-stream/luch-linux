@@ -52,12 +52,12 @@ func withReceiver(_ request: [String: Any], _ name: String?) -> [String: Any] {
 /// sends it again to the one picked. A script without a terminal gets the app's error, which names them. A receiver
 /// that asks for pairing gets its code typed here (`askCode`), and the request goes again.
 func callPicking(_ request: [String: Any], timeout: TimeInterval = 10, askCode: Bool = true) -> [String: Any] {
-    var response = (try? LocalClient.request(request, timeout: timeout)) ?? ["error": "Luch.app is not running"]
+    var response = (try? LocalClient.request(request, timeout: timeout)) ?? ["error": "Luch.app is not running: start it with `open -a Luch`"]
     if request["id"] == nil, (response["error"] as? String)?.hasPrefix("several receivers") == true,
        let picked = chooseReceiver() {
         var again = request
         again["id"] = picked
-        response = (try? LocalClient.request(again, timeout: timeout)) ?? ["error": "Luch.app is not running"]
+        response = (try? LocalClient.request(again, timeout: timeout)) ?? ["error": "Luch.app is not running: start it with `open -a Luch`"]
     }
     return askCode ? pairedAndAgain(request, response, timeout: timeout) : response
 }

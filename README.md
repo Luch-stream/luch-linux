@@ -135,7 +135,8 @@ pairs again; a receiver with another certificate under a paired TV's id is refus
 
 **GNOME:** Quick Settings → **Luch**. A tap mirrors the whole screen in `fast` mode to the last or
 only receiver; the arrow opens the list with all modes. While mirroring, the toggle shows the
-estimated latency. On the TV, press OK on the remote to show the statistics overlay.
+estimated latency, and the list starts with **Stop mirroring to …**; do not disturb and the web receiver's address
+are under **More**. A refusal is told in plain words with what to do (`plain.js`). On the TV, press OK on the remote to show the statistics overlay.
 
 **Terminal:**
 

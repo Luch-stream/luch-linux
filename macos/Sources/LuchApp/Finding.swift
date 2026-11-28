@@ -1,5 +1,6 @@
 // The app's side of finding and waking receivers: the local API's find, add, refresh, id, known, wake and info
-// commands (luchctl), and the menu's "Find Receivers", "Add Receiver…" and the TVs that are off, with Wake.
+// commands (luchctl), and the menu's "Find Receivers", "Add Receiver…", "Search Harder" for an empty list, and the TVs
+// that are off, with Turn On.
 // SPDX-License-Identifier: GPL-3.0-or-later
 import AppKit
 import LuchEngine
@@ -102,8 +103,8 @@ final class Finding {
     private func asleepMenu(id: String, name: String, _ r: [String: Any]) -> NSMenu {
         let m = NSMenu()
         let ways = KnownReceivers.methods(r)
-        m.addItem(.run("Wake", enabled: !ways.isEmpty, symbol: "power") { [weak self] in
-            self?.background(name) { "Waking: " + (try $0.finder.wake(id)).joined(separator: ", ") }
+        m.addItem(.run("Turn On", enabled: !ways.isEmpty, symbol: "power") { [weak self] in
+            self?.background(name) { "Turning on: " + (try $0.finder.wake(id)).joined(separator: ", ") }
         })
         m.addItem(.label(ways.isEmpty ? KnownReceivers.hint(r) ?? "No way to wake it known yet" : "By " + ways.map {
             $0 == "wol" ? "Wake-on-LAN" : "the remote's Bluetooth signal, sent by another Luch device"
@@ -139,17 +140,24 @@ final class Finding {
         ]
         for (title, mode, symbol) in ways {
             if mode == "scan" { m.addItem(.separator()) }
-            m.addItem(.run(title, symbol: symbol) { [weak self] in
-                if mode == "sound" || mode == "all" {
-                    _ = Finding.alert("Find Receivers", "On the TV, open Luch and choose \"Say the address\"; or hold this Mac's camera up to the QR code on its screen.", buttons: ["OK"])
-                }
-                do { try self?.finder.start(mode) } catch { _ = Finding.alert("Find Receivers", error.localizedDescription, buttons: ["OK"]) }
-                self?.onChange?()
-            })
+            m.addItem(.run(title, symbol: symbol) { [weak self] in self?.search(mode) })
         }
         direct.addFindItems(to: m)
         parent.submenu = m
         return parent
+    }
+
+    /// For an empty list: the whole ladder at once, the person's part (the TV's sound, its QR code) told first.
+    func searchHarderItem() -> NSMenuItem {
+        .run("Search Harder: Also Sound and Camera…", symbol: "sparkle.magnifyingglass") { [weak self] in self?.search("all") }
+    }
+
+    private func search(_ mode: String) {
+        if mode == "sound" || mode == "all" {
+            _ = Finding.alert("Find Receivers", "On the TV, open Luch and choose \"Say the address by sound\"; or hold this Mac's camera up to the QR code on its screen.", buttons: ["OK"])
+        }
+        do { try finder.start(mode) } catch { _ = Finding.alert("Find Receivers", error.localizedDescription, buttons: ["OK"]) }
+        onChange?()
     }
 
     private func askForLink() {

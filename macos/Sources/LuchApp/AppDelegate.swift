@@ -86,9 +86,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private(set) lazy var finding = Finding(discovery: discovery)
     /// Do-not-disturb follows a mirroring session (sound only does not count).
     private(set) var engine: Engine? { didSet { caster.presenter.mirroring(engine.map { !$0.options.soundOnly } ?? false) } }
+    /// What is happening now, first in the menu; "Idle" shows nothing.
     private var state = "Idle"
-    private var statsLine = "Not streaming"
+    private var statsLine = ""
     private var statsItem: NSMenuItem?
+    /// macOS refused Screen Recording: the menu shows the way to the switch and a restart, which it needs.
+    private var needsScreenRecording = false
     private var timer: Timer?
     private(set) var receivers: [Receiver] = []
     private var pendingMenuRefresh = false
@@ -307,41 +310,60 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         menu.removeAllItems()
 
-        if receivers.isEmpty {
-            let item = NSMenuItem(title: "No receivers found", action: nil, keyEquivalent: "")
-            item.isEnabled = false
-            menu.addItem(item)
+        // What is happening now, and the way to stop it, before anything else.
+        let busy = engine != nil || state != "Idle"
+        if busy { menu.addItem(.label(state)) }
+        statsItem = nil
+        if engine != nil {
+            if !statsLine.isEmpty {
+                let stats = NSMenuItem.label(statsLine)
+                statsItem = stats
+                menu.addItem(stats)
+            }
+            menu.addItem(.run("Stop Mirroring", symbol: "stop.circle") { [weak self] in self?.stopMirror() })
         }
-        for (index, receiver) in receivers.enumerated() {
+        if needsScreenRecording { screenRecordingItems().forEach(menu.addItem) }
+        if busy || needsScreenRecording { menu.addItem(.separator()) }
+
+        // The first time: where a TV comes from, and the harder search right here, not two menus down.
+        if receivers.isEmpty {
+            menu.addItem(.label("No receivers found yet"))
+            menu.addItem(.label("Open Luch on the TV: it shows up here"))
+            menu.addItem(finding.searchHarderItem())
+        }
+        for receiver in receivers {
             let item = NSMenuItem(title: receiver.name, action: nil, keyEquivalent: "")
             let luch = TVKind.of(receiver.id) == .luch
             item.submenu = receiver.service == "web" ? webBrowserMenu(receiver) : luch ? receiverMenu(receiver) : tvMenu(receiver)
             if caster.existing(receiver.id)?.showing != nil || currentReceiverID == receiver.id
                 || caster.tvs.session(receiver.id) != nil { item.state = .on }
-            if index == 0 { item.image = NSImage(systemSymbolName: "tv", accessibilityDescription: nil) }
+            item.image = NSImage(systemSymbolName: receiver.service == "web" ? "globe" : "tv", accessibilityDescription: nil)
             menu.addItem(item)
         }
         finding.addMenu(to: menu, online: receivers)
+        menu.addItem(webMenuItem())
 
         menu.addItem(.separator())
         together.addMenuItems(to: menu, receivers: receivers)
         menu.addItem(.separator())
 
-        let stats = NSMenuItem(title: statsLine, action: nil, keyEquivalent: "")
-        stats.isEnabled = false
-        statsItem = stats
-        menu.addItem(stats)
-
-        let stateItem = NSMenuItem(title: state, action: nil, keyEquivalent: "")
-        stateItem.isEnabled = false
-        menu.addItem(stateItem)
-
+        menu.addItem(settingsItem())
         menu.addItem(.separator())
+        menu.addItem(reportMenuItem())
+        let quit = NSMenuItem(title: "Quit Luch", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        menu.addItem(quit)
+    }
 
-        let audio = NSMenuItem(title: "Audio", action: #selector(toggleAudio), keyEquivalent: "")
+    /// The picture and sound, how the app starts, and the expert's knobs, out of the first level.
+    private func settingsItem() -> NSMenuItem {
+        let parent = NSMenuItem(title: "Settings", action: nil, keyEquivalent: "")
+        parent.image = NSImage(systemSymbolName: "gearshape", accessibilityDescription: nil)
+        let settings = NSMenu()
+
+        let audio = NSMenuItem(title: "Send This Mac's Sound", action: #selector(toggleAudio), keyEquivalent: "")
         audio.target = self
         audio.state = Preferences.shared.audio ? .on : .off
-        menu.addItem(audio)
+        settings.addItem(audio)
 
         // One row: label, slider, percentage. A bare NSSlider as the item view sits crooked in a menu.
         let row = NSView(frame: NSRect(x: 0, y: 0, width: 260, height: 26))
@@ -366,64 +388,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let warmItem = NSMenuItem()
         warmItem.view = row
-        // Tucked into a submenu: the top level stays short, and the row gets the full width it needs.
-        let warmParent = NSMenuItem(title: "Warm picture", action: nil, keyEquivalent: "")
-        let warmMenu = NSMenu()
-        warmMenu.addItem(warmItem)
-        warmParent.submenu = warmMenu
-        menu.addItem(warmParent)
+        warmItem.toolTip = "A warmer picture on the TV in the evening, as Night Shift"
+        settings.addItem(warmItem)
 
-        let quality = NSMenuItem(title: "Quality", action: nil, keyEquivalent: "")
-        let qualityMenu = NSMenu()
-        for preset in QualityPreset.allCases {
-            // Warn about the cost, do not silently change the user's choice.
-            let onBattery = engine?.deviceOnBattery ?? false
-            let hint = onBattery && preset != .low ? " — drains the battery faster" : ""
-            _ = preset
-            let item = NSMenuItem(title: preset.label + hint, action: #selector(setPreset(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = preset.rawValue
-            item.state = Preferences.shared.preset == preset.rawValue ? .on : .off
-            qualityMenu.addItem(item)
-        }
-        quality.submenu = qualityMenu
-        menu.addItem(quality)
-
-        let size = NSMenuItem(title: "Size", action: nil, keyEquivalent: "")
-        let sizeMenu = NSMenu()
-        for mode in SizeMode.allCases {
-            let item = NSMenuItem(title: mode.rawValue, action: #selector(setSizeMode(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = mode.rawValue
-            item.state = Preferences.shared.sizeMode == mode.rawValue ? .on : .off
-            sizeMenu.addItem(item)
-        }
-        size.submenu = sizeMenu
-        menu.addItem(size)
-
-        let codec = NSMenuItem(title: "Codec", action: nil, keyEquivalent: "")
-        let codecMenu = NSMenu()
-        for choice in CodecChoice.allCases {
-            let item = NSMenuItem(title: choice.rawValue.uppercased(), action: #selector(setCodec(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = choice.rawValue
-            item.state = Preferences.shared.codec == choice.rawValue ? .on : .off
-            codecMenu.addItem(item)
-        }
-        codec.submenu = codecMenu
-        menu.addItem(codec)
-
-        let bitrate = NSMenuItem(title: "Bitrate", action: nil, keyEquivalent: "")
-        let bitrateMenu = NSMenu()
-        for kbps in [10_000, 20_000, 30_000] {
-            let item = NSMenuItem(title: "\(kbps / 1000) Mbit/s", action: #selector(setBitrate(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = kbps
-            item.state = Preferences.shared.bitrate == kbps ? .on : .off
-            bitrateMenu.addItem(item)
-        }
-        bitrate.submenu = bitrateMenu
-        menu.addItem(bitrate)
+        // Warn about the cost, do not silently change the user's choice.
+        let onBattery = engine?.deviceOnBattery ?? false
+        settings.addItem(choices("Quality", QualityPreset.allCases.map {
+            ($0.rawValue, $0.label + (onBattery && $0 != .low ? " — drains the battery faster" : ""))
+        }, chosen: Preferences.shared.preset, #selector(setPreset(_:))))
+        settings.addItem(choices("Picture Fit", SizeMode.allCases.map { ($0.rawValue, $0.label) },
+                                 chosen: Preferences.shared.sizeMode, #selector(setSizeMode(_:))))
 
         let display = NSMenuItem(title: "Display", action: nil, keyEquivalent: "")
         let displayMenu = NSMenu()
@@ -440,54 +414,82 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             displayMenu.addItem(item)
         }
         display.submenu = displayMenu
-        menu.addItem(display)
+        settings.addItem(display)
 
-        menu.addItem(webMenuItem())
-        menu.addItem(.separator())
-
-        menu.addItem(quietItem())
-
-        let launch = NSMenuItem(title: "Mirror on launch", action: #selector(toggleMirrorOnLaunch), keyEquivalent: "")
+        settings.addItem(.separator())
+        settings.addItem(quietItem())
+        let launch = NSMenuItem(title: "Mirror When Luch Starts", action: #selector(toggleMirrorOnLaunch), keyEquivalent: "")
         launch.target = self
         launch.state = Preferences.shared.mirrorOnLaunch ? .on : .off
-        menu.addItem(launch)
-
+        launch.toolTip = "To the only TV there is, a few seconds after Luch starts"
+        settings.addItem(launch)
         let login = NSMenuItem(title: "Start at Login", action: #selector(toggleLogin), keyEquivalent: "")
         login.target = self
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
-        menu.addItem(login)
+        settings.addItem(login)
 
-        menu.addItem(.separator())
-        menu.addItem(reportMenuItem())
-        let quit = NSMenuItem(title: "Quit Luch", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-        menu.addItem(quit)
+        settings.addItem(.separator())
+        settings.addItem(.label("Advanced"))
+        let codecs = CodecChoice.allCases.map { c in
+            (c.rawValue, c == .auto ? "Auto" : c == .h264 ? "H.264" : c.rawValue.uppercased())
+        }
+        settings.addItem(choices("Codec", codecs, chosen: Preferences.shared.codec, #selector(setCodec(_:))))
+        let bitrate = NSMenuItem(title: "Bitrate", action: nil, keyEquivalent: "")
+        let bitrateMenu = NSMenu()
+        for kbps in [10_000, 20_000, 30_000] {
+            let item = NSMenuItem(title: "\(kbps / 1000) Mbit/s", action: #selector(setBitrate(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = kbps
+            item.state = Preferences.shared.bitrate == kbps ? .on : .off
+            bitrateMenu.addItem(item)
+        }
+        bitrate.submenu = bitrateMenu
+        settings.addItem(bitrate)
+
+        parent.submenu = settings
+        return parent
+    }
+
+    /// A submenu of choices sent to `action` with their raw value; the one in use is checked.
+    private func choices(_ title: String, _ options: [(String, String)], chosen: String, _ action: Selector) -> NSMenuItem {
+        let parent = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        let m = NSMenu()
+        for (raw, label) in options {
+            let item = NSMenuItem(title: label, action: action, keyEquivalent: "")
+            item.target = self
+            item.representedObject = raw
+            item.state = chosen == raw ? .on : .off
+            m.addItem(item)
+        }
+        parent.submenu = m
+        return parent
+    }
+
+    /// Once refused, macOS asks no more: the switch in System Settings, then a restart for the app to see it.
+    private func screenRecordingItems() -> [NSMenuItem] {
+        [.run("Open Screen Recording Settings…", symbol: "lock.shield") {
+            if let pane = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
+                NSWorkspace.shared.open(pane)
+            }
+        },
+         .run("Restart Luch", symbol: "arrow.clockwise") {
+            let relaunch = Process()
+            relaunch.executableURL = URL(fileURLWithPath: "/bin/sh")
+            relaunch.arguments = ["-c", "sleep 1; /usr/bin/open \"$0\"", Bundle.main.bundlePath]
+            try? relaunch.run()
+            NSApp.terminate(nil)
+        }]
     }
 
     private func tick() {
         guard let stats = engine?.lastStats else {
-            if engine == nil && statsLine != "Not streaming" {
-                statsLine = "Not streaming"
+            if engine == nil && !statsLine.isEmpty {
+                statsLine = ""
                 statsItem?.title = statsLine
             }
             return
         }
-        var line = String(format: "≈ %.0f ms · host %.1f · rtt %.1f", stats.estMs, stats.hostMs, stats.rttMs)
-        if let decode = stats.decodeMs { line += String(format: " · dec %.1f", decode) }
-        if let battery = stats.battery {
-            line += " · 📱\(battery)%"
-            if stats.charging == true { line += "⚡" }
-        }
-        if let thermal = stats.thermal, thermal != "none" { line += " · \(thermal)" }
-        if let headroom = stats.thermalHeadroom {
-            // Warn, never throttle on its own: the user decides whether to drop the quality.
-            line += headroom < 0.3 ? String(format: " · 🔥 %.2f", headroom)
-                                   : String(format: " · 🌡%.2f", headroom)
-        }
-        line += String(format: " · %.0f fps", stats.fps)
-        if line != statsLine {
-            statsLine = line
-            statsItem?.title = line
-        }
+        apply(stats)
     }
 
     // MARK: - actions
@@ -544,7 +546,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if !CGPreflightScreenCaptureAccess() {
                 // Once refused, macOS shows no dialog again: only the switch in Settings can allow it, and the
                 // app sees the change only after it restarts.
-                state = "Allow Luch in Screen Recording, then reopen Luch"
+                state = "Luch may not record the screen yet: allow it in System Settings, then restart Luch"
+                needsScreenRecording = true
                 rebuildMenu()
                 if let pane = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") {
                     NSWorkspace.shared.open(pane)
@@ -576,7 +579,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         engine.shareArt = { [caster] file, client, me in caster.shareArt(file, client: client, me: me) }
         engine.onWaitingForAllow = { [weak self] in
             DispatchQueue.main.async {
-                self?.state = "Press Allow on \(receiver.name) (left, then OK on its remote)"
+                self?.state = "Press Allow on \(receiver.name): left, then OK on its remote"
                 self?.rebuildMenu()
             }
         }
@@ -587,9 +590,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.async {
                 guard let self, self.engine == nil else { return } // replaced by a newer session
                 self.currentReceiverID = nil
-                self.state = "Idle (\(reason))"
-                self.statsLine = "Not streaming"
-                self.statsItem?.title = self.statsLine
+                self.state = Plain.stopped(reason) ?? "Idle"
+                self.statsLine = ""
                 self.rebuildMenu()
             }
         }
@@ -609,7 +611,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 let batteryNote = engine.deviceOnBattery ? " · 🔋 on battery" : ""
                 DispatchQueue.main.async {
                     self?.state = soundOnly ? "Playing sound on \(receiver.name)"
-                        : extend ? "Extended to \(receiver.name) · \(codec)"
+                        : extend ? "\(receiver.name) is a second screen · \(codec)"
                         : ultra != nil ? "Mirroring to \(receiver.name) at its \(engine.ultraMode.map { "\($0)" } ?? "") · \(codec)"
                         : window != nil ? "Showing a window on \(receiver.name) · \(codec)"
                         : "Mirroring to \(receiver.name) · \(codec)\(batteryNote)"
@@ -624,7 +626,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                         }
                         self?.state = "Pairing with \(receiver.name): type the code the TV shows"
                     } else {
-                        self?.state = "Error: \(error.localizedDescription)"
+                        self?.state = Plain.problem(error.localizedDescription).map { "\(receiver.name): \($0)" } ?? "Idle"
                     }
                     self?.engine = nil
                     self?.rebuildMenu()
@@ -634,21 +636,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func apply(_ stats: SessionStats) {
-        var line = String(format: "≈ %.0f ms · host %.1f · rtt %.1f", stats.estMs, stats.hostMs, stats.rttMs)
-        if let decode = stats.decodeMs { line += String(format: " · dec %.1f", decode) }
-        if let battery = stats.battery {
-            line += " · 📱\(battery)%"
-            if stats.charging == true { line += "⚡" }
-        }
-        if let thermal = stats.thermal, thermal != "none" { line += " · \(thermal)" }
-        if let headroom = stats.thermalHeadroom {
-            // Warn, never throttle on its own: the user decides whether to drop the quality.
-            line += headroom < 0.3 ? String(format: " · 🔥 %.2f", headroom)
-                                   : String(format: " · 🌡%.2f", headroom)
-        }
-        line += String(format: " · %.0f fps", stats.fps)
+        let (line, details) = Plain.session(stats)
+        let first = statsLine.isEmpty
         statsLine = line
         statsItem?.title = line
+        statsItem?.toolTip = details
+        if first { rebuildMenu() } // the line appears with the first numbers
     }
 
     @objc func stopMirror() {
@@ -657,7 +650,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         currentReceiverID = nil
         currentReceiver = nil
         state = "Stopping…"
-        statsLine = "Not streaming"
+        statsLine = ""
         rebuildMenu()
         DispatchQueue.global(qos: .userInitiated).async {
             engine.stop(reason: "menu")
@@ -746,7 +739,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 try service.register()
             }
         } catch {
-            state = "Login item: \(error.localizedDescription)"
+            state = "Could not change Start at Login: \(error.localizedDescription)"
             log("app: login item failed: \(error.localizedDescription)")
         }
         rebuildMenu()
@@ -760,10 +753,10 @@ extension AppDelegate {
         let m = NSMenu()
         let mirroringHere = currentReceiverID == r.id
         let mode = Preferences.shared.screenMode(for: r.id)
-        m.addItem(.run(mode == .extend ? "Extend Screen" : "Mirror Screen", symbol: mode.symbol) { [weak self] in
+        m.addItem(.run(mode == .extend ? "Use as Second Screen" : "Mirror Screen", symbol: mode.symbol) { [weak self] in
             self?.startMirror(r, extend: mode == .extend, ultra: mode.ultra)
         })
-        let modeItem = NSMenuItem(title: "Screen: \(mode.short)", action: nil, keyEquivalent: "")
+        let modeItem = NSMenuItem(title: "Show As: \(mode.short)", action: nil, keyEquivalent: "")
         let modeMenu = NSMenu()
         for each in ScreenMode.allCases {
             if each == .extend { modeMenu.addItem(.separator()) }
@@ -777,7 +770,7 @@ extension AppDelegate {
         addScreenSources(to: modeMenu, for: r)
         modeItem.submenu = modeMenu
         m.addItem(modeItem)
-        m.addItem(.run("Play Sound Only", symbol: "hifispeaker") { [weak self] in self?.startMirror(r, soundOnly: true) })
+        m.addItem(.run("Sound Only (as a Speaker)", symbol: "hifispeaker") { [weak self] in self?.startMirror(r, soundOnly: true) })
         if mirroringHere {
             m.addItem(.run("Stop Mirroring", symbol: "stop.circle") { [weak self] in self?.stopMirror() })
         }
@@ -802,7 +795,7 @@ extension AppDelegate {
 
         m.addItem(.separator())
         m.addItem(volumeItem(r))
-        m.addItem(.run("Put to Sleep", symbol: "moon") { [weak self] in self?.send(["cmd": "sleep"], to: r) })
+        m.addItem(.run("Turn Off the TV", symbol: "power") { [weak self] in self?.send(["cmd": "sleep"], to: r) })
         m.addItem(.separator())
         pairPrompt.menuItems(for: r) { [weak self] in self?.send(["cmd": "connect"], to: r) }.forEach(m.addItem)
         return m
@@ -908,10 +901,10 @@ extension AppDelegate {
                 if let error = response["error"] as? String, error.contains("asks for pairing") {
                     // The window for the code comes with the pairing; this is done again once paired.
                     self.pairPrompt.after(r.id) { self.send(request, to: r) }
-                } else if let error = response["error"] as? String {
+                } else if let error = response["error"] as? String, let words = Plain.problem(error) {
                     let alert = NSAlert()
                     alert.messageText = r.name
-                    alert.informativeText = error
+                    alert.informativeText = words
                     NSApp.activate(ignoringOtherApps: true)
                     alert.runModal()
                 }
@@ -964,6 +957,11 @@ extension AppDelegate: NSMenuDelegate {
     func menuDidClose(_ menu: NSMenu) {
         guard menu === self.menu else { return }
         menuOpen = false
+        // A notice (why it stopped, what went wrong) is read once, then the menu is back to the list.
+        if engine == nil, !needsScreenRecording, state != "Idle" {
+            state = "Idle"
+            pendingMenuRefresh = true
+        }
         if pendingMenuRefresh {
             pendingMenuRefresh = false
             rebuildMenu()
@@ -987,12 +985,12 @@ extension AppDelegate {
                 let codec = engine.plan?.codec.label ?? ""
                 let at = engine.ultraMode.map { " at its \($0)" } ?? ""
                 DispatchQueue.main.async {
-                    self?.state = "\(mode == .extend ? "Extended" : "Mirroring") to \(r.name)\(at) · \(codec)"
+                    self?.state = (mode == .extend ? "\(r.name) is a second screen" : "Mirroring to \(r.name)\(at)") + " · \(codec)"
                     self?.rebuildMenu()
                 }
             } catch {
                 DispatchQueue.main.async {
-                    self?.state = "Error: \(error.localizedDescription)"
+                    self?.state = Plain.problem(error.localizedDescription).map { "\(r.name): \($0)" } ?? "Idle"
                     self?.rebuildMenu()
                 }
                 engine.stop(reason: "switch failed")
@@ -1021,21 +1019,21 @@ enum ScreenMode: String, CaseIterable {
 
     var label: String {
         switch self {
-        case .asIs: return "As It Is: this Mac's screen, scaled"
-        case .speed: return "Match the TV · Speed: 1080p at its fastest rate"
-        case .quality: return "Match the TV · Quality: its sharpest mode"
-        case .likeMac: return "Match the TV · Like This Mac: the nearest size"
-        case .extend: return "Extend: a second screen"
+        case .asIs: return "As It Is: This Mac's Screen, Scaled"
+        case .speed: return "TV's Own Size · Smoothest (1080p at its fastest rate)"
+        case .quality: return "TV's Own Size · Sharpest"
+        case .likeMac: return "TV's Own Size · Closest to This Mac"
+        case .extend: return "As a Second Screen"
         }
     }
 
     var short: String {
         switch self {
         case .asIs: return "As It Is"
-        case .speed: return "Match the TV, Speed"
-        case .quality: return "Match the TV, Quality"
-        case .likeMac: return "Match the TV, Like This Mac"
-        case .extend: return "Extend"
+        case .speed: return "TV's Size, Smoothest"
+        case .quality: return "TV's Size, Sharpest"
+        case .likeMac: return "TV's Size, Like This Mac"
+        case .extend: return "Second Screen"
         }
     }
 

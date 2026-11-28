@@ -6,7 +6,7 @@ import Foundation
 import LuchLocal
 
 private func request(_ r: [String: Any], timeout: TimeInterval = 10) -> [String: Any] {
-    (try? LocalClient.request(r, timeout: timeout)) ?? ["error": "Luch.app is not running"]
+    (try? LocalClient.request(r, timeout: timeout)) ?? ["error": "Luch.app is not running: start it with `open -a Luch`"]
 }
 
 private func failed(_ why: String) -> Never {
@@ -73,7 +73,7 @@ func enterCode(_ id: String, code: String?) -> String? {
 func pairedAndAgain(_ request: [String: Any], _ response: [String: Any], timeout: TimeInterval) -> [String: Any] {
     guard let id = (response["error"] as? String).flatMap(pairingID), isatty(STDIN_FILENO) != 0 else { return response }
     if let why = enterCode(id, code: nil) { return ["error": why] }
-    return (try? LocalClient.request(request, timeout: timeout)) ?? ["error": "Luch.app is not running"]
+    return (try? LocalClient.request(request, timeout: timeout)) ?? ["error": "Luch.app is not running: start it with `open -a Luch`"]
 }
 
 /// The app mirrors in the background: a receiver that asks for pairing shows in its pairing state within the time
