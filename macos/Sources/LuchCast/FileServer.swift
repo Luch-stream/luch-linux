@@ -416,11 +416,15 @@ final class RelayPipe: NSObject, URLSessionDataDelegate {
             return
         }
         var h = "HTTP/1.1 \(status) \(FileServer.reason(status))\r\n"
-        for k in ["Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "Last-Modified", "ETag"] {
+        // URLSession unpacks a gzipped answer by itself: the origin's length is the packed one, so none is passed on.
+        let encoding = (http?.value(forHTTPHeaderField: "Content-Encoding") ?? "").lowercased()
+        let packed = !encoding.isEmpty && encoding != "identity"
+        for k in ["Content-Type", "Content-Length", "Content-Range", "Accept-Ranges", "Last-Modified", "ETag"]
+            where !(packed && k == "Content-Length") {
             if let v = http?.value(forHTTPHeaderField: k) { h += "\(k): \(v)\r\n" }
         }
         for (k, v) in extra { h += "\(k): \(v)\r\n" }
-        if http?.value(forHTTPHeaderField: "Content-Length") == nil {
+        if packed || http?.value(forHTTPHeaderField: "Content-Length") == nil {
             h += "Connection: close\r\n"
             keepAlive = false
         }

@@ -91,6 +91,23 @@ final class CastTests: XCTestCase {
         XCTAssertEqual(String(decoding: get(String(links[0])).2, as: UTF8.self), "segment")
     }
 
+    /// A file the origin sends gzipped (subtitles often are) arrives whole: URLSession unpacks it, so the packed
+    /// length must not go on with it.
+    func testRelayPassesAGzippedAnswerOnWhole() throws {
+        let text = "WEBVTT\n\n00:00:01.000 --> 00:00:04.000\nA line long enough that it packs well, packs well, packs well, packs well.\n"
+        let gz = Data(base64Encoded: "H4sIAAAAAAAA/wt3dQoLCeHiMjCwAiFDPQMDAwVdXTsFqIAJSIDLUSEnMy9VISc/L10hNS+/ND1DoSQjsUQhs0ShIDE5u1ihPDUnR4cIth4XANGO7YtxAAAA")!
+        let origin = try server()
+        let t = origin.share(.file(temp("en.vtt", gz)), client: "127.0.0.1", mime: "text/vtt")
+        let url = origin.url(host: "127.0.0.1", token: t, name: "en.vtt")
+        origin.addHeader(url: url, name: "Content-Encoding", value: "gzip")
+        let relay = try server()
+        let rt = relay.share(.relay(url: url, headers: [:]), client: "127.0.0.1", mime: "")
+        let (code, headers, body) = get(relay.url(host: "127.0.0.1", token: rt, name: "en.vtt"))
+        XCTAssertEqual(code, 200)
+        XCTAssertNil(headers["content-encoding"])
+        XCTAssertEqual(String(decoding: body, as: UTF8.self), text)
+    }
+
     func testPlaylistLinksResolve() {
         let b = "https://cdn.example/a/b/index.m3u8?t=1"
         XCTAssertEqual(Playlist.resolve(base: b, "seg.ts"), "https://cdn.example/a/b/seg.ts")
