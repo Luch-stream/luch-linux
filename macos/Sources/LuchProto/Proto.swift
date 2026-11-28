@@ -30,6 +30,9 @@ public enum Proto {
     public static let audioBps = 128_000
     public static let audioFrameMs = 5
     public static let app = "luch/0.1 (macos)"
+    /// The receiver counts as hot at this thermal headroom or more (PROTOCOL.md 5): it rises toward 1, the severe
+    /// throttling threshold, so higher is hotter. The receiver's own badge uses the same number.
+    public static let hotHeadroom = 0.7
 
     /// 24-byte big-endian datagram header. `delay`: the playout delay D in 0.1 ms (PROTOCOL.md 4k), 0 = at once.
     public static func header(kind: MediaKind, flags: PacketFlags, shard: UInt16, shards: UInt16,

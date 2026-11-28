@@ -79,7 +79,7 @@ public enum Plain {
         var line = String(format: "Delay ≈ %.0f ms · %.0f fps", s.estMs, s.fps)
         if let battery = s.battery { line += " · TV battery \(battery)%" + (s.charging == true ? ", charging" : "") }
         // Warn, never throttle on its own: the person decides whether to lower the quality.
-        if let headroom = s.thermalHeadroom, headroom < 0.3 { line += " · the TV is hot: lower the quality" }
+        if Heat.isHot(headroom: s.thermalHeadroom, thermal: s.thermal) { line += " · the TV is hot: lower the quality" }
         var details = String(format: "≈ %.0f ms: this Mac %.1f ms, network round trip %.1f ms", s.estMs, s.hostMs, s.rttMs)
         if let decode = s.decodeMs { details += String(format: ", TV decoding %.1f ms", decode) }
         details += String(format: " · %.0f fps · %.1f Mbit/s", s.fps, s.mbps)

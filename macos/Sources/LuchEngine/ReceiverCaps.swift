@@ -45,20 +45,11 @@ public struct ReceiverCaps {
     /// What works worse on its Android (welcome `limits.limits`, PROTOCOL.md 5), e.g. "audio_lag".
     public var limits: [String] = []
 
-    /// A phone or tablet running off its own battery.
+    /// A phone, tablet or projector running off its own battery. A TV on mains power sends no `battery`, and
+    /// `charging` means on power (PROTOCOL.md 5).
     public var onBattery: Bool { battery >= 0 && !charging }
     /// none=0, light=1, moderate=2, severe=3, critical=4, and worse.
-    public var thermalRank: Int {
-        switch thermal {
-        case "light": return 1
-        case "moderate": return 2
-        case "severe": return 3
-        case "critical": return 4
-        case "emergency": return 5
-        case "shutdown": return 6
-        default: return 0
-        }
-    }
+    public var thermalRank: Int { Heat.rank(thermal) }
 
     public init?(welcome: [String: Any]) {
         guard (welcome["t"] as? String) == "welcome" else { return nil }
@@ -141,6 +132,27 @@ public struct ReceiverCaps {
         }
         if let prefer { lines.append("  prefer: \(prefer)  (bench at \(benchRes ?? "?"))") }
         return lines.joined(separator: "\n")
+    }
+}
+
+/// When the TV counts as hot (PROTOCOL.md 5), the rule of the receiver's own badge: its thermal headroom at
+/// `Proto.hotHeadroom` or more, or a thermal status of moderate or worse.
+public enum Heat {
+    /// none=0, light=1, moderate=2, severe=3, critical=4, and worse.
+    public static func rank(_ thermal: String?) -> Int {
+        switch thermal {
+        case "light": return 1
+        case "moderate": return 2
+        case "severe": return 3
+        case "critical": return 4
+        case "emergency": return 5
+        case "shutdown": return 6
+        default: return 0
+        }
+    }
+
+    public static func isHot(headroom: Double?, thermal: String?) -> Bool {
+        (headroom ?? -1) >= Proto.hotHeadroom || rank(thermal) >= 2
     }
 }
 

@@ -42,7 +42,13 @@ final class PlainTests: XCTestCase {
         s.battery = 80
         s.charging = true
         s.thermalHeadroom = 0.2
+        // A cool TV: headroom rises toward 1 as it heats.
+        XCTAssertEqual(Plain.session(s).line, "Delay ≈ 71 ms · 60 fps · TV battery 80%, charging")
+        s.thermalHeadroom = 0.8
         XCTAssertEqual(Plain.session(s).line, "Delay ≈ 71 ms · 60 fps · TV battery 80%, charging · the TV is hot: lower the quality")
+        s.thermalHeadroom = nil
+        s.thermal = "severe"
+        XCTAssertTrue(Plain.session(s).line.hasSuffix(" · the TV is hot: lower the quality"))
     }
 
     func testEveryPictureFitHasWords() {

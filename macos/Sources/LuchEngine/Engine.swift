@@ -125,7 +125,7 @@ public struct SessionStats {
     public var battery: Int?
     public var charging: Bool?
     public var thermal: String?
-    /// 1 = cool, below ~0.3 = throttling soon.
+    /// 0 = cool, 1 = severe throttling; hot from `Proto.hotHeadroom` (PROTOCOL.md 5).
     public var thermalHeadroom: Double?
 }
 
@@ -749,10 +749,8 @@ public final class Engine {
             if let charging = deviceCharging, charging { line += " (charging)" }
         }
         if let thermal = deviceThermal, thermal != "none" { line += ", thermal \(thermal)" }
-        if let headroom = deviceHeadroom {
-            line += String(format: ", headroom %.2f", headroom)
-            if headroom < 0.3 { line += " (hot: 720p or 30 fps would help)" }
-        }
+        if let headroom = deviceHeadroom { line += String(format: ", headroom %.2f", headroom) }
+        if Heat.isHot(headroom: deviceHeadroom, thermal: deviceThermal) { line += " (hot: 720p or 30 fps would help)" }
         log(line)
         let snapshot = SessionStats(fps: Double(df), mbps: mbps, hostMs: hostMs,
                                     rttMs: control?.rttMs ?? 0, decodeMs: decodeMs,
