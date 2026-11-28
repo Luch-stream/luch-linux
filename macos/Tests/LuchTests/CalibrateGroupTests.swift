@@ -75,9 +75,16 @@ final class CalibrateGroupTests: XCTestCase {
 
     override func setUp() {
         signal(SIGPIPE, SIG_IGN)
-        let d = UserDefaults(suiteName: "luch.tests.calibrate")!
-        d.removePersistentDomain(forName: "luch.tests.calibrate")
-        store = SyncStore(defaults: d)
+        // A store of its own each time: a domain removed and opened again may still hold the last run's values.
+        let suite = "luch.tests.calibrate.\(UUID().uuidString)"
+        suiteName = suite
+        store = SyncStore(defaults: UserDefaults(suiteName: suite)!)
+    }
+
+    private var suiteName = ""
+
+    override func tearDown() {
+        UserDefaults(suiteName: suiteName)?.removePersistentDomain(forName: suiteName)
     }
 
     private func options() -> MirrorOptions {
