@@ -149,7 +149,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setUpPresenting { [weak self] id in self?.currentReceiverID == id ? self?.engine : nil }
         wireTogether()
         caster.tvs.onChange = { [weak self] in DispatchQueue.main.async { self?.refreshReceivers() } }
-        caster.tvs.start()
+        if !Home.isolated { caster.tvs.start() } // other TVs (DLNA, Chromecast) are real ones: not for a test instance
         startWebReceiver()
 
         rebuildMenu()
