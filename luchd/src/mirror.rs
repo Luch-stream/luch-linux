@@ -690,6 +690,67 @@ impl Dest {
     }
 }
 
+/// The shortest time between two IDRs asked for: one receiver's requests must not turn a group's stream into keyframes
+/// only.
+pub const IDR_COOLDOWN: Duration = Duration::from_millis(500);
+
+/// The keyframe requests of a whole session (every member of a group, a web receiver's full queue) merged into one
+/// IDR, at most one per cooldown: receivers that all lost the same frame get one keyframe, not one each, and a request
+/// within the cooldown waits for its end instead of being lost.
+pub struct IdrGate {
+    want: AtomicBool,
+    last: Mutex<Option<std::time::Instant>>,
+    cooldown: Duration,
+    /// Requests that found none pending, those merged into one already pending, and the IDRs forced.
+    asked: AtomicU64,
+    merged: AtomicU64,
+    sent: AtomicU64,
+}
+
+impl IdrGate {
+    pub fn new(cooldown: Duration) -> Self {
+        IdrGate {
+            want: AtomicBool::new(false),
+            last: Mutex::new(None),
+            cooldown,
+            asked: AtomicU64::new(0),
+            merged: AtomicU64::new(0),
+            sent: AtomicU64::new(0),
+        }
+    }
+
+    pub fn request(&self) {
+        let counter = if self.want.swap(true, Ordering::Relaxed) {
+            &self.merged
+        } else {
+            &self.asked
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Whether the encoder must make the next frame an IDR now: one is pending and the last forced one is older than
+    /// the cooldown. Asked once per frame.
+    pub fn due(&self, now: std::time::Instant) -> bool {
+        if !self.want.load(Ordering::Relaxed) {
+            return false;
+        }
+        let mut last = self.last.lock().unwrap();
+        if last.is_some_and(|t| now.duration_since(t) < self.cooldown) {
+            return false;
+        }
+        *last = Some(now);
+        self.want.store(false, Ordering::Relaxed);
+        self.sent.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
+    /// For the stats: requests, those merged into another, IDRs forced.
+    fn counters(&self) -> Value {
+        json!({"asked": self.asked.load(Ordering::Relaxed), "merged": self.merged.load(Ordering::Relaxed),
+               "sent": self.sent.load(Ordering::Relaxed)})
+    }
+}
+
 /// Where one receiver's stream goes: its interface, its address and its media key (from its `ready`, TLS only).
 type MediaTo = (String, SocketAddrV4, Option<Vec<u8>>);
 
@@ -710,7 +771,7 @@ enum Out {
     Udp(Vec<Dest>),
     /// Whole frame per message (websocket framing is reliable and ordered); on a full channel
     /// drop the frame and ask for an IDR — the browser lags, the stream must not.
-    Ws(mpsc::Sender<Vec<u8>>, Arc<AtomicBool>),
+    Ws(mpsc::Sender<Vec<u8>>, Arc<IdrGate>),
 }
 
 /// Shards per burst before a short pause, so a big IDR doesn't overflow the Wi-Fi queue.
@@ -798,9 +859,9 @@ impl Tx {
         }
     }
 
-    fn ws(kind: u8, tx: mpsc::Sender<Vec<u8>>, want_idr: Arc<AtomicBool>) -> Self {
+    fn ws(kind: u8, tx: mpsc::Sender<Vec<u8>>, idr: Arc<IdrGate>) -> Self {
         Tx {
-            out: Out::Ws(tx, want_idr),
+            out: Out::Ws(tx, idr),
             kind,
             seq: AtomicU32::new(0),
             warned: AtomicBool::new(false),
@@ -899,7 +960,7 @@ impl Tx {
                     }
                 }
             }
-            Out::Ws(tx, want_idr) => {
+            Out::Ws(tx, idr) => {
                 let mut msg = Vec::with_capacity(HEADER + data.len());
                 msg.extend_from_slice(&header(
                     self.kind,
@@ -913,7 +974,7 @@ impl Tx {
                 ));
                 msg.extend_from_slice(data);
                 if let Err(TrySendError::Full(_) | TrySendError::Closed(_)) = tx.try_send(msg) {
-                    want_idr.store(true, Ordering::Relaxed);
+                    idr.request();
                 }
             }
         }
@@ -1229,13 +1290,13 @@ fn render_node() -> String {
 }
 
 /// Hooks the appsinks to the senders; returns the "resend OpusHead" flag (set on every video IDR).
-/// `want_idr` is shared with a websocket sink, which sets it when it drops a frame.
+/// `idr` takes every keyframe request of the session; the encoder asks it once per frame.
 /// Without a "v" sink only audio is wired.
 fn wire(
     p: &gst::Pipeline,
     video: Arc<Tx>,
     audio: Arc<Tx>,
-    want_idr: Arc<AtomicBool>,
+    idr: Arc<IdrGate>,
     size: Size,
 ) -> Arc<AtomicBool> {
     let need_head = Arc::new(AtomicBool::new(true));
@@ -1250,7 +1311,6 @@ fn wire(
     let nh_audio = need_head.clone();
 
     let nh = need_head.clone();
-    let wi = want_idr.clone();
     if let Some(vsink) = p
         .by_name("v")
         .and_then(|v| v.downcast::<gst_app::AppSink>().ok())
@@ -1295,7 +1355,7 @@ fn wire(
                             }
                         }
                     }
-                    let force = wi.swap(false, Ordering::Relaxed);
+                    let force = idr.due(std::time::Instant::now());
                     let (pts, _) = timing(s, pts_rt);
                     let r =
                         enc.as_mut()
@@ -1367,6 +1427,22 @@ struct Grabber {
     reader: Option<std::thread::JoinHandle<()>>,
     /// Set before a stop of ours, so that its EOF is not taken for a dead helper.
     stopping: Arc<AtomicBool>,
+    kick: Arc<KmsKick>,
+}
+
+/// `k` to luch-kms when the session's gate lets an IDR through: at once on a request, else from the reader at the
+/// first frame after the cooldown.
+struct KmsKick {
+    idr: Arc<IdrGate>,
+    to: Mutex<Box<dyn std::io::Write + Send>>,
+}
+
+impl KmsKick {
+    fn kick(&self) {
+        if self.idr.due(std::time::Instant::now()) {
+            let _ = self.to.lock().unwrap().write_all(b"k");
+        }
+    }
 }
 
 enum GrabberKind {
@@ -1375,17 +1451,9 @@ enum GrabberKind {
 }
 
 impl Grabber {
-    /// Ask for an IDR.
-    fn idr(&mut self) {
-        use std::io::Write;
-        let _ = match &mut self.kind {
-            GrabberKind::Child(c) => c
-                .stdin
-                .as_mut()
-                .map(|s| s.write_all(b"k"))
-                .unwrap_or(Ok(())),
-            GrabberKind::Socket(s) => s.write_all(b"k"),
-        };
+    /// An IDR, when the gate has one pending and lets it through.
+    fn kick(&self) {
+        self.kick.kick();
     }
 
     fn stop(mut self) {
@@ -1428,6 +1496,7 @@ fn spawn_kms(
     hevc: bool,
     size: Size,
     pipeline: gst::Pipeline,
+    idr: Arc<IdrGate>,
     dead: mpsc::UnboundedSender<String>,
 ) -> Result<Grabber, String> {
     use std::io::{Read, Write};
@@ -1439,12 +1508,14 @@ fn spawn_kms(
         size.height,
         if hevc { "hevc" } else { "h264" }
     );
-    let (kind, out): (GrabberKind, Box<dyn Read + Send>) =
+    type Io = (GrabberKind, Box<dyn Read + Send>, Box<dyn Write + Send>);
+    let (kind, out, to): Io =
         match kms_socket().and_then(|p| std::os::unix::net::UnixStream::connect(p).ok()) {
             Some(mut s) => {
                 writeln!(s, "{opts}").map_err(|e| format!("luch-kms socket: {e}"))?;
-                let out = s.try_clone().map_err(|e| format!("luch-kms socket: {e}"))?;
-                (GrabberKind::Socket(s), Box::new(out))
+                let err = |e: std::io::Error| format!("luch-kms socket: {e}");
+                let (out, to) = (s.try_clone().map_err(err)?, s.try_clone().map_err(err)?);
+                (GrabberKind::Socket(s), Box::new(out), Box::new(to))
             }
             None => {
                 let exe = kms_exe();
@@ -1454,12 +1525,16 @@ fn spawn_kms(
                     .stdout(Stdio::piped())
                     .spawn()
                     .map_err(|e| format!("{}: {e}", exe.display()))?;
-                let out = child.stdout.take().unwrap();
-                (GrabberKind::Child(child), Box::new(out))
+                let (out, to) = (child.stdout.take().unwrap(), child.stdin.take().unwrap());
+                (GrabberKind::Child(child), Box::new(out), Box::new(to))
             }
         };
+    let kick = Arc::new(KmsKick {
+        idr,
+        to: Mutex::new(to),
+    });
     Ok(Grabber::reading(
-        kind, out, video, need_head, pipeline, dead,
+        kind, out, video, need_head, pipeline, kick, dead,
     ))
 }
 
@@ -1471,10 +1546,12 @@ impl Grabber {
         video: Arc<Tx>,
         need_head: Arc<AtomicBool>,
         pipeline: gst::Pipeline,
+        kick: Arc<KmsKick>,
         dead: mpsc::UnboundedSender<String>,
     ) -> Self {
         let stopping = Arc::new(AtomicBool::new(false));
         let ours = stopping.clone();
+        let k = kick.clone();
         let reader = std::thread::spawn(move || {
             let mut hdr = [0u8; 13];
             let mut buf = Vec::new();
@@ -1509,6 +1586,7 @@ impl Grabber {
                     cap.saturating_sub(base),
                     lat,
                 );
+                k.kick(); // a request the cooldown held back
             };
             if !ours.load(Ordering::SeqCst) {
                 let _ = dead.send(format!("luch-kms stopped sending ({why})"));
@@ -1518,6 +1596,7 @@ impl Grabber {
             kind,
             reader: Some(reader),
             stopping,
+            kick,
         }
     }
 }
@@ -1774,13 +1853,13 @@ pub async fn run(
         .map_err(|_| "control channel closed")?;
     let ready = await_ready(&mut events).await?;
     // Web receivers take media over their websocket; everything else gets UDP sockets.
-    let want_idr = Arc::new(AtomicBool::new(false));
+    let idr = Arc::new(IdrGate::new(IDR_COOLDOWN));
     // Which member (0 = the target) each video and audio destination belongs to.
     let (mut video_of, mut audio_of): (Vec<usize>, Vec<usize>) = (vec![0], vec![0]);
     let (video, audio) = if let Some(ws) = t.ws.clone() {
         (
-            Arc::new(Tx::ws(KIND_VIDEO, ws.clone(), want_idr.clone())),
-            Arc::new(Tx::ws(KIND_AUDIO, ws, want_idr.clone())),
+            Arc::new(Tx::ws(KIND_VIDEO, ws.clone(), idr.clone())),
+            Arc::new(Tx::ws(KIND_AUDIO, ws, idr.clone())),
         )
     } else {
         let (vp, ap) = control::ready_ports(&ready).ok_or(format!("bad ready: {ready}"))?;
@@ -1912,15 +1991,16 @@ pub async fn run(
         video.start_timeline();
         audio.start_timeline();
     }
-    let need_head = wire(&p, video.clone(), audio.clone(), want_idr.clone(), size);
+    let need_head = wire(&p, video.clone(), audio.clone(), idr.clone(), size);
     let (kms_dead, mut kms_died) = mpsc::unbounded_channel::<String>();
-    let mut kms = if t.kms {
+    let kms = if t.kms {
         Some(spawn_kms(
             video.clone(),
             need_head,
             hevc,
             size,
             p.clone(),
+            idr.clone(),
             kms_dead,
         )?)
     } else {
@@ -1992,7 +2072,7 @@ pub async fn run(
                 // Rough glass-to-glass estimate without the display: capture+encode + one-way network + decode.
                 let decode = rx_stats["decode_ms"].as_f64().unwrap_or(0.0);
                 let est = host_ms + rtt.as_f64().unwrap_or(0.0) / 2.0 + decode;
-                let mut all = json!({"sender": sender, "receiver": rx_stats, "est_ms": round1(est)});
+                let mut all = json!({"sender": sender, "receiver": rx_stats, "est_ms": round1(est), "idr": idr.counters()});
                 if let Some(g) = gs.as_mut() {
                     all["group"] = g.tick(&video, &video_of, &audio, &audio_of);
                     for (k, offset) in g.offsets_to_send() {
@@ -2016,9 +2096,9 @@ pub async fn run(
             }
             ev = events.recv() => match ev {
                 Ok(v) if v["t"] == "keyframe" => {
-                    want_idr.store(true, Ordering::Relaxed);
-                    if let Some(k) = kms.as_mut() {
-                        k.idr();
+                    idr.request();
+                    if let Some(k) = &kms {
+                        k.kick();
                     }
                 }
                 Ok(v) if v["t"] == "stats" => {
@@ -2058,9 +2138,9 @@ pub async fn run(
             },
             Some((k, v)) = member_rx.recv() => match v["t"].as_str() {
                 Some("keyframe") => {
-                    want_idr.store(true, Ordering::Relaxed);
-                    if let Some(kms) = kms.as_mut() {
-                        kms.idr();
+                    idr.request();
+                    if let Some(k) = &kms {
+                        k.kick();
                     }
                 }
                 Some("stats") => {
@@ -2362,10 +2442,10 @@ mod tests {
             .downcast::<gst_app::AppSrc>()
             .unwrap();
         let (tx, mut rx) = mpsc::channel(8);
-        let want_idr = Arc::new(AtomicBool::new(false));
-        let video = Arc::new(Tx::ws(KIND_VIDEO, tx.clone(), want_idr.clone()));
-        let audio = Arc::new(Tx::ws(KIND_AUDIO, tx, want_idr.clone()));
-        let need_head = wire(&pipeline, video, audio, want_idr.clone(), Size::default());
+        let idr = Arc::new(IdrGate::new(IDR_COOLDOWN));
+        let video = Arc::new(Tx::ws(KIND_VIDEO, tx.clone(), idr.clone()));
+        let audio = Arc::new(Tx::ws(KIND_AUDIO, tx, idr.clone()));
+        let need_head = wire(&pipeline, video, audio, idr.clone(), Size::default());
         pipeline.set_state(gst::State::Playing).unwrap();
         for _ in 0..2 {
             // The KMS forwarding thread sets this on every IDR.
@@ -2383,7 +2463,7 @@ mod tests {
             assert_eq!(config[1], F_CONFIG);
             assert_eq!(&config[HEADER..], &opus_head());
             assert_eq!(data[1], 0);
-            assert!(!want_idr.load(Ordering::Relaxed));
+            assert!(!idr.due(std::time::Instant::now()));
         }
         pipeline.set_state(gst::State::Null).unwrap();
     }
@@ -2391,8 +2471,8 @@ mod tests {
     #[tokio::test]
     async fn ws_frame_is_one_whole_message() {
         let (tx, mut rx) = mpsc::channel(1);
-        let want_idr = Arc::new(AtomicBool::new(false));
-        let t = Tx::ws(KIND_AUDIO, tx, want_idr.clone());
+        let idr = Arc::new(IdrGate::new(IDR_COOLDOWN));
+        let t = Tx::ws(KIND_AUDIO, tx, idr.clone());
         let frame: Vec<u8> = (0..SHARD * 2 + 100).map(|i| i as u8).collect();
         t.send_frame(&frame, F_CONFIG, 42, 3); // fills the channel
         t.send_frame(&frame, 0, 43, 3); // full: dropped, an IDR is requested instead of stalling
@@ -2403,7 +2483,29 @@ mod tests {
             &header(KIND_AUDIO, F_CONFIG, 0, 1, 0, 42, frame.len() as u32, 3)
         );
         assert_eq!(&msg[HEADER..], &frame[..]);
-        assert!(want_idr.load(Ordering::Relaxed));
+        assert!(idr.due(std::time::Instant::now()));
+    }
+
+    #[test]
+    fn keyframe_requests_are_merged_with_a_cooldown_for_everyone() {
+        let gate = IdrGate::new(Duration::from_millis(500));
+        let t0 = std::time::Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        assert!(!gate.due(t0), "nothing asked");
+        // Three members lost the same frame: one IDR.
+        gate.request();
+        gate.request();
+        gate.request();
+        assert!(gate.due(at(1)));
+        assert!(!gate.due(at(2)));
+        // Asked again soon after: held for the end of the cooldown, then sent, once.
+        gate.request();
+        assert!(!gate.due(at(100)));
+        assert!(!gate.due(at(400)));
+        gate.request();
+        assert!(gate.due(at(501)));
+        assert!(!gate.due(at(1200)));
+        assert_eq!(gate.counters(), json!({"asked": 2, "merged": 3, "sent": 2}));
     }
 
     #[test]
@@ -2463,9 +2565,14 @@ mod tests {
         let (rx, d) = pair();
         rx.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let video = Arc::new(Tx::udp(KIND_VIDEO, vec![d]));
+        let idr = Arc::new(IdrGate::new(Duration::from_millis(100)));
         let start = |video: &Arc<Tx>| {
             let (ours, mut helper) = UnixStream::pair().unwrap();
-            let out = ours.try_clone().unwrap();
+            let (out, to) = (ours.try_clone().unwrap(), ours.try_clone().unwrap());
+            let kick = Arc::new(KmsKick {
+                idr: idr.clone(),
+                to: Mutex::new(Box::new(to)),
+            });
             let (dead, died) = mpsc::unbounded_channel();
             let g = Grabber::reading(
                 GrabberKind::Socket(ours),
@@ -2473,6 +2580,7 @@ mod tests {
                 video.clone(),
                 Arc::new(AtomicBool::new(false)),
                 gst::Pipeline::new(),
+                kick,
                 dead,
             );
             helper.write_all(&kms_frame(true, 5_000, b"idr")).unwrap();
@@ -2481,9 +2589,22 @@ mod tests {
         let mut buf = [0u8; 64];
 
         // Stopped by us: the reader is joined, nothing is reported.
-        let (g, _helper, mut died) = start(&video);
+        let (g, mut helper, mut died) = start(&video);
         let n = rx.recv(&mut buf).unwrap();
         assert_eq!((buf[1] & F_IDR, &buf[HEADER..n]), (F_IDR, &b"idr"[..]));
+        // A keyframe asked for: `k` at once; asked again within the cooldown: `k` with the first frame after it.
+        let mut k = [0u8; 1];
+        idr.request();
+        g.kick();
+        std::io::Read::read_exact(&mut helper, &mut k).unwrap();
+        assert_eq!(&k, b"k");
+        idr.request();
+        g.kick();
+        std::thread::sleep(Duration::from_millis(120));
+        helper.write_all(&kms_frame(false, 6_000, b"p")).unwrap();
+        std::io::Read::read_exact(&mut helper, &mut k).unwrap();
+        assert_eq!(&k, b"k");
+        rx.recv(&mut buf).unwrap();
         g.stop();
         assert!(matches!(
             died.try_recv(),

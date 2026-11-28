@@ -271,6 +271,9 @@ Live numbers as JSON, refreshed every second while mirroring, `{}` otherwise:
 - `host_ms` — capture → encoded packet on the sender (scanout flip time in `fast` mode).
 - `decode_ms` — the receiver's decoder time, as it reports it.
 - `est_ms` — `host_ms + rtt_ms / 2 + decode_ms`; the display's own latency is not included.
+- `idr` — keyframe requests: `asked`, `merged` (into one already pending: a group's members that lost the same
+  frame) and `sent` (IDRs forced). At most one IDR per 500 ms for the whole session; a request within that wait is
+  kept and served at its end.
 
 The same sender numbers are sent to the receiver (`sender_stats`) for its on-screen overlay.
 
