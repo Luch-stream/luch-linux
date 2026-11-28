@@ -281,4 +281,80 @@ final class GroupTests: XCTestCase {
         XCTAssertTrue(tv.received("start").isEmpty)
         XCTAssertTrue(old.received("start").isEmpty)
     }
+
+    func testAReceiverJoinsAPlayingGroupAtTheNextKeyframeAndLeavesTheOthersPlaying() throws {
+        let kitchen = FakeSyncReceiver(name: "Kitchen", needMs: 100)
+        let den = FakeSyncReceiver(name: "Den", needMs: 100)
+        let g = GroupSession(members: [GroupMember(kitchen.receiver, role: .both), GroupMember(den.receiver, role: .audio)],
+                             mode: .watching, soundOnly: false, options: options(), store: store)
+        var ended: String?
+        g.onStopped = { ended = $0 }
+        try g.start()
+        defer { g.stop(reason: "test") }
+        XCTAssertTrue(eventually { kitchen.media(kind: 2).last.map { $0.be16(22) } == 1500 }, "D at the floor")
+        XCTAssertTrue(eventually { kitchen.media(kind: 1).count > 10 }, "the picture plays")
+
+        // One more TV, slower than the others: it starts at a keyframe and the OpusHead, at the group's D…
+        let bedroom = FakeSyncReceiver(name: "Bedroom", needMs: 300)
+        XCTAssertEqual(g.defaultJoinRole, .both)
+        try g.add(GroupMember(bedroom.receiver, role: .both))
+        let start = bedroom.received("start").first ?? [:]
+        let group = start["group"] as? [String: Any] ?? [:]
+        let first = (kitchen.received("start").first?["group"] as? [String: Any]) ?? [:]
+        XCTAssertEqual(start["mode"] as? String, "mirror")
+        XCTAssertEqual(group["id"] as? String, g.id)
+        XCTAssertEqual(group["timeline"] as? Int, first["timeline"] as? Int, "the group's own timeline")
+        XCTAssertTrue(eventually { !bedroom.media(kind: 1).isEmpty && !bedroom.media(kind: 2).isEmpty })
+        XCTAssertEqual(bedroom.media(kind: 1)[0][1] & PacketFlags.idr.rawValue, PacketFlags.idr.rawValue,
+                       "never a P-frame first")
+        XCTAssertEqual(bedroom.media(kind: 2)[0][1] & PacketFlags.config.rawValue, PacketFlags.config.rawValue)
+        XCTAssertEqual(bedroom.media(kind: 2)[0].be16(22), 1500, "the D everyone has")
+        // …and D rises once, for everyone at the same frame, when it reports its need.
+        for tv in [kitchen, den, bedroom] {
+            XCTAssertTrue(eventually { tv.media(kind: 2).last.map { $0.be16(22) } == 3100 }, "\(tv.name): D 310 ms")
+        }
+        XCTAssertEqual(g.receiverIDs, ["kitchen", "den", "bedroom"])
+
+        // Removing one leaves the others untouched; the first one too.
+        XCTAssertEqual(g.remove("den"), false)
+        XCTAssertTrue(eventually { !den.received("stop").isEmpty })
+        Thread.sleep(forTimeInterval: 0.3)
+        let denHad = den.media(kind: 2).count
+        XCTAssertEqual(g.remove("kitchen"), false)
+        let bedroomHad = bedroom.media(kind: 1).count
+        Thread.sleep(forTimeInterval: 0.4)
+        XCTAssertEqual(den.media(kind: 2).count, denHad, "nothing more to who left")
+        XCTAssertGreaterThan(bedroom.media(kind: 1).count, bedroomHad, "the one left plays on")
+        XCTAssertNil(ended)
+        XCTAssertNil(g.remove("den"), "not in the group any more")
+        let members = (g.stats["group"] as? [String: Any])?["members"] as? [[String: Any]]
+        XCTAssertTrue(eventually { ((g.stats["group"] as? [String: Any])?["members"] as? [[String: Any]])?.count == 1 },
+                      "\(members ?? [])")
+
+        // The last one out ends the group.
+        XCTAssertEqual(g.remove("bedroom"), true)
+        XCTAssertNotNil(ended)
+        XCTAssertTrue(eventually { !bedroom.received("stop").isEmpty })
+    }
+
+    func testAGroupOfSoundOnlyTakesSpeakersOnly() throws {
+        let kitchen = FakeSyncReceiver(name: "Kitchen", needMs: 100)
+        let den = FakeSyncReceiver(name: "Den", needMs: 100)
+        let g = GroupSession(members: [GroupMember(kitchen.receiver, role: .audio), GroupMember(den.receiver, role: .audio)],
+                             mode: .watching, soundOnly: true, options: options(), store: store)
+        try g.start()
+        defer { g.stop(reason: "test") }
+        let bedroom = FakeSyncReceiver(name: "Bedroom", needMs: 100)
+        XCTAssertEqual(g.defaultJoinRole, .audio)
+        XCTAssertThrowsError(try g.add(GroupMember(bedroom.receiver, role: .both))) { error in
+            XCTAssertTrue(error.localizedDescription.contains("speaker"), error.localizedDescription)
+        }
+        XCTAssertThrowsError(try g.add(GroupMember(kitchen.receiver, role: .audio))) { error in
+            XCTAssertEqual(Plain.kind(error.localizedDescription), "playingHere")
+        }
+        try g.add(GroupMember(bedroom.receiver, role: .audio))
+        XCTAssertEqual(bedroom.received("start").first?["mode"] as? String, "audio")
+        XCTAssertTrue(eventually { !bedroom.media(kind: 2).isEmpty })
+        XCTAssertTrue(bedroom.media(kind: 1).isEmpty)
+    }
 }

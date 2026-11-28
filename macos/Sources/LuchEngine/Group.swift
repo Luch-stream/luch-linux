@@ -1,6 +1,8 @@
 // Several receivers in step (PROTOCOL.md 4k): one capture and one encode, sent to every member on its own sockets
 // with the playout delay D in each packet; each member gets the streams of its role, its clock requests are answered,
-// and D follows what the members report, chosen by SyncPolicy as luchd chooses it.
+// and D follows what the members report, chosen by SyncPolicy as luchd chooses it. Members join and leave while it
+// plays, as luchd's: one that joins starts at the next keyframe and OpusHead, at the group's D; the last one out
+// ends the group.
 // SPDX-License-Identifier: GPL-3.0-or-later
 import CoreMedia
 import Foundation
@@ -25,10 +27,14 @@ public final class GroupSession {
     /// The Mac's sound only, every member a speaker; else the screen and its sound.
     public let soundOnly: Bool
     public let id = UUID().uuidString
-    /// Each member's receiver id, in the order given (the first shows the picture unless sound only).
-    public var receiverIDs: [String] { parts.map(\.receiver.id) }
+    /// Each member's receiver id, those playing now, in the order they came.
+    public var receiverIDs: [String] {
+        lock.lock()
+        defer { lock.unlock() }
+        return parts.filter(\.present).map(\.receiver.id)
+    }
     public var onStats: (([String: Any]) -> Void)?
-    /// The session ended on its own (the first member stopped, capture failed).
+    /// The session ended on its own (the last member left, capture failed).
     public var onStopped: ((String) -> Void)?
     /// A member's person is asked to Allow this Mac (PROTOCOL.md 3a).
     public var onWaitingForAllow: ((String) -> Void)?
@@ -79,6 +85,9 @@ public final class GroupSession {
         var report = SyncReport()
         var stats: [String: Any] = [:]
         var present = true
+        /// It joined a running group: no picture before an IDR, no sound before an OpusHead.
+        var waitVideo = false
+        var waitAudio = false
         /// The correction in use and the route it was chosen for.
         var offset: (ms: Double, route: String?)
 
@@ -178,7 +187,10 @@ public final class GroupSession {
     /// Sends a control message to one member (the latency lab's flag); false when it is not in this group.
     @discardableResult
     public func send(_ message: [String: Any], to receiverID: String) -> Bool {
-        guard let p = parts.first(where: { $0.receiver.id == receiverID }), let c = p.control else { return false }
+        lock.lock()
+        let p = parts.first { $0.present && $0.receiver.id == receiverID }
+        lock.unlock()
+        guard let c = p?.control else { return false }
         return c.send(message)
     }
 
@@ -210,27 +222,30 @@ public final class GroupSession {
     // MARK: - start
 
     private func connectAll() throws {
+        for (k, p) in parts.enumerated() { try connect(p, k) }
+    }
+
+    /// Opens member `k`'s control channel and checks it can play its part.
+    private func connect(_ p: Part, _ k: Int) throws {
         let identity = senderIdentity()
-        for (k, p) in parts.enumerated() {
-            let r = p.receiver
-            // Each member over TLS and paired when it offers that (Connector), asked for its code as any connection is.
-            let c = try Connector.shared.open(r, hello: ["t": "hello", "v": Int(Proto.version), "id": identity.id,
-                                                         "name": identity.name, "app": Proto.app,
-                                                         "want": ["mirror", "reports"]])
-            let ctl = c.channel
-            p.control = ctl
-            ctl.onEvent = { [weak self] msg in self?.handle(k, msg) }
-            ctl.onClosed = { [weak self] why in self?.handle(k, ["t": "_closed", "why": why]) }
-            let welcome = c.welcome
-            guard let caps = ReceiverCaps(welcome: welcome) else { throw EngineError.noWelcome }
-            p.caps = caps
-            guard Sync.capable(welcome) else { throw EngineError.refused("\(r.name) cannot play in step yet: update it") }
-            if p.role.audio && (soundOnly || k > 0) && !caps.hasOpus {
-                throw EngineError.refused("\(r.name) cannot play this Mac's sound (no Opus)")
-            }
-            if soundOnly && !caps.modes.contains("audio") {
-                throw EngineError.refused("\(r.name) cannot play sound only yet: update it")
-            }
+        let r = p.receiver
+        // Each member over TLS and paired when it offers that (Connector), asked for its code as any connection is.
+        let c = try Connector.shared.open(r, hello: ["t": "hello", "v": Int(Proto.version), "id": identity.id,
+                                                     "name": identity.name, "app": Proto.app,
+                                                     "want": ["mirror", "reports"]])
+        let ctl = c.channel
+        p.control = ctl
+        ctl.onEvent = { [weak self] msg in self?.handle(k, msg) }
+        ctl.onClosed = { [weak self] why in self?.handle(k, ["t": "_closed", "why": why]) }
+        let welcome = c.welcome
+        guard let caps = ReceiverCaps(welcome: welcome) else { throw EngineError.noWelcome }
+        p.caps = caps
+        guard Sync.capable(welcome) else { throw EngineError.refused("\(r.name) cannot play in step yet: update it") }
+        if p.role.audio && (soundOnly || k > 0) && !caps.hasOpus {
+            throw EngineError.refused("\(r.name) cannot play this Mac's sound (no Opus)")
+        }
+        if soundOnly && !caps.modes.contains("audio") {
+            throw EngineError.refused("\(r.name) cannot play sound only yet: update it")
         }
     }
 
@@ -248,51 +263,161 @@ public final class GroupSession {
 
     private func startAll() throws {
         plan = planVideo()
-        let video: [String: Any]? = plan.map {
-            ["codec": $0.codec.rawValue, "width": $0.width, "height": $0.height, "fps": $0.fps]
-        }
-        for (k, p) in parts.enumerated() {
-            guard let ctl = p.control, let caps = p.caps else { continue }
-            var start: [String: Any] = ["t": "start", "mode": "audio"]
-            if p.role.video, let video {
-                start = ["t": "start", "mode": "mirror", "video": video]
-            }
-            // The first member's sound is its own choice (luchd: the mirroring target's); the others' plays as it comes.
-            let audioMode = k == 0 && !soundOnly ? store.audioMode(p.receiver.id) : .on
-            let wantsSound = soundOnly || (options.audio && caps.hasOpus)
-            let audioBlock = wantsSound ? audioMode.startBlock(limits: caps.limits, frameMs: options.audioFrameMs) : nil
-            if p.role.audio, let audioBlock { start["audio"] = audioBlock }
-            start["group"] = Sync.groupBlock(id: id, timeline: timeline, role: p.role, mode: mode,
-                                             toleranceMs: Self.toleranceMs, offsetMs: p.offset.ms)
-            let ready = try startWhenAllowed(ctl, start, name: p.receiver.name)
-            let r = p.receiver
-            // Each member's media sealed with the key of its own ready (PROTOCOL.md 4).
-            let seal = try MediaSeal.key(ready: ready).flatMap { MediaSeal(key: $0) }
-            if start["video"] != nil, let port = (ready["video_port"] as? NSNumber)?.uint16Value, port > 0 {
-                p.video = UdpSender.open(kind: .video, ip: r.address, port: port, interfaceIndex: r.interfaceIndex,
-                                         dscp: 40, seal: seal)
-                if p.video == nil { throw EngineError.socket }
-            }
-            if start["audio"] != nil, let port = (ready["audio_port"] as? NSNumber)?.uint16Value, port > 0 {
-                p.audio = UdpSender.open(kind: .audio, ip: r.address, port: port, interfaceIndex: r.interfaceIndex,
-                                         dscp: 48, seal: seal)
-                if p.audio == nil { throw EngineError.socket }
-            }
-            log("group: \(r.name) ready (\(p.role.rawValue))")
-        }
+        for (k, p) in parts.enumerated() { try start(p, k) }
         base = CMClockGetTime(CMClockGetHostTimeClock())
         started = Date()
+        for p in parts { answerClock(p) }
+    }
+
+    /// Member `k`'s start, the streams of its role and the group, and its senders once it is ready.
+    private func start(_ p: Part, _ k: Int) throws {
+        guard let ctl = p.control, let caps = p.caps else { return }
+        var start: [String: Any] = ["t": "start", "mode": "audio"]
+        if p.role.video, let plan {
+            start = ["t": "start", "mode": "mirror",
+                     "video": ["codec": plan.codec.rawValue, "width": plan.width, "height": plan.height, "fps": plan.fps]]
+        }
+        // The first member's sound is its own choice (luchd: the mirroring target's); the others' plays as it comes.
+        let audioMode = k == 0 && !soundOnly ? store.audioMode(p.receiver.id) : .on
+        let wantsSound = soundOnly || (options.audio && caps.hasOpus)
+        let audioBlock = wantsSound ? audioMode.startBlock(limits: caps.limits, frameMs: options.audioFrameMs) : nil
+        if p.role.audio, let audioBlock { start["audio"] = audioBlock }
+        start["group"] = Sync.groupBlock(id: id, timeline: timeline, role: p.role, mode: mode,
+                                         toleranceMs: Self.toleranceMs, offsetMs: p.offset.ms)
+        let ready = try startWhenAllowed(ctl, start, name: p.receiver.name)
+        let r = p.receiver
+        // Each member's media sealed with the key of its own ready (PROTOCOL.md 4).
+        let seal = try MediaSeal.key(ready: ready).flatMap { MediaSeal(key: $0) }
+        if start["video"] != nil, let port = (ready["video_port"] as? NSNumber)?.uint16Value, port > 0 {
+            p.video = UdpSender.open(kind: .video, ip: r.address, port: port, interfaceIndex: r.interfaceIndex,
+                                     dscp: 40, seal: seal)
+            if p.video == nil { throw EngineError.socket }
+        }
+        if start["audio"] != nil, let port = (ready["audio_port"] as? NSNumber)?.uint16Value, port > 0 {
+            p.audio = UdpSender.open(kind: .audio, ip: r.address, port: port, interfaceIndex: r.interfaceIndex,
+                                     dscp: 48, seal: seal)
+            if p.audio == nil { throw EngineError.socket }
+        }
+        log("group: \(r.name) ready (\(p.role.rawValue))")
+    }
+
+    /// A member's clock requests answered on its sockets, on the session's pts clock: the host clock from its zero.
+    private func answerClock(_ p: Part) {
         let base = self.base
-        // The pts clock: the host clock from the session's zero, the clock every pts here is on.
         let now: () -> UInt64? = {
             let us = (CMTimeGetSeconds(CMClockGetTime(CMClockGetHostTimeClock())) - CMTimeGetSeconds(base)) * 1e6
             return UInt64(max(0, us))
         }
-        for p in parts {
-            for tx in [p.video, p.audio].compactMap({ $0 }) {
-                tx.startTimeline()
-                clocks.append(ClockResponder(on: tx, now: now))
+        for tx in [p.video, p.audio].compactMap({ $0 }) {
+            tx.startTimeline()
+            let c = ClockResponder(on: tx, now: now)
+            lock.lock()
+            clocks.append(c)
+            lock.unlock()
+        }
+    }
+
+    // MARK: - joining and leaving while it plays
+
+    /// The role a receiver joining gets when none is asked for: a speaker in a group of sound only, else the picture
+    /// and its sound.
+    public var defaultJoinRole: GroupRole { soundOnly ? .audio : .both }
+
+    /// Puts a receiver into the playing group: connected (paired as any connection), started with the group's
+    /// timeline, it gets the current D and nothing before the next keyframe and OpusHead, which are asked for at once;
+    /// D rises for everyone once if it needs more. Blocks until it plays or refused.
+    public func add(_ member: GroupMember) throws {
+        let r = member.receiver
+        lock.lock()
+        guard running, !stopping else {
+            lock.unlock()
+            throw EngineError.refused("the group has ended")
+        }
+        guard !parts.contains(where: { $0.present && $0.receiver.id == r.id }) else {
+            lock.unlock()
+            throw EngineError.refused("\(r.name) is playing already: stop it first")
+        }
+        lock.unlock()
+        if soundOnly && member.role != .audio {
+            throw EngineError.refused("this group plays sound only: \(r.name) can join it as a speaker")
+        }
+        if member.role.audio && audio == nil { throw EngineError.refused("this group plays no sound") }
+        if member.role.video && encoder == nil { throw EngineError.refused("this group plays no picture") }
+        let p = Part(member, offset: store.currentOffset(r.id))
+        p.present = false
+        lock.lock()
+        let k = parts.count
+        parts.append(p)
+        lock.unlock()
+        do {
+            try connect(p, k)
+            if member.role.video, let plan, p.caps?.canDecode(plan.codec) == false {
+                throw EngineError.refused("\(r.name) cannot decode \(plan.codec == .hevc ? "HEVC" : "H.264"), " +
+                                          "the picture of this group")
             }
+            try start(p, k)
+        } catch {
+            p.control?.send(["t": "stop"])
+            p.control?.bye()
+            throw error
+        }
+        answerClock(p)
+        lock.lock()
+        let d = self.d
+        p.video?.setDelay(Sync.headerUnits(d.video))
+        p.audio?.setDelay(Sync.headerUnits(d.audio))
+        (p.waitVideo, p.waitAudio, p.present) = (p.video != nil, p.audio != nil, true)
+        lock.unlock()
+        if p.video != nil { wantIDR.set() }
+        if p.audio != nil { needHead.set() }
+        log("group: \(r.name) joined (\(member.role.rawValue))")
+    }
+
+    /// Takes a member out: it stops, the others play on; the last one out ends the group. Nil when it is not in the
+    /// group, else whether the group ended with it.
+    @discardableResult
+    public func remove(_ receiverID: String) -> Bool? {
+        lock.lock()
+        guard let p = parts.first(where: { $0.present && $0.receiver.id == receiverID }) else {
+            lock.unlock()
+            return nil
+        }
+        p.present = false
+        let last = !parts.contains(where: \.present)
+        lock.unlock()
+        p.control?.send(["t": "stop"])
+        p.control?.bye()
+        log("group: \(p.receiver.name) removed")
+        if last { stop(reason: "the last receiver left") }
+        return last
+    }
+
+    /// The video senders this frame goes to: a member that joined waits for an IDR.
+    private func videoSenders(idr: Bool) -> [UdpSender] {
+        lock.lock()
+        defer { lock.unlock() }
+        return parts.filter(\.present).compactMap { p in
+            guard let tx = p.video else { return nil }
+            if p.waitVideo {
+                guard idr else { return nil }
+                p.waitVideo = false
+            }
+            return tx
+        }
+    }
+
+    /// The audio senders this frame goes to, and whether each gets the OpusHead first: a member that joined waits
+    /// for it.
+    private func audioSenders(head: Bool) -> [UdpSender] {
+        lock.lock()
+        defer { lock.unlock() }
+        return parts.filter(\.present).compactMap { p in
+            guard let tx = p.audio else { return nil }
+            if p.waitAudio {
+                guard head else { return nil }
+                p.waitAudio = false
+            }
+            return tx
         }
     }
 
@@ -342,7 +467,7 @@ public final class GroupSession {
                 let flags: PacketFlags = idr ? .idr : []
                 let hostLat = self.hostLatency(pts)
                 let bytes = [UInt8](data)
-                for tx in self.live(\.video) {
+                for tx in self.videoSenders(idr: idr) {
                     tx.send(frame: bytes, flags: flags, ptsUS: self.relativeUS(pts), hostLat: hostLat)
                 }
                 self.lastAU = (data, flags, hostLat)
@@ -357,7 +482,7 @@ public final class GroupSession {
                 guard let self else { return }
                 let head = self.needHead.take()
                 let bytes = [UInt8](data)
-                for tx in self.live(\.audio) {
+                for tx in self.audioSenders(head: head) {
                     if head { tx.send(frame: [UInt8](audio.head), flags: .config, ptsUS: self.relativeUS(pts), hostLat: 0) }
                     tx.send(frame: bytes, flags: [], ptsUS: self.relativeUS(pts), hostLat: self.hostLatency(pts))
                 }
@@ -439,18 +564,23 @@ public final class GroupSession {
         case "stop", "bye", "_closed":
             lock.lock()
             let wasRunning = running && !stopping
-            let present = parts[k].present
-            parts[k].present = false
+            let p = parts[k]
+            let present = p.present
+            p.present = false
+            let last = !parts.contains(where: \.present)
             lock.unlock()
             guard wasRunning, present else { return }
-            // The first member is the session; another one leaving leaves the others playing.
-            if k == 0 {
-                stop(reason: "\(parts[0].receiver.name) stopped")
+            // A member leaving leaves the others playing; the last one out ends the group.
+            if last {
+                stop(reason: "\(p.receiver.name) stopped")
             } else {
-                log("group: \(parts[k].receiver.name) left (\(msg["t"] as? String ?? ""))")
+                log("group: \(p.receiver.name) left (\(msg["t"] as? String ?? ""))")
             }
         default:
-            onMessage?(parts[k].receiver.id, msg)
+            lock.lock()
+            let id = parts[k].receiver.id
+            lock.unlock()
+            onMessage?(id, msg)
         }
     }
 
@@ -485,23 +615,25 @@ public final class GroupSession {
         let need = parts.filter { $0.present && (mode == .watching || $0.role.audio) }.compactMap(\.report.needMs)
         d = policy.update(nowS: Date().timeIntervalSince(started), videoPtsMs: video, needMs: need)
         let (dv, da) = (Sync.headerUnits(d.video), Sync.headerUnits(d.audio))
-        let offsets = pending
+        let offsets = pending.map { (parts[$0.0], $0.1) }
         pending = []
-        let members: [[String: Any]] = parts.map { p in
+        let members: [[String: Any]] = parts.filter(\.present).map { p in
             ["id": p.receiver.id, "name": p.receiver.name, "role": p.role.rawValue, "present": p.present,
              "need_ms": p.report.needMs ?? NSNull(), "video_pts_ms": p.report.videoPtsMs ?? NSNull(),
              "route": p.report.route ?? NSNull(), "offset_ms": p.offset.ms]
         }
-        let group: [String: Any] = ["d_video_ms": d.video, "d_audio_ms": d.audio, "members": members]
-        let primary = parts[0].stats
+        let group: [String: Any] = ["id": id, "mode": mode.wire, "sound_only": soundOnly,
+                                    "d_video_ms": d.video, "d_audio_ms": d.audio, "members": members]
         let live = parts.filter(\.present)
+        // The receiver's numbers are the first member's still playing.
+        let primary = live.first?.stats ?? [:]
         lock.unlock()
 
         for p in live {
             p.video?.setDelay(dv)
             p.audio?.setDelay(da)
         }
-        for (k, ms) in offsets { parts[k].control?.send(["t": "offset", "ms": ms]) }
+        for (p, ms) in offsets { p.control?.send(["t": "offset", "ms": ms]) }
 
         let first = live.compactMap { $0.video ?? $0.audio }.first
         let snap = first?.snapshot()
@@ -511,7 +643,7 @@ public final class GroupSession {
         let dl = latency >= lastLatency ? latency - lastLatency : latency
         (lastFrames, lastBytes, lastLatency) = (frames, bytes, latency)
         let hostMs = df > 0 ? Double(dl) / Double(df) / 10 : 0
-        let rtt = parts[0].control?.rttMs ?? 0
+        let rtt = live.first?.control?.rttMs ?? 0
         func r1(_ x: Double) -> Double { (x * 10).rounded() / 10 }
         var sender: [String: Any] = ["t": "sender_stats", "rtt_ms": r1(rtt), "host_ms": r1(hostMs), "fps": df,
                                      "mbps": r1(Double(db) * 8 / 1e6)]
@@ -536,7 +668,9 @@ public final class GroupSession {
         else { return }
         let pts = CMClockGetTime(CMClockGetHostTimeClock())
         let bytes = [UInt8](last.data)
-        for tx in live(\.video) { tx.send(frame: bytes, flags: last.flags, ptsUS: relativeUS(pts), hostLat: last.hostLat) }
+        for tx in videoSenders(idr: last.flags.contains(.idr)) {
+            tx.send(frame: bytes, flags: last.flags, ptsUS: relativeUS(pts), hostLat: last.hostLat)
+        }
         lastSentAt = Date()
     }
 
