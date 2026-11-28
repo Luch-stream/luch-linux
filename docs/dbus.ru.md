@@ -389,5 +389,7 @@ proxy.connectSignal('ReceiversChanged', () => { /* обновить */ });
 | `~/.config/luch/id` | id передатчика |
 | `~/.config/luch/known.json` | приёмники, к которым luchd подключался, и способы их включить |
 | `~/.config/luch/restore-token` | токен портала трансляции (после первого раза без диалога выбора) |
+| `LUCH_KMS` | какой `luch-kms` запускать (по умолчанию тот, что рядом с `luchd`, затем из `PATH`): установленный с `setcap` вне раздела `nosuid`, как `/home` во многих системах, где file capabilities не действуют |
+| `LUCH_DRM_FORMAT` | один формат NV12 DRM, который захват экрана просит у `vapostproc` (например `NV12:0x0100000000000009`); по умолчанию модификаторы NV12, которые `vapostproc` предлагает на этом GPU, из его caps |
 | `LUCH_KMS_CARD`, `LUCH_KMS_RENDER` | DRM-карта и render node для `luch-kms` (по умолчанию карта с активной плоскостью и render node того же GPU) |
 | `LUCH_PROBE=1` | замеры задержки по этапам в логе `luchd` |

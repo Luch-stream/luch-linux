@@ -572,5 +572,7 @@ proxy.connectSignal('ReceiversChanged', () => { /* refresh */ });
 | `~/.config/luch/known.json` | receivers luchd has connected to, with the ways to wake them |
 | `~/.config/luch/restore-token` | screencast portal restore token (no picker after the first time) |
 | `LUCH_KMS_SOCKET` | a privileged `luch-kms --serve SOCKET [--uid N]` that `luchd` uses for the `fast` mode instead of running `luch-kms` itself (default `$XDG_RUNTIME_DIR/luch/kms.sock`, used when it exists): for a `luchd` in a sandbox (Flatpak), where file capabilities do not work. The socket is owned by `--uid`, mode 0600 |
+| `LUCH_KMS` | the `luch-kms` to run (default: the one next to `luchd`, then `PATH`): one installed with `setcap` outside a `nosuid` mount such as many `/home` setups, where file capabilities are ignored |
+| `LUCH_DRM_FORMAT` | the one NV12 DRM format the screen capture asks `vapostproc` for (e.g. `NV12:0x0100000000000009`); by default the NV12 modifiers `vapostproc` offers on this GPU, from its caps |
 | `LUCH_KMS_CARD`, `LUCH_KMS_RENDER` | DRM card and render node for `luch-kms` (default: the card with an active plane, and the render node of the same GPU) |
 | `LUCH_PROBE=1` | per-stage latency probes in the `luchd` log |

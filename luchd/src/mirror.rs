@@ -456,7 +456,8 @@ pub fn available_sources() -> Vec<&'static str> {
     };
     let niri = std::env::var_os("NIRI_SOCKET").is_some() && on_path("niri");
     let mut v = Vec::new();
-    if on_path("luch-kms") || kms_socket().is_some() {
+    let kms_set = std::env::var_os("LUCH_KMS").is_some_and(|p| std::path::Path::new(&p).is_file());
+    if kms_set || on_path("luch-kms") || kms_socket().is_some() {
         v.push("fast");
         if niri {
             v.push("fast169");
@@ -1062,9 +1063,8 @@ fn pipeline(
     virtual_source: bool,
 ) -> Result<gst::Pipeline, String> {
     let keepalive = 2000 / FPS; // resend the last frame at fps/2 when the screen is static
-                                // ponytail: the Intel tiled NV12 modifier is what vapostproc offers here; make it a negotiated
-                                // list when other GPUs matter.
-                                // Newer gst-plugins-bad dropped vapostproc's `scale-method`; only pass it where it exists.
+
+    // Newer gst-plugins-bad dropped vapostproc's `scale-method`; only pass it where it exists.
     let has_scale = gst::ElementFactory::make("vapostproc")
         .build()
         .is_ok_and(|e| e.find_property("scale-method").is_some());
@@ -1076,12 +1076,24 @@ fn pipeline(
     } else {
         String::new()
     };
-    // NV12 modifiers vapostproc may offer: Intel Y-tiled, AMD DCC, AMD 64KB tiled, linear.
-    // LUCH_DRM_FORMAT overrides.
+    // The NV12 modifiers vapostproc offers on this GPU (they differ per driver: Intel's tiled ones do not negotiate
+    // on AMD and the other way round); a list of the usual ones when its caps say nothing. LUCH_DRM_FORMAT overrides.
     let drm = std::env::var("LUCH_DRM_FORMAT")
         .map(|d| format!("\"{d}\""))
         .unwrap_or_else(|_| {
-            "{\"NV12:0x0100000000000009\",\"NV12:0x0200000010401b04\",\"NV12:0x0200000000082305\",\"NV12:0x0\"}".into()
+            let offered = gst::ElementFactory::find("vapostproc")
+                .and_then(|f| {
+                    f.static_pad_templates()
+                        .into_iter()
+                        .find(|t| t.name_template() == "src")
+                })
+                .map(|t| nv12_drm_formats(&t.caps()))
+                .unwrap_or_default();
+            drm_caps_list(if offered.is_empty() {
+                FALLBACK_DRM_FORMATS.iter().map(|s| s.to_string()).collect()
+            } else {
+                offered
+            })
         });
     // Zero copy: compositor DMA-BUF -> GPU conversion -> DMA-BUF -> VA-API encoder.
     let (width, height) = (size.width, size.height);
@@ -1108,6 +1120,48 @@ fn pipeline(
         .map_err(|e| format!("pipeline: {e}"))?
         .downcast::<gst::Pipeline>()
         .map_err(|_| "pipeline: not a pipeline".to_string())
+}
+
+/// The NV12 modifiers tried when vapostproc's caps list none: Intel Y-tiled, AMD DCC, AMD 64KB tiled, linear.
+const FALLBACK_DRM_FORMATS: [&str; 4] = [
+    "NV12:0x0100000000000009",
+    "NV12:0x0200000010401b04",
+    "NV12:0x0200000000082305",
+    "NV12:0x0",
+];
+
+/// The NV12 `drm-format`s of a DMA_DRM caps (vapostproc's src template, probed from the driver): the VA-API encoder
+/// imports NV12 only. A plain "NV12" is linear.
+fn nv12_drm_formats(caps: &gst::Caps) -> Vec<String> {
+    let mut v: Vec<String> = Vec::new();
+    for s in caps.iter() {
+        if s.get::<&str>("format").ok() != Some("DMA_DRM") {
+            continue;
+        }
+        let one = s.get::<String>("drm-format").ok().map(|f| vec![f]);
+        let all = one.or_else(|| {
+            s.get::<gst::List>("drm-format")
+                .ok()
+                .map(|l| l.iter().filter_map(|x| x.get::<String>().ok()).collect())
+        });
+        for f in all.unwrap_or_default() {
+            let f = if f == "NV12" {
+                "NV12:0x0".to_string()
+            } else {
+                f
+            };
+            if f.starts_with("NV12:") && !v.contains(&f) {
+                v.push(f);
+            }
+        }
+    }
+    v
+}
+
+/// `{"A","B"}`: a caps list of drm-formats for the pipeline's description.
+fn drm_caps_list(formats: Vec<String>) -> String {
+    let quoted: Vec<String> = formats.iter().map(|f| format!("\"{f}\"")).collect();
+    format!("{{{}}}", quoted.join(","))
 }
 
 /// Microseconds of pipeline running time for `pts`, and capture->now latency in 0.1 ms.
@@ -1305,8 +1359,17 @@ pub fn kms_socket() -> Option<std::path::PathBuf> {
     p.exists().then_some(p)
 }
 
-/// The KMS grabber: a child process, or a connection to a `luch-kms --serve`.
-enum Grabber {
+/// The KMS grabber: a child process (or a connection to a `luch-kms --serve`) and the thread reading its stream. The
+/// thread is owned here: a stop kills the helper, wakes the reader and joins it, so no frame is sent after the session
+/// ended; a helper that dies by itself is reported instead of leaving the picture frozen.
+struct Grabber {
+    kind: GrabberKind,
+    reader: Option<std::thread::JoinHandle<()>>,
+    /// Set before a stop of ours, so that its EOF is not taken for a dead helper.
+    stopping: Arc<AtomicBool>,
+}
+
+enum GrabberKind {
     Child(std::process::Child),
     Socket(std::os::unix::net::UnixStream),
 }
@@ -1315,37 +1378,57 @@ impl Grabber {
     /// Ask for an IDR.
     fn idr(&mut self) {
         use std::io::Write;
-        let _ = match self {
-            Grabber::Child(c) => c
+        let _ = match &mut self.kind {
+            GrabberKind::Child(c) => c
                 .stdin
                 .as_mut()
                 .map(|s| s.write_all(b"k"))
                 .unwrap_or(Ok(())),
-            Grabber::Socket(s) => s.write_all(b"k"),
+            GrabberKind::Socket(s) => s.write_all(b"k"),
         };
     }
 
-    fn stop(self) {
-        match self {
-            Grabber::Child(mut c) => {
+    fn stop(mut self) {
+        self.stopping.store(true, Ordering::SeqCst);
+        match &mut self.kind {
+            GrabberKind::Child(c) => {
                 let _ = c.kill();
                 let _ = c.wait();
             }
-            Grabber::Socket(s) => {
+            GrabberKind::Socket(s) => {
                 let _ = s.shutdown(std::net::Shutdown::Both);
             }
+        }
+        if let Some(r) = self.reader.take() {
+            let _ = r.join();
         }
     }
 }
 
+/// The helper: `LUCH_KMS` (one installed outside a nosuid /home, where file capabilities do not work), else the one
+/// next to luchd, else the PATH's.
+fn kms_exe() -> std::path::PathBuf {
+    std::env::var_os("LUCH_KMS")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.parent().map(|d| d.join("luch-kms")))
+        })
+        .filter(|p| p.exists())
+        .unwrap_or_else(|| "luch-kms".into())
+}
+
 /// Lowest-latency video: luch-kms (KMS scanout -> EGL NV12 -> h264_vaapi) as a child, or through its
-/// socket, forwarding its packets as they come. `k` on its input forces an IDR.
+/// socket, forwarding its packets as they come. `k` on its input forces an IDR. `dead` hears why the helper's stream
+/// ended when it was not stopped by us.
 fn spawn_kms(
     video: Arc<Tx>,
     need_head: Arc<AtomicBool>,
     hevc: bool,
     size: Size,
     pipeline: gst::Pipeline,
+    dead: mpsc::UnboundedSender<String>,
 ) -> Result<Grabber, String> {
     use std::io::{Read, Write};
     use std::process::{Command, Stdio};
@@ -1356,20 +1439,15 @@ fn spawn_kms(
         size.height,
         if hevc { "hevc" } else { "h264" }
     );
-    let (grabber, mut out): (Grabber, Box<dyn Read + Send>) =
+    let (kind, out): (GrabberKind, Box<dyn Read + Send>) =
         match kms_socket().and_then(|p| std::os::unix::net::UnixStream::connect(p).ok()) {
             Some(mut s) => {
                 writeln!(s, "{opts}").map_err(|e| format!("luch-kms socket: {e}"))?;
                 let out = s.try_clone().map_err(|e| format!("luch-kms socket: {e}"))?;
-                (Grabber::Socket(s), Box::new(out))
+                (GrabberKind::Socket(s), Box::new(out))
             }
             None => {
-                let exe = std::env::current_exe()
-                    .ok()
-                    .and_then(|p| p.parent().map(|d| d.join("luch-kms")));
-                let exe = exe
-                    .filter(|p| p.exists())
-                    .unwrap_or_else(|| "luch-kms".into());
+                let exe = kms_exe();
                 let mut child = Command::new(&exe)
                     .args(opts.split(' '))
                     .stdin(Stdio::piped())
@@ -1377,38 +1455,71 @@ fn spawn_kms(
                     .spawn()
                     .map_err(|e| format!("{}: {e}", exe.display()))?;
                 let out = child.stdout.take().unwrap();
-                (Grabber::Child(child), Box::new(out))
+                (GrabberKind::Child(child), Box::new(out))
             }
         };
-    std::thread::spawn(move || {
-        let mut hdr = [0u8; 13];
-        let mut buf = Vec::new();
-        let mut base: Option<u64> = None;
-        while out.read_exact(&mut hdr).is_ok() {
-            let len = u32::from_be_bytes(hdr[0..4].try_into().unwrap()) as usize;
-            let idr = hdr[4] & 1 != 0;
-            let cap = u64::from_be_bytes(hdr[5..13].try_into().unwrap());
-            buf.resize(len, 0);
-            if out.read_exact(&mut buf).is_err() {
-                break;
+    Ok(Grabber::reading(
+        kind, out, video, need_head, pipeline, dead,
+    ))
+}
+
+impl Grabber {
+    /// Starts the thread that forwards the helper's packets from `out`.
+    fn reading(
+        kind: GrabberKind,
+        mut out: Box<dyn std::io::Read + Send>,
+        video: Arc<Tx>,
+        need_head: Arc<AtomicBool>,
+        pipeline: gst::Pipeline,
+        dead: mpsc::UnboundedSender<String>,
+    ) -> Self {
+        let stopping = Arc::new(AtomicBool::new(false));
+        let ours = stopping.clone();
+        let reader = std::thread::spawn(move || {
+            let mut hdr = [0u8; 13];
+            let mut buf = Vec::new();
+            let mut base: Option<u64> = None;
+            let why = loop {
+                if let Err(e) = out.read_exact(&mut hdr) {
+                    break e;
+                }
+                let len = u32::from_be_bytes(hdr[0..4].try_into().unwrap()) as usize;
+                let idr = hdr[4] & 1 != 0;
+                let cap = u64::from_be_bytes(hdr[5..13].try_into().unwrap());
+                buf.resize(len, 0);
+                if let Err(e) = out.read_exact(&mut buf) {
+                    break e;
+                }
+                let now = mono_us();
+                // The pts are the pipeline's running time, as the sound's are (and the clock a group's receivers
+                // follow): scanout time minus where the running time started on the monotonic clock. Before the
+                // pipeline runs, the first frame's time, as before.
+                let base = *base.get_or_insert_with(|| {
+                    pipeline
+                        .current_running_time()
+                        .map_or(cap, |rt| now.saturating_sub(rt.useconds()))
+                });
+                let lat = (now.saturating_sub(cap) / 100).min(u16::MAX as u64) as u16; // scanout flip -> encoded
+                if idr {
+                    need_head.store(true, Ordering::Relaxed);
+                }
+                video.send_frame(
+                    &buf,
+                    if idr { F_IDR } else { 0 },
+                    cap.saturating_sub(base),
+                    lat,
+                );
+            };
+            if !ours.load(Ordering::SeqCst) {
+                let _ = dead.send(format!("luch-kms stopped sending ({why})"));
             }
-            let now = mono_us();
-            // The pts are the pipeline's running time, as the sound's are (and the clock a group's receivers follow):
-            // scanout time minus where the running time started on the monotonic clock. Before the pipeline runs,
-            // the first frame's time, as before.
-            let base = *base.get_or_insert_with(|| {
-                pipeline
-                    .current_running_time()
-                    .map_or(cap, |rt| now.saturating_sub(rt.useconds()))
-            });
-            let lat = (now.saturating_sub(cap) / 100).min(u16::MAX as u64) as u16; // scanout flip -> encoded
-            if idr {
-                need_head.store(true, Ordering::Relaxed);
-            }
-            video.send_frame(&buf, if idr { F_IDR } else { 0 }, cap - base, lat);
+        });
+        Grabber {
+            kind,
+            reader: Some(reader),
+            stopping,
         }
-    });
-    Ok(grabber)
+    }
 }
 
 fn mono_us() -> u64 {
@@ -1802,8 +1913,16 @@ pub async fn run(
         audio.start_timeline();
     }
     let need_head = wire(&p, video.clone(), audio.clone(), want_idr.clone(), size);
+    let (kms_dead, mut kms_died) = mpsc::unbounded_channel::<String>();
     let mut kms = if t.kms {
-        Some(spawn_kms(video.clone(), need_head, hevc, size, p.clone())?)
+        Some(spawn_kms(
+            video.clone(),
+            need_head,
+            hevc,
+            size,
+            p.clone(),
+            kms_dead,
+        )?)
     } else {
         None
     };
@@ -1961,6 +2080,10 @@ pub async fn run(
                 }
                 _ => {}
             },
+            Some(why) = kms_died.recv() => {
+                let _ = cmd.send(Cmd::Send(json!({"t": "stop"}))).await;
+                break Err(why);
+            }
             msg = bus.next() => match msg.as_ref().map(|m| m.view()) {
                 Some(gst::MessageView::Error(err)) => {
                     let _ = cmd.send(Cmd::Send(json!({"t": "stop"}))).await;
@@ -2281,5 +2404,98 @@ mod tests {
         );
         assert_eq!(&msg[HEADER..], &frame[..]);
         assert!(want_idr.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn drm_formats_are_the_nv12_ones_vapostproc_offers() {
+        gst::init().unwrap();
+        // An AMD card's template: modifiers of its own, other formats, and a linear plain NV12.
+        let caps: gst::Caps = "video/x-raw(memory:DMABuf), format=(string)DMA_DRM, \
+             drm-format=(string){ NV12:0x0200000000082305, P010:0x0200000000082305, NV12:0x0200000010401b04, NV12 }; \
+             video/x-raw, format=(string){ NV12, I420 }"
+            .parse()
+            .unwrap();
+        assert_eq!(
+            nv12_drm_formats(&caps),
+            [
+                "NV12:0x0200000000082305",
+                "NV12:0x0200000010401b04",
+                "NV12:0x0"
+            ]
+        );
+        // One modifier alone is a plain string, not a list (an Intel card).
+        let one: gst::Caps =
+            "video/x-raw(memory:DMABuf), format=(string)DMA_DRM, drm-format=(string)NV12:0x0100000000000009"
+                .parse()
+                .unwrap();
+        assert_eq!(nv12_drm_formats(&one), ["NV12:0x0100000000000009"]);
+        // No DMA_DRM at all: nothing, and the pipeline keeps its list.
+        let none: gst::Caps = "video/x-raw, format=(string)NV12".parse().unwrap();
+        assert!(nv12_drm_formats(&none).is_empty());
+        assert_eq!(
+            drm_caps_list(vec!["NV12:0x1".into(), "NV12:0x0".into()]),
+            r#"{"NV12:0x1","NV12:0x0"}"#
+        );
+        // The list is a valid caps field as the pipeline writes it.
+        let filter: gst::Caps = format!(
+            "video/x-raw(memory:DMABuf),format=DMA_DRM,drm-format={}",
+            drm_caps_list(FALLBACK_DRM_FORMATS.iter().map(|s| s.to_string()).collect())
+        )
+        .parse()
+        .unwrap();
+        assert_eq!(nv12_drm_formats(&filter).len(), 4);
+    }
+
+    /// A luch-kms frame on its stream: length, IDR flag, scanout time, then the bytes.
+    fn kms_frame(idr: bool, cap_us: u64, data: &[u8]) -> Vec<u8> {
+        let mut v = (data.len() as u32).to_be_bytes().to_vec();
+        v.push(idr as u8);
+        v.extend_from_slice(&cap_us.to_be_bytes());
+        v.extend_from_slice(data);
+        v
+    }
+
+    #[test]
+    fn the_kms_grabber_stops_quietly_and_reports_a_helper_that_died() {
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+        gst::init().unwrap();
+        let (rx, d) = pair();
+        rx.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let video = Arc::new(Tx::udp(KIND_VIDEO, vec![d]));
+        let start = |video: &Arc<Tx>| {
+            let (ours, mut helper) = UnixStream::pair().unwrap();
+            let out = ours.try_clone().unwrap();
+            let (dead, died) = mpsc::unbounded_channel();
+            let g = Grabber::reading(
+                GrabberKind::Socket(ours),
+                Box::new(out),
+                video.clone(),
+                Arc::new(AtomicBool::new(false)),
+                gst::Pipeline::new(),
+                dead,
+            );
+            helper.write_all(&kms_frame(true, 5_000, b"idr")).unwrap();
+            (g, helper, died)
+        };
+        let mut buf = [0u8; 64];
+
+        // Stopped by us: the reader is joined, nothing is reported.
+        let (g, _helper, mut died) = start(&video);
+        let n = rx.recv(&mut buf).unwrap();
+        assert_eq!((buf[1] & F_IDR, &buf[HEADER..n]), (F_IDR, &b"idr"[..]));
+        g.stop();
+        assert!(matches!(
+            died.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+
+        // The helper went away by itself: the session hears it.
+        let (g, helper, mut died) = start(&video);
+        rx.recv(&mut buf).unwrap();
+        drop(helper);
+        let why = died.blocking_recv().unwrap();
+        assert!(why.starts_with("luch-kms stopped sending"), "{why}");
+        g.stop();
     }
 }
