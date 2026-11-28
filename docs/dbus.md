@@ -230,8 +230,25 @@ role says (`video`, `audio` or `both`; the first one's is `video` or `both`). `m
 as fast as alone and lets the sound wait for it (a TV and a speaker); `watch` gives every receiver the same playout
 delay, at least 150 ms (speakers in several rooms, a wall of TVs). Every receiver must be connected (it is connected
 when it is not) and announce `sync` in its welcome; a busy or older one is refused. `StopMirror` on any member ends the
-group; a member that leaves by itself is dropped and the others go on. `Stats` of `ids[0]` then has a `group` part:
-`d_video_ms`, `d_audio_ms` and per member `need_ms`, `video_pts_ms`, `route`, `offset_ms`.
+group; a member that leaves by itself (the first one too) is dropped and the others go on; the last one out ends it.
+The picture is H.264 when a member that shows it cannot decode HEVC. `Stats` of any member then has a `group` part:
+`id`, `mode`, `sound_only`, `d_video_ms`, `d_audio_ms` and the members playing now, each with `id`, `name`, `role`,
+`need_ms`, `video_pts_ms`, `route`, `offset_ms`.
+
+### `AddToGroup(s member, s id, s role)`
+
+Puts receiver `id` into the running group that `member` (any receiver in it) plays in. It is connected when it is not
+(and asks for pairing as any connection does), must announce `sync` and not be playing anything; it gets the group's
+`timeline` and current D, and its picture starts at the group's next keyframe (one is asked for at once, merged with
+any other request) and its sound at the next OpusHead: never a P-frame of a picture it did not have. When it needs a
+larger D, D rises once for everyone at the same frame. `role` is `video`, `audio` or `both`; `""` is `both`, or
+`audio` in a group of sound only (where a picture role is refused). A group playing HEVC refuses a receiver without an
+HEVC decoder for a picture role. Answered once it plays, or with why not (10 s at most).
+
+### `RemoveFromGroup(s id)`
+
+Takes receiver `id` out of the group it plays in: it gets `stop`, the others play on untouched; the last one out ends
+the group. `InvalidArgs` when it is in none.
 
 ### `SetOffset(s id, d ms)`
 

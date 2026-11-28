@@ -72,6 +72,8 @@ trait Luch1 {
         source: &str,
         mode: &str,
     ) -> zbus::Result<()>;
+    fn add_to_group(&self, member: &str, id: &str, role: &str) -> zbus::Result<()>;
+    fn remove_from_group(&self, id: &str) -> zbus::Result<()>;
     fn set_offset(&self, id: &str, ms: f64) -> zbus::Result<()>;
     #[zbus(signal)]
     fn receivers_changed(&self) -> zbus::Result<()>;
@@ -92,7 +94,8 @@ const USAGE: &str = "usage: luchctl [list | refresh | find [auto|all|mdns,scan,b
                 | present [r] <file> | quiet [ask|on|off] | browser install
                 | pair [r] [code] | paired | forget <r> | web [allow|deny <code> | forget <n>]
                 | latency [on|off] [r] | latency analyze <video> [--out prefix] [--fps n] [--readout-ms ms]
-                | group interactive|watch <r>[=role] <r>[=role]... [--source S] | offset <r> <ms>]
+                | group interactive|watch <r>[=role] <r>[=role]... [--source S] | group add <r>[=role]
+                | group remove <r> | offset <r> <ms>]
        r = receiver id or name, optional when there is only one; mirror defaults to fast; no arguments: interactive
        find: when the list stays empty (hotel Wi-Fi, a VPN): every address of the LAN, Bluetooth, then the TV's sound
        through the microphone and its QR code through the camera; add: a receiver by its QR link or address
@@ -118,6 +121,8 @@ const USAGE: &str = "usage: luchctl [list | refresh | find [auto|all|mdns,scan,b
        latency: photon-to-photon latency with a phone filming both screens at 240 fps (docs/latency-lab.md)
        group: several receivers in step, the first one shows the picture; role video|audio|both (first: both, others:
        audio, a speaker); interactive keeps the picture as fast as alone, watch delays all alike (rooms, TV walls);
+       group add: one more receiver into the group that plays (role: the picture and its sound, or a speaker when
+       the group plays sound only); group remove: one out, the others play on, the last one out ends the group;
        offset: a receiver's own correction in ms (positive = later), for its output route";
 
 const LAB_STEPS: &str =
@@ -270,7 +275,6 @@ fn need_one(
     })
 }
 
-/// Receiver by id or name; with no key, the only receiver on the LAN.
 /// `group`'s receivers (`name` or `name=role`) and its `--source` (default fast).
 fn group_args<'a>(args: &[&'a str]) -> Result<(Vec<(&'a str, Option<&'a str>)>, &'a str), String> {
     let (mut members, mut source) = (Vec::new(), "fast");
@@ -293,6 +297,31 @@ fn group_args<'a>(args: &[&'a str]) -> Result<(Vec<(&'a str, Option<&'a str>)>, 
     Ok((members, source))
 }
 
+/// `group add`'s receiver, `name` or `name=role`; no role ("") is the group's own default.
+fn member_arg(a: &str) -> Result<(&str, &str), String> {
+    match a.rsplit_once('=') {
+        Some((k, r)) if matches!(r, "video" | "audio" | "both") => Ok((k, r)),
+        Some((_, r)) => Err(format!("role video|audio|both, not {r}")),
+        None => Ok((a, "")),
+    }
+}
+
+/// A receiver playing in a group, which names that group: the first one mirroring whose stats have a group part.
+async fn playing_group(p: &Luch1Proxy<'_>) -> Result<String, String> {
+    for r in p.receivers().await.map_err(|e| e.to_string())? {
+        if !r.7 {
+            continue;
+        }
+        let stats: serde_json::Value =
+            serde_json::from_str(&p.stats(&r.0).await.unwrap_or_default()).unwrap_or_default();
+        if stats["group"].is_object() {
+            return Ok(r.0);
+        }
+    }
+    Err("no group is playing: start one with `luchctl group`".into())
+}
+
+/// Receiver by id or name; with no key, the only receiver on the LAN.
 async fn find_id(p: &Luch1Proxy<'_>, key: Option<&str>) -> Result<String, String> {
     let rows = p.receivers().await.map_err(|e| e.to_string())?;
     let Some(key) = key else {
@@ -429,6 +458,16 @@ async fn run(args: &[String]) -> Result<(), String> {
             .map_err(e)?,
         ["mirror", key, source] => p
             .mirror(&find_id(&p, Some(key)).await?, source)
+            .await
+            .map_err(e)?,
+        ["group", "add", r] => {
+            let (key, role) = member_arg(r)?;
+            let id = find_id(&p, Some(key)).await?;
+            let member = playing_group(&p).await?;
+            p.add_to_group(&member, &id, role).await.map_err(e)?
+        }
+        ["group", "remove", key] => p
+            .remove_from_group(&find_id(&p, Some(key)).await?)
             .await
             .map_err(e)?,
         ["group", mode, rest @ ..] if rest.len() >= 2 => {
@@ -1412,6 +1451,13 @@ mod tests {
             progress_lines(&later, &end),
             vec!["  ble done: Living room TV", "1 receiver found"]
         );
+    }
+
+    #[test]
+    fn group_add_takes_a_receiver_and_maybe_its_role() {
+        assert_eq!(member_arg("Den TV").unwrap(), ("Den TV", ""));
+        assert_eq!(member_arg("Kitchen=audio").unwrap(), ("Kitchen", "audio"));
+        assert!(member_arg("Kitchen=loud").is_err());
     }
 
     #[test]

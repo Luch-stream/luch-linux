@@ -86,8 +86,8 @@ struct Conn {
 struct State {
     found: HashMap<String, Receiver>,
     conns: HashMap<String, Conn>,
-    mirrors: HashMap<String, mpsc::Sender<()>>, // id -> stop signal
-    stats: HashMap<String, mirror::Stats>,      // id -> live mirroring stats
+    mirrors: HashMap<String, mpsc::Sender<mirror::Ctl>>, // id -> its session (every member of a group: the group's)
+    stats: HashMap<String, mirror::Stats>,               // id -> live mirroring stats
     last_stats: HashMap<String, Value>, // id -> the numbers its last session ended with, for Report
     welcomes: HashMap<String, Value>,   // id -> last welcome (hw passport, decoder bench)
     codec: HashMap<String, String>, // id -> "auto" | "avc" | "hevc": a person's choice of the video codec
@@ -116,6 +116,31 @@ struct State {
     sources: HashMap<String, String>,
     /// The latency lab, while it is on (docs/latency-lab.md).
     lab: Option<latency::Lab>,
+    /// id -> the id of the group it plays in (PROTOCOL.md 4k), for every member.
+    groups: HashMap<String, String>,
+}
+
+async fn m_name(st: &Shared, id: &str) -> String {
+    receiver_name(&*st.lock().await, id)
+}
+
+/// A receiver's name for a message, its id when it is not on the list.
+fn receiver_name(s: &State, id: &str) -> String {
+    s.found
+        .get(id)
+        .map_or_else(|| id.to_string(), |r| r.name.clone())
+}
+
+/// A member left its group (removed, or by itself) while the group plays on: it is free again. Only when it still
+/// belongs to this session, which it may have left long ago for another.
+async fn forget_member(st: &Shared, id: &str, session: &mpsc::Sender<mirror::Ctl>) {
+    let mut s = st.lock().await;
+    if s.mirrors.get(id).is_some_and(|c| c.same_channel(session)) {
+        s.mirrors.remove(id);
+        s.groups.remove(id);
+        s.stats.remove(id);
+        s.sources.remove(id);
+    }
 }
 
 /// The code a person typed for a receiver, and where Pair's answer goes (the welcome, or why not).
@@ -607,6 +632,114 @@ impl Luch {
         start_mirror(&self.st, conn, &ids[0], &source, (0, 0), Some(group)).await
     }
 
+    /// Puts a receiver into a running group (PROTOCOL.md 4k): `member` names the group by any receiver in it. The
+    /// receiver is connected when it is not (pairing as for any connection), gets the group's timeline and D, and
+    /// starts from the group's next keyframe; D rises for everyone, once, if it needs more. `role` "" is the picture
+    /// and its sound, or a speaker in a group of sound only.
+    async fn add_to_group(
+        &self,
+        member: String,
+        id: String,
+        role: String,
+        #[zbus(connection)] conn: &Connection,
+    ) -> fdo::Result<()> {
+        if !matches!(role.as_str(), "" | "video" | "audio" | "both") {
+            return Err(fdo::Error::InvalidArgs(format!(
+                "role video|audio|both, not {role}"
+            )));
+        }
+        let ctl = {
+            let s = self.st.lock().await;
+            if !s.groups.contains_key(&member) {
+                return Err(fdo::Error::InvalidArgs(format!(
+                    "{member} is not playing in a group"
+                )));
+            }
+            if s.mirrors.contains_key(&id) {
+                return Err(fdo::Error::Failed(format!(
+                    "{} is playing already: stop it first",
+                    receiver_name(&s, &id)
+                )));
+            }
+            s.mirrors[&member].clone()
+        };
+        if !self.st.lock().await.conns.contains_key(&id) {
+            self.connect(id.clone(), conn).await?;
+        }
+        let (stats, source) = {
+            let mut s = self.st.lock().await;
+            let m = group_member(&s, &id, role)?;
+            // Busy from now on: a second join of it, or a session of its own, is refused meanwhile.
+            if s.mirrors.contains_key(&id) {
+                return Err(fdo::Error::Failed(format!("{} is busy", m.who.name)));
+            }
+            s.mirrors.insert(id.clone(), ctl.clone());
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            let _ = ctl.try_send(mirror::Ctl::Join(m, tx));
+            let stats = s.stats.get(&member).cloned();
+            let source = s.sources.get(&member).cloned();
+            drop(s);
+            let failed = match timeout(Duration::from_secs(10), rx).await {
+                Ok(Ok(Ok(()))) => None,
+                Ok(Ok(Err(e))) => Some(e),
+                Ok(Err(_)) => Some("the group ended".to_string()),
+                Err(_) => Some(format!("{} did not answer", m_name(&self.st, &id).await)),
+            };
+            if let Some(e) = failed {
+                self.st.lock().await.mirrors.remove(&id);
+                return Err(fdo::Error::Failed(e));
+            }
+            (stats, source)
+        };
+        {
+            let mut s = self.st.lock().await;
+            let gid = s.groups[&member].clone();
+            s.groups.insert(id.clone(), gid);
+            if let Some(stats) = stats {
+                s.stats.insert(id.clone(), stats);
+            }
+            if let Some(source) = source {
+                s.sources.insert(id.clone(), source);
+            }
+        }
+        changed(conn).await;
+        Ok(())
+    }
+
+    /// Takes a receiver out of the group it plays in: it stops, the others play on untouched; the last one out ends
+    /// the group.
+    async fn remove_from_group(
+        &self,
+        id: String,
+        #[zbus(connection)] conn: &Connection,
+    ) -> fdo::Result<()> {
+        let ctl = {
+            let s = self.st.lock().await;
+            match (s.groups.contains_key(&id), s.mirrors.get(&id)) {
+                (true, Some(c)) => c.clone(),
+                _ => {
+                    return Err(fdo::Error::InvalidArgs(format!(
+                        "{} is not playing in a group",
+                        receiver_name(&s, &id)
+                    )))
+                }
+            }
+        };
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        ctl.send(mirror::Ctl::Leave(id.clone(), tx))
+            .await
+            .map_err(|_| fdo::Error::Failed("the group ended".into()))?;
+        match rx.await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => return Err(fdo::Error::Failed(e)),
+            Err(_) => return Err(fdo::Error::Failed("the group ended".into())),
+        }
+        // At once, so that it can be added again right away (the session tells it too).
+        forget_member(&self.st, &id, &ctl).await;
+        changed(conn).await;
+        Ok(())
+    }
+
     /// A receiver's own correction in ms (positive = later), for the output route it uses now: the slider of a group.
     /// Saved, and applied at once when it is playing in a group.
     async fn set_offset(&self, id: String, ms: f64) -> fdo::Result<()> {
@@ -886,7 +1019,7 @@ impl Luch {
     async fn stop_mirror(&self, id: String) -> fdo::Result<()> {
         let tx = self.st.lock().await.mirrors.get(&id).cloned();
         let tx = tx.ok_or_else(|| fdo::Error::InvalidArgs(format!("not mirroring: {id}")))?;
-        let _ = tx.send(()).await;
+        let _ = tx.send(mirror::Ctl::Stop).await;
         Ok(())
     }
 
@@ -2320,6 +2453,13 @@ async fn start_mirror(
         }
         None => (None, Vec::new()),
     };
+    // A group's picture is one stream: H.264 when a member that shows it cannot decode HEVC.
+    let prefer = match &group {
+        Some(g) if g.members.iter().any(|m| m.who.video() && !m.can_hevc) => "video/avc".into(),
+        _ => prefer,
+    };
+    let (left_tx, mut left_rx) = mpsc::unbounded_channel::<String>();
+    let gid = group.as_ref().map(|g| g.id.clone());
     let target = mirror::Target {
         name: r.name.clone(),
         address,
@@ -2345,18 +2485,21 @@ async fn start_mirror(
         }),
         id: id.to_string(),
         group,
+        left: left_tx,
     };
-    let (stop_tx, stop_rx) = mpsc::channel(1);
+    let (stop_tx, stop_rx) = mpsc::channel(4);
     let stats = mirror::Stats::default();
     {
         let mut s = st.lock().await;
-        // Every member of a group is busy with it: StopMirror on any of them ends the group.
-        for m in &member_ids {
-            s.mirrors.insert(m.clone(), stop_tx.clone());
+        // Every member of a group is busy with it, with the group's numbers: StopMirror on any of them ends the group.
+        for m in member_ids.iter().map(String::as_str).chain([id]) {
+            s.mirrors.insert(m.to_string(), stop_tx.clone());
+            s.stats.insert(m.to_string(), stats.clone());
+            s.sources.insert(m.to_string(), source_name.to_string());
+            if let Some(gid) = &gid {
+                s.groups.insert(m.to_string(), gid.clone());
+            }
         }
-        s.mirrors.insert(id.to_string(), stop_tx);
-        s.stats.insert(id.to_string(), stats.clone());
-        s.sources.insert(id.to_string(), source_name.to_string());
         if s.lab.as_ref().is_some_and(|l| l.id == id) {
             let _ = c
                 .cmd
@@ -2364,6 +2507,16 @@ async fn start_mirror(
         }
     }
     changed(conn).await;
+    {
+        // A member that left the group playing on is free again.
+        let (st, conn, session) = (st.clone(), conn.clone(), stop_tx.clone());
+        tokio::spawn(async move {
+            while let Some(id) = left_rx.recv().await {
+                forget_member(&st, &id, &session).await;
+                changed(&conn).await;
+            }
+        });
+    }
     let (st, conn, id) = (st.clone(), conn.clone(), id.to_string());
     // Subscribe here and drop our copy of the sender: the mirror must see the channel close
     // (receiver gone or restarted) instead of streaming into the void.
@@ -2384,7 +2537,7 @@ async fn start_mirror(
             false => Some(quiet_session(&conn).await),
             true => None,
         };
-        let res = mirror::run(target, cmd, events_rx, stop_rx, stats).await;
+        let res = mirror::run(target, cmd, events_rx, stop_rx, stats.clone()).await;
         match res {
             Ok(why) => {
                 eprintln!("[luchd] {name}: mirroring ended ({why})");
@@ -2402,14 +2555,20 @@ async fn start_mirror(
         }
         {
             let mut s = st.lock().await;
-            s.mirrors.remove(&id);
-            if let Some(last) = s.stats.remove(&id) {
-                let last = last.lock().unwrap().clone();
-                s.last_stats.insert(id.clone(), last);
-            }
-            s.sources.remove(&id);
-            for m in &member_ids {
-                s.mirrors.remove(m);
+            let last = stats.lock().unwrap().clone();
+            s.last_stats.insert(id.clone(), last);
+            // Everyone still in this session (a group's members come and go, and the first may have left it).
+            let ours: Vec<String> = s
+                .mirrors
+                .iter()
+                .filter(|(_, c)| c.same_channel(&stop_tx))
+                .map(|(m, _)| m.clone())
+                .collect();
+            for m in ours {
+                s.mirrors.remove(&m);
+                s.stats.remove(&m);
+                s.sources.remove(&m);
+                s.groups.remove(&m);
             }
         }
         changed(&conn).await;
@@ -2437,7 +2596,6 @@ async fn build_group(
             "{name} cannot play in step yet: update it"
         )));
     }
-    let offset = |id: &str| saved_offset(&sync::offset_key(id, &last_route(id))).unwrap_or(0.0);
     let mut members = Vec::new();
     for (mid, role) in g.members {
         if !role_ok(&role) || mid == id {
@@ -2446,36 +2604,14 @@ async fn build_group(
             )));
         }
         let s = st.lock().await;
-        let (c, r, w) = (s.conns.get(&mid), s.found.get(&mid), s.welcomes.get(&mid));
-        let (Some(c), Some(r)) = (c, r) else {
-            return Err(fdo::Error::Failed(format!("{mid} is not connected")));
-        };
-        if !w.is_some_and(sync::capable) {
-            return Err(fdo::Error::NotSupported(format!(
-                "{} cannot play in step yet: update it",
-                r.name
+        let m = group_member(&s, &mid, role)?;
+        if s.mirrors.contains_key(&mid) {
+            return Err(fdo::Error::Failed(format!(
+                "{} is playing already: stop it first",
+                m.who.name
             )));
         }
-        if s.mirrors.contains_key(&mid) {
-            return Err(fdo::Error::Failed(format!("{} is busy", r.name)));
-        }
-        let audio = limits::start_audio("on", w.unwrap_or(&Value::Null), mirror::AUDIO_FRAME_MS);
-        members.push(mirror::Member {
-            who: mirror::MemberId {
-                id: mid.clone(),
-                name: r.name.clone(),
-                role,
-                offset_ms: offset(&mid),
-            },
-            address: r
-                .address
-                .parse()
-                .map_err(|_| fdo::Error::Failed(format!("not IPv4: {}", r.address)))?,
-            ifname: r.ifname.clone(),
-            audio,
-            cmd: c.cmd.clone(),
-            events: c.events.subscribe(),
-        });
+        members.push(m);
     }
     Ok(mirror::Group {
         id: uuid::Uuid::new_v4().to_string(),
@@ -2490,6 +2626,49 @@ async fn build_group(
             offset_ms: offset(id),
         },
         members,
+    })
+}
+
+/// A receiver's correction as it plays now: for the output route it last reported.
+fn offset(id: &str) -> f64 {
+    saved_offset(&sync::offset_key(id, &last_route(id))).unwrap_or(0.0)
+}
+
+/// A connected receiver as a member of a group: able to play in step (its welcome says so), with its saved
+/// correction and its own control channel.
+fn group_member(s: &State, mid: &str, role: String) -> fdo::Result<mirror::Member> {
+    let (c, r, w) = (s.conns.get(mid), s.found.get(mid), s.welcomes.get(mid));
+    let (Some(c), Some(r)) = (c, r) else {
+        return Err(fdo::Error::Failed(format!(
+            "{} is not connected",
+            receiver_name(s, mid)
+        )));
+    };
+    let w = w.unwrap_or(&Value::Null);
+    if !sync::capable(w) {
+        return Err(fdo::Error::NotSupported(format!(
+            "{} cannot play in step yet: update it",
+            r.name
+        )));
+    }
+    Ok(mirror::Member {
+        who: mirror::MemberId {
+            id: mid.to_string(),
+            name: r.name.clone(),
+            role,
+            offset_ms: offset(mid),
+        },
+        address: r
+            .address
+            .parse()
+            .map_err(|_| fdo::Error::Failed(format!("not IPv4: {}", r.address)))?,
+        ifname: r.ifname.clone(),
+        audio: limits::start_audio("on", w, mirror::AUDIO_FRAME_MS),
+        cmd: c.cmd.clone(),
+        events: c.events.subscribe(),
+        can_hevc: w["decoders"]
+            .as_array()
+            .is_some_and(|d| d.iter().any(|m| m == "video/hevc")),
     })
 }
 

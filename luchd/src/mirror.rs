@@ -79,6 +79,8 @@ pub struct Target {
     pub id: String,
     /// Played in step with other receivers (PROTOCOL.md 4k), None for a session of its own as before.
     pub group: Option<Group>,
+    /// Hears the id of each member that leaves the group (removed, or by itself) while the others play on.
+    pub left: mpsc::UnboundedSender<String>,
 }
 
 /// A group session (PROTOCOL.md 4k): this target and its other members present every frame at pts + D.
@@ -111,14 +113,16 @@ pub struct Member {
     pub audio: Option<Value>,
     pub cmd: mpsc::Sender<Cmd>,
     pub events: broadcast::Receiver<Value>,
+    /// Its welcome lists an HEVC decoder.
+    pub can_hevc: bool,
 }
 
 impl MemberId {
-    fn video(&self) -> bool {
+    pub fn video(&self) -> bool {
         self.role != "audio"
     }
 
-    fn audio(&self) -> bool {
+    pub fn audio(&self) -> bool {
         self.role != "video"
     }
 }
@@ -670,13 +674,16 @@ impl Seal {
 pub const TAG: usize = 16;
 
 /// One receiver of a kind's stream: its socket, pinned to the LAN interface, and the playout delay D (0.1 ms) its
-/// packets carry. A receiver that left the group is skipped. Sealed when that receiver gave a key (TLS): each
-/// receiver of a group has its own.
+/// packets carry. Sealed when that receiver gave a key (TLS): each receiver of a group has its own.
 pub struct Dest {
     sock: UdpSocket,
     delay: AtomicU16,
-    alive: AtomicBool,
     seal: Option<Seal>,
+    /// The receiver's id: what its leaving the group removes.
+    member: String,
+    /// It joined a stream already running: it gets nothing before the frame it can start from (a picture's IDR, the
+    /// sound's OpusHead), so that it never decodes a P-frame of a picture it never had.
+    waiting: AtomicBool,
 }
 
 impl Dest {
@@ -702,9 +709,28 @@ impl Dest {
         Dest {
             sock,
             delay: AtomicU16::new(0),
-            alive: AtomicBool::new(true),
             seal: None,
+            member: String::new(),
+            waiting: AtomicBool::new(false),
         }
+    }
+
+    fn of_member(mut self, id: &str) -> Self {
+        self.member = id.to_string();
+        self
+    }
+
+    /// Whether this frame goes to this receiver: always, unless it waits for the frame it can start from.
+    fn takes(&self, kind: u8, flags: u8) -> bool {
+        if !self.waiting.load(Ordering::Relaxed) {
+            return true;
+        }
+        let start = if kind == KIND_VIDEO { F_IDR } else { F_CONFIG };
+        if flags & start == 0 {
+            return false;
+        }
+        self.waiting.store(false, Ordering::Relaxed);
+        true
     }
 }
 
@@ -769,8 +795,8 @@ impl IdrGate {
     }
 }
 
-/// Where one receiver's stream goes: its interface, its address and its media key (from its `ready`, TLS only).
-type MediaTo = (String, SocketAddrV4, Option<Vec<u8>>);
+/// Where one receiver's stream goes: its interface, its address, its media key (from its `ready`, TLS only) and its id.
+type MediaTo = (String, SocketAddrV4, Option<Vec<u8>>, String);
 
 /// One media kind's stream to its receivers over UDP — or a websocket for the web receiver.
 struct Tx {
@@ -782,11 +808,13 @@ struct Tx {
     lat_sum: AtomicU64, // host latency, 0.1 ms units, summed over frames
     /// A group's stream: its first frame carries the new-timeline flag.
     timeline: AtomicBool,
+    /// The D every receiver of this kind gets now, and one that joins.
+    delay: AtomicU16,
 }
 
 enum Out {
-    /// Every receiver of this kind: one, or the members of a group.
-    Udp(Vec<Dest>),
+    /// Every receiver of this kind: one, or the members of a group, who come and go while it plays.
+    Udp(std::sync::RwLock<Vec<Arc<Dest>>>),
     /// Whole frame per message (websocket framing is reliable and ordered); on a full queue the frame is dropped — the
     /// browser lags, the stream must not — and a picture's asks for an IDR (none for the sound's: it needs none).
     Ws(mpsc::Sender<Vec<u8>>, Option<Arc<IdrGate>>),
@@ -798,26 +826,41 @@ const BURST_GAP: Duration = Duration::from_micros(250);
 
 impl Tx {
     /// The same stream to several receivers (a group), each on its own socket.
-    /// `to`: each receiver's interface, address and media key (from its `ready`, over TLS only).
+    /// `to`: each receiver's interface, address, media key (from its `ready`, over TLS only) and id.
     fn open_many(kind: u8, to: &[MediaTo], dscp: u32) -> std::io::Result<Self> {
         let dests = to
             .iter()
-            .map(|(ifname, addr, key)| {
+            .map(|(ifname, addr, key, id)| {
                 Dest::open(ifname, *addr, dscp, key.as_deref().and_then(Seal::new))
+                    .map(|d| d.of_member(id))
             })
             .collect::<std::io::Result<Vec<_>>>()?;
         Ok(Self::udp(kind, dests))
     }
 
     fn udp(kind: u8, dests: Vec<Dest>) -> Self {
+        Self::with(
+            kind,
+            Out::Udp(std::sync::RwLock::new(
+                dests.into_iter().map(Arc::new).collect(),
+            )),
+        )
+    }
+
+    fn ws(kind: u8, tx: mpsc::Sender<Vec<u8>>, idr: Option<Arc<IdrGate>>) -> Self {
+        Self::with(kind, Out::Ws(tx, idr))
+    }
+
+    fn with(kind: u8, out: Out) -> Self {
         Tx {
-            out: Out::Udp(dests),
+            out,
             kind,
             seq: AtomicU32::new(0),
             warned: AtomicBool::new(false),
             bytes: AtomicU64::new(0),
             lat_sum: AtomicU64::new(0),
             timeline: AtomicBool::new(false),
+            delay: AtomicU16::new(0),
         }
     }
 
@@ -826,72 +869,55 @@ impl Tx {
         self.timeline.store(true, Ordering::Relaxed);
     }
 
-    fn dests(&self) -> &[Dest] {
+    /// The receivers now; a frame goes to these, whoever joins or leaves meanwhile.
+    fn dests(&self) -> Vec<Arc<Dest>> {
         match &self.out {
-            Out::Udp(d) => d,
-            Out::Ws(..) => &[],
+            Out::Udp(d) => d.read().unwrap().clone(),
+            Out::Ws(..) => Vec::new(),
         }
     }
 
-    /// Sets the playout delay D (0.1 ms) of receiver `i`'s packets, from the next packet on.
-    fn set_delay(&self, i: usize, units: u16) {
-        if let Some(d) = self.dests().get(i) {
+    /// Sets the playout delay D (0.1 ms) of every receiver's packets, from the next frame on: at the same frame for
+    /// all, so a change is one resync everywhere.
+    fn set_delay(&self, units: u16) {
+        self.delay.store(units, Ordering::Relaxed);
+        for d in self.dests() {
             d.delay.store(units, Ordering::Relaxed);
         }
     }
 
-    /// Stops sending to receiver `i` (it left the group).
-    fn drop_dest(&self, i: usize) {
-        if let Some(d) = self.dests().get(i) {
-            d.alive.store(false, Ordering::Relaxed);
+    /// A receiver joins the running stream: from the frame it can start from on, at the D of everyone else.
+    fn join(&self, d: Dest) -> Arc<Dest> {
+        d.delay
+            .store(self.delay.load(Ordering::Relaxed), Ordering::Relaxed);
+        d.waiting.store(true, Ordering::Relaxed);
+        let d = Arc::new(d);
+        if let Out::Udp(all) = &self.out {
+            all.write().unwrap().push(d.clone());
+        }
+        d
+    }
+
+    /// Stops sending to a receiver (it left the group).
+    fn drop_member(&self, id: &str) {
+        if let Out::Udp(all) = &self.out {
+            all.write().unwrap().retain(|d| d.member != id);
         }
     }
 
     /// Answers the receivers' clock requests (PROTOCOL.md 4k) on every socket, with t2 and t3 from `now_us` (the pts
-    /// clock), until this Tx is dropped. A thread per receiver: a request is answered the moment it is read.
-    /// `skip_first`: the first socket already has a reader (the receiver's input, which answers the clock too); two
-    /// readers on one socket would each take datagrams meant for the other.
-    fn answer_clock(self: &Arc<Self>, now_us: crate::sync::Now, skip_first: bool) {
-        for (i, d) in self.dests().iter().enumerate().skip(skip_first as usize) {
-            let Ok(sock) = d.sock.try_clone() else {
-                continue;
-            };
-            let _ = sock.set_read_timeout(Some(Duration::from_millis(200)));
-            let (weak, now_us) = (Arc::downgrade(self), now_us.clone());
-            std::thread::Builder::new()
-                .name(format!("luchd-clock-{i}"))
-                .spawn(move || {
-                    let mut buf = [0u8; 128];
-                    while weak.strong_count() > 0 {
-                        let n = match sock.recv(&mut buf) {
-                            Ok(n) => n,
-                            // Timeouts, and the ICMP "unreachable" of a receiver not listening yet: go on.
-                            Err(_) => continue,
-                        };
-                        if let Some(r) = crate::sync::answer(&buf[..n], &now_us) {
-                            let _ = sock.send(&r);
-                        }
-                    }
-                })
-                .ok();
-        }
-    }
-
-    fn ws(kind: u8, tx: mpsc::Sender<Vec<u8>>, idr: Option<Arc<IdrGate>>) -> Self {
-        Tx {
-            out: Out::Ws(tx, idr),
-            kind,
-            seq: AtomicU32::new(0),
-            warned: AtomicBool::new(false),
-            bytes: AtomicU64::new(0),
-            lat_sum: AtomicU64::new(0),
-            timeline: AtomicBool::new(false),
+    /// clock), until each leaves or this Tx is dropped. `skip_first`: the first socket already has a reader (the
+    /// receiver's input, which answers the clock too); two readers on one socket would each take datagrams meant for
+    /// the other.
+    fn answer_clock(&self, now_us: crate::sync::Now, skip_first: bool) {
+        for d in self.dests().iter().skip(skip_first as usize) {
+            answer_clock_on(d, now_us.clone());
         }
     }
 
     /// The first receiver's UDP socket, for the input that comes back on the same flow.
-    fn first_socket(&self) -> Option<&UdpSocket> {
-        self.dests().first().map(|d| &d.sock)
+    fn first(&self) -> Option<Arc<Dest>> {
+        self.dests().into_iter().next()
     }
 
     // ponytail: one send() per shard; sendmmsg/UDP_SEGMENT if the syscall count ever shows up in profiles.
@@ -917,13 +943,16 @@ impl Tx {
             );
         }
         match &self.out {
-            Out::Udp(dests) => {
+            Out::Udp(_) => {
+                let dests = self.dests();
                 // Each receiver's frame: sealed with its own key over the header it will carry, its own delay D
-                // included (PROTOCOL.md 4, 4k), so the receiver authenticates exactly what it gets.
-                let frames: Vec<(&Dest, std::borrow::Cow<[u8]>)> = dests
+                // included (PROTOCOL.md 4, 4k), so the receiver authenticates exactly what it gets: D is read once.
+                type Body<'a> = (&'a Dest, [u8; 2], std::borrow::Cow<'a, [u8]>);
+                let frames: Vec<Body> = dests
                     .iter()
-                    .filter(|d| d.alive.load(Ordering::Relaxed))
+                    .filter(|d| d.takes(self.kind, flags))
                     .map(|d| {
+                        let delay = d.delay.load(Ordering::Relaxed).to_be_bytes();
                         let body = match &d.seal {
                             Some(seal) => {
                                 let len = data.len() + TAG;
@@ -937,37 +966,35 @@ impl Tx {
                                     len as u32,
                                     host_lat,
                                 );
-                                h[22..24].copy_from_slice(
-                                    &d.delay.load(Ordering::Relaxed).to_be_bytes(),
-                                );
+                                h[22..24].copy_from_slice(&delay);
                                 std::borrow::Cow::Owned(seal.seal(&h, data))
                             }
                             None => std::borrow::Cow::Borrowed(data),
                         };
-                        (d, body)
+                        (&**d, delay, body)
                     })
                     .collect();
-                let parts: Vec<(&Dest, Vec<_>)> = frames
+                let parts: Vec<(&Dest, [u8; 2], Vec<_>)> = frames
                     .iter()
-                    .map(|(d, body)| {
+                    .map(|(d, delay, body)| {
                         let p = wire::shards(self.kind, flags, seq, pts_us as u32, host_lat, body);
-                        (*d, p.collect())
+                        (*d, *delay, p.collect())
                     })
                     .collect();
-                let most = parts.iter().map(|(_, p)| p.len()).max().unwrap_or(0);
+                let most = parts.iter().map(|(_, _, p)| p.len()).max().unwrap_or(0);
                 let mut pkt = Vec::with_capacity(HEADER + SHARD);
                 // Shard by shard to every receiver, so none of a group waits for the others' whole frame.
                 for i in 0..most {
                     if i > 0 && i % BURST == 0 {
                         std::thread::sleep(BURST_GAP); // ponytail: fixed pacing, ~3 ms for a 200 KB IDR
                     }
-                    for (d, p) in &parts {
+                    for (d, delay, p) in &parts {
                         let Some((h, chunk)) = p.get(i) else {
                             continue;
                         };
                         pkt.clear();
                         pkt.extend_from_slice(h);
-                        pkt[22..24].copy_from_slice(&d.delay.load(Ordering::Relaxed).to_be_bytes());
+                        pkt[22..24].copy_from_slice(delay);
                         pkt.extend_from_slice(chunk);
                         // A lost datagram is recovered by the receiver's keyframe request; just report the first failure.
                         if let Err(e) = d.sock.send(&pkt) {
@@ -999,6 +1026,32 @@ impl Tx {
             }
         }
     }
+}
+
+/// Answers one receiver's clock requests (PROTOCOL.md 4k) on its socket until it leaves: a thread of its own, so a
+/// request is answered the moment it is read.
+fn answer_clock_on(d: &Arc<Dest>, now_us: crate::sync::Now) {
+    let Ok(sock) = d.sock.try_clone() else {
+        return;
+    };
+    let _ = sock.set_read_timeout(Some(Duration::from_millis(200)));
+    let weak = Arc::downgrade(d);
+    std::thread::Builder::new()
+        .name("luchd-clock".into())
+        .spawn(move || {
+            let mut buf = [0u8; 128];
+            while weak.strong_count() > 0 {
+                let n = match sock.recv(&mut buf) {
+                    Ok(n) => n,
+                    // Timeouts, and the ICMP "unreachable" of a receiver not listening yet: go on.
+                    Err(_) => continue,
+                };
+                if let Some(r) = crate::sync::answer(&buf[..n], &now_us) {
+                    let _ = sock.send(&r);
+                }
+            }
+        })
+        .ok();
 }
 
 /// The media key a receiver gives in `ready` over TLS (PROTOCOL.md 4); none from an older receiver.
@@ -1686,10 +1739,16 @@ fn round1(x: f64) -> f64 {
     (x * 10.0).round() / 10.0
 }
 
-/// Runs one mirroring session until stopped (by us, the receiver, or an error).
-/// What a running group knows of its members, and the policy choosing its D (PROTOCOL.md 4k).
+/// What a running group knows of its members, and the policy choosing its D (PROTOCOL.md 4k). Member 0 is the
+/// session's own receiver; those that join later are numbered on, and a number is never given again.
 struct GroupState {
+    id: String,
+    timeline: u32,
+    mode: crate::sync::Mode,
+    tolerance_ms: f64,
     who: Vec<MemberId>,
+    /// Each member's control channel; member 0's is the session's own.
+    cmds: Vec<Option<mpsc::Sender<Cmd>>>,
     reports: Vec<crate::sync::Report>,
     present: Vec<bool>,
     /// Each member's correction in use, and the route it was chosen for.
@@ -1698,43 +1757,90 @@ struct GroupState {
     policy: crate::sync::Policy,
     started: std::time::Instant,
     d: (f64, f64),
+    /// The members' events in one stream, tagged with the member's number.
+    events: mpsc::Sender<(usize, Value)>,
 }
 
 impl GroupState {
-    fn new(g: Group, tx: &mpsc::Sender<(usize, Value)>, cmds: &mut Vec<mpsc::Sender<Cmd>>) -> Self {
-        let mut who = vec![g.primary.clone()];
-        for (k, m) in g.members.into_iter().enumerate() {
-            let (tx, mut events) = (tx.clone(), m.events);
-            tokio::spawn(async move {
-                loop {
-                    match events.recv().await {
-                        Ok(v) => {
-                            if tx.send((k + 1, v)).await.is_err() {
-                                break;
-                            }
-                        }
-                        Err(broadcast::error::RecvError::Lagged(_)) => {}
-                        Err(_) => {
-                            let _ = tx.send((k + 1, json!({"t": "_closed"}))).await;
-                            break;
-                        }
-                    }
-                }
-            });
-            cmds.push(m.cmd);
-            who.push(m.who);
-        }
-        let n = who.len();
-        GroupState {
-            offsets: who.iter().map(|w| (w.offset_ms, None)).collect(),
-            who,
-            reports: vec![Default::default(); n],
-            present: vec![true; n],
+    fn new(g: Group, events: mpsc::Sender<(usize, Value)>) -> Self {
+        let mut s = GroupState {
+            id: g.id,
+            timeline: g.timeline,
+            mode: g.mode,
+            tolerance_ms: g.tolerance_ms,
+            who: Vec::new(),
+            cmds: Vec::new(),
+            reports: Vec::new(),
+            present: Vec::new(),
+            offsets: Vec::new(),
             pending: Vec::new(),
             policy: crate::sync::Policy::new(g.mode, g.tolerance_ms, g.floor_ms),
             started: std::time::Instant::now(),
             d: (0.0, 0.0),
+            events,
+        };
+        s.push(g.primary, None);
+        for m in g.members {
+            s.add(m.who, m.cmd, m.events);
         }
+        s
+    }
+
+    fn push(&mut self, who: MemberId, cmd: Option<mpsc::Sender<Cmd>>) -> usize {
+        self.offsets.push((who.offset_ms, None));
+        self.who.push(who);
+        self.cmds.push(cmd);
+        self.reports.push(Default::default());
+        self.present.push(true);
+        self.who.len() - 1
+    }
+
+    /// A member, at the start or joining later: its events come in with its number.
+    fn add(
+        &mut self,
+        who: MemberId,
+        cmd: mpsc::Sender<Cmd>,
+        mut events: broadcast::Receiver<Value>,
+    ) -> usize {
+        let k = self.push(who, Some(cmd));
+        let tx = self.events.clone();
+        tokio::spawn(async move {
+            loop {
+                match events.recv().await {
+                    Ok(v) => {
+                        if tx.send((k, v)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(_) => {
+                        let _ = tx.send((k, json!({"t": "_closed"}))).await;
+                        break;
+                    }
+                }
+            }
+        });
+        k
+    }
+
+    /// The number of the member playing with this receiver id.
+    fn find(&self, id: &str) -> Option<usize> {
+        (0..self.who.len()).find(|k| self.present[*k] && self.who[*k].id == id)
+    }
+
+    /// The (group id, timeline, mode, tolerance) a member's start carries.
+    fn info(&self) -> (&str, u32, crate::sync::Mode, f64) {
+        (&self.id, self.timeline, self.mode, self.tolerance_ms)
+    }
+
+    /// A member still playing: its control channel (None for member 0, the session's own).
+    fn cmd(&self, k: usize) -> Option<&mpsc::Sender<Cmd>> {
+        self.cmds.get(k)?.as_ref().filter(|_| self.present[k])
+    }
+
+    /// Every member still playing but member 0, with its channel.
+    fn others(&self) -> impl Iterator<Item = &mpsc::Sender<Cmd>> {
+        (1..self.who.len()).filter_map(|k| self.cmd(k))
     }
 
     fn report(&mut self, k: usize, stats: &Value) {
@@ -1755,18 +1861,31 @@ impl GroupState {
         }
     }
 
-    fn left(&mut self, k: usize) {
-        if let Some(p) = self.present.get_mut(k) {
-            *p = false;
+    /// Member `k` left (removed, or by itself): nothing more goes to it, the others play on. Its receiver id, or
+    /// None when it had left already.
+    fn leave(&mut self, k: usize, video: &Tx, audio: &Tx) -> Option<String> {
+        if !self.present.get(k).copied().unwrap_or(false) {
+            return None;
         }
+        self.present[k] = false;
+        let id = self.who[k].id.clone();
+        video.drop_member(&id);
+        audio.drop_member(&id);
+        Some(id)
+    }
+
+    /// How many members play now: none left ends the group.
+    fn playing(&self) -> usize {
+        self.present.iter().filter(|p| **p).count()
     }
 
     fn offsets_to_send(&mut self) -> Vec<(usize, f64)> {
         std::mem::take(&mut self.pending)
     }
 
-    /// Once a second: D from what the members reported, into every packet from now on; the group's stats.
-    fn tick(&mut self, video: &Tx, video_of: &[usize], audio: &Tx, audio_of: &[usize]) -> Value {
+    /// Once a second: D from what the members reported, into every packet from now on; the group's stats (the members
+    /// playing now).
+    fn tick(&mut self, video: &Tx, audio: &Tx) -> Value {
         let live = |k: &usize| self.present[*k];
         let video_pts: Vec<f64> = (0..self.who.len())
             .filter(|k| live(k) && self.who[*k].video())
@@ -1779,17 +1898,14 @@ impl GroupState {
         self.d = self
             .policy
             .update(self.started.elapsed().as_secs_f64(), &video_pts, &need);
-        let (dv, da) = (
-            crate::sync::header_units(self.d.0),
-            crate::sync::header_units(self.d.1),
-        );
-        (0..video_of.len()).for_each(|i| video.set_delay(i, dv));
-        (0..audio_of.len()).for_each(|i| audio.set_delay(i, da));
-        json!({"d_video_ms": self.d.0, "d_audio_ms": self.d.1,
-               "members": self.who.iter().zip(&self.reports).zip(&self.offsets).zip(&self.present)
-                   .map(|(((w, r), o), p)| json!({"id": w.id, "name": w.name, "role": w.role, "present": p,
-                        "need_ms": r.need_ms, "video_pts_ms": r.video_pts_ms, "route": r.route, "offset_ms": o.0}))
-                   .collect::<Vec<_>>()})
+        video.set_delay(crate::sync::header_units(self.d.0));
+        audio.set_delay(crate::sync::header_units(self.d.1));
+        json!({"id": self.id, "mode": self.mode.wire(), "d_video_ms": self.d.0, "d_audio_ms": self.d.1,
+               "members": (0..self.who.len()).filter(live).map(|k| {
+                   let (w, r) = (&self.who[k], &self.reports[k]);
+                   json!({"id": w.id, "name": w.name, "role": w.role, "present": true, "need_ms": r.need_ms,
+                          "video_pts_ms": r.video_pts_ms, "route": r.route, "offset_ms": self.offsets[k].0})
+               }).collect::<Vec<_>>()})
     }
 
     fn policy_needs_all(&self) -> bool {
@@ -1801,11 +1917,57 @@ impl GroupState {
     }
 }
 
+/// The role a receiver joining a running group plays: the one asked for, or by default a speaker in a group of sound
+/// only and the picture with its sound otherwise. Refused when the group cannot give it that (no picture to show, or
+/// a codec it cannot decode).
+fn join_role(
+    asked: &str,
+    name: &str,
+    sound_only: bool,
+    hevc: bool,
+    can_hevc: bool,
+) -> Result<String, String> {
+    let role = match asked {
+        "" if sound_only => "audio",
+        "" => "both",
+        "video" | "audio" | "both" => asked,
+        r => return Err(format!("role video|audio|both, not {r}")),
+    };
+    if sound_only && role != "audio" {
+        return Err(format!(
+            "this group plays sound only: {name} can join it as a speaker (role audio)"
+        ));
+    }
+    if role != "audio" && hevc && !can_hevc {
+        return Err(format!(
+            "{name} cannot decode HEVC, the picture of this group"
+        ));
+    }
+    Ok(role.to_string())
+}
+
+/// What a running session is told: stop, or a change of its group.
+pub enum Ctl {
+    Stop,
+    /// A receiver joins the group; answered once it plays, or with why not.
+    Join(Member, tokio::sync::oneshot::Sender<Result<(), String>>),
+    /// A member (by receiver id) leaves; answered with whether it was the last, which ends the group.
+    Leave(String, tokio::sync::oneshot::Sender<Result<bool, String>>),
+}
+
+/// A receiver that answered its start: it is given its sockets in the session's loop.
+type Joined = (
+    Member,
+    Result<Value, String>,
+    tokio::sync::oneshot::Sender<Result<(), String>>,
+);
+
+/// Runs one mirroring session until stopped (by us, the receiver, or an error).
 pub async fn run(
     t: Target,
     cmd: mpsc::Sender<Cmd>,
     mut events: broadcast::Receiver<Value>,
-    mut stop: mpsc::Receiver<()>,
+    mut ctl: mpsc::Receiver<Ctl>,
     stats: Stats,
 ) -> Result<&'static str, String> {
     let _awake = ScreenAwake::start().await;
@@ -1874,8 +2036,6 @@ pub async fn run(
     let ready = await_ready(&mut events).await?;
     // Web receivers take media over their websocket; everything else gets UDP sockets.
     let idr = Arc::new(IdrGate::new(IDR_COOLDOWN));
-    // Which member (0 = the target) each video and audio destination belongs to.
-    let (mut video_of, mut audio_of): (Vec<usize>, Vec<usize>) = (vec![0], vec![0]);
     let (video, audio) = if let Some(ws) = t.ws.clone() {
         (
             Arc::new(Tx::ws(KIND_VIDEO, ws.video, Some(idr.clone()))),
@@ -1894,17 +2054,22 @@ pub async fn run(
                 t.ifname.clone(),
                 SocketAddrV4::new(t.address, vp),
                 key.clone(),
-                0,
+                t.id.clone(),
             ));
         }
         if primary.as_ref().is_none_or(|p| p.audio()) {
-            ato.push((t.ifname.clone(), SocketAddrV4::new(t.address, ap), key, 0));
+            ato.push((
+                t.ifname.clone(),
+                SocketAddrV4::new(t.address, ap),
+                key,
+                t.id.clone(),
+            ));
         }
         if let Some(g) = group.as_mut() {
             let video_block = start["video"].clone();
             let gid = g.id.clone();
             let info = (gid.as_str(), g.timeline, g.mode, g.tolerance_ms);
-            for (k, m) in g.members.iter_mut().enumerate() {
+            for m in g.members.iter_mut() {
                 let st = member_start(&video_block, &m.audio, info, &m.who);
                 m.cmd
                     .send(Cmd::Send(st))
@@ -1919,7 +2084,7 @@ pub async fn run(
                         m.ifname.clone(),
                         SocketAddrV4::new(m.address, vp),
                         key.clone(),
-                        k + 1,
+                        m.who.id.clone(),
                     ));
                 }
                 if let (true, Some(ap)) = (m.who.audio(), port_of(&r, "audio_port")) {
@@ -1927,21 +2092,14 @@ pub async fn run(
                         m.ifname.clone(),
                         SocketAddrV4::new(m.address, ap),
                         key,
-                        k + 1,
+                        m.who.id.clone(),
                     ));
                 }
             }
         }
-        let addrs = |v: &[(String, SocketAddrV4, Option<Vec<u8>>, usize)]| {
-            v.iter()
-                .map(|(i, a, k, _)| (i.clone(), *a, k.clone()))
-                .collect::<Vec<MediaTo>>()
-        };
-        video_of = vto.iter().map(|x| x.3).collect();
-        audio_of = ato.iter().map(|x| x.3).collect();
         (
-            Arc::new(Tx::open_many(KIND_VIDEO, &addrs(&vto), 40).map_err(io)?),
-            Arc::new(Tx::open_many(KIND_AUDIO, &addrs(&ato), 48).map_err(io)?),
+            Arc::new(Tx::open_many(KIND_VIDEO, &vto, 40).map_err(io)?),
+            Arc::new(Tx::open_many(KIND_AUDIO, &ato, 48).map_err(io)?),
         )
     };
 
@@ -1950,9 +2108,8 @@ pub async fn run(
     // clock requests a receiver without sound sends there (4k) are answered by the same reader, once the pts clock
     // is there.
     let clock: Arc<std::sync::OnceLock<crate::sync::Now>> = Arc::default();
-    let input_sock = video
-        .first_socket()
-        .filter(|_| video_of.first() == Some(&0));
+    let input_dest = video.first().filter(|d| d.member == t.id);
+    let input_sock = input_dest.as_ref().map(|d| &d.sock);
     let mut input = match (&t.input, input_sock) {
         (Some(_), Some(sock)) if wants_input && crate::input::mode() != "off" => {
             use crate::input::{inject::Injector, map::Geometry};
@@ -2016,7 +2173,7 @@ pub async fn run(
     let kms = if t.kms {
         Some(spawn_kms(
             video.clone(),
-            need_head,
+            need_head.clone(),
             hevc,
             size,
             p.clone(),
@@ -2028,9 +2185,12 @@ pub async fn run(
     };
     // A group's members: their events in one stream, tagged with the member's number (1..; 0 is the target).
     let (member_tx, mut member_rx) = mpsc::channel::<(usize, Value)>(64);
-    let mut member_cmds: Vec<mpsc::Sender<Cmd>> = Vec::new();
-    let mut gs = group.map(|g| GroupState::new(g, &member_tx, &mut member_cmds));
-    drop(member_tx);
+    let mut gs = group.map(|g| GroupState::new(g, member_tx));
+    // Receivers joining the running group, once they answered their start.
+    let (joined_tx, mut joined) = mpsc::channel::<Joined>(4);
+    let video_block = start["video"].clone();
+    // The target is in the session until it leaves a group that plays on without it.
+    let mut primary_in = true;
     if std::env::var_os("LUCH_PROBE").is_some() {
         probe_stages(&p);
     }
@@ -2085,8 +2245,10 @@ pub async fn run(
                 (last_frames, last_bytes, last_lat) = (frames, bytes, lat);
                 let sender = json!({"t": "sender_stats", "rtt_ms": rtt, "host_ms": round1(host_ms),
                                     "fps": df, "mbps": round1(mbps), "virtual_monitor": virtual_monitor, "encoder": if hevc { "hevc_vaapi" } else { "h264_vaapi" }, "res": format!("{}x{}", size.width, size.height)});
-                let _ = cmd.send(Cmd::Send(sender.clone())).await;
-                for c in &member_cmds {
+                if primary_in {
+                    let _ = cmd.send(Cmd::Send(sender.clone())).await;
+                }
+                for c in gs.iter().flat_map(|g| g.others()) {
                     let _ = c.send(Cmd::Send(sender.clone())).await;
                 }
                 // Rough glass-to-glass estimate without the display: capture+encode + one-way network + decode.
@@ -2094,19 +2256,125 @@ pub async fn run(
                 let est = host_ms + rtt.as_f64().unwrap_or(0.0) / 2.0 + decode;
                 let mut all = json!({"sender": sender, "receiver": rx_stats, "est_ms": round1(est), "idr": idr.counters()});
                 if let Some(g) = gs.as_mut() {
-                    all["group"] = g.tick(&video, &video_of, &audio, &audio_of);
+                    all["group"] = g.tick(&video, &audio);
+                    all["group"]["sound_only"] = json!(t.audio_only);
                     for (k, offset) in g.offsets_to_send() {
                         let msg = Cmd::Send(json!({"t": "offset", "ms": offset}));
-                        let _ = if k == 0 { cmd.send(msg).await } else { member_cmds[k - 1].send(msg).await };
+                        match g.cmd(k) {
+                            Some(c) => { let _ = c.send(msg).await; }
+                            None if k == 0 && primary_in => { let _ = cmd.send(msg).await; }
+                            None => {}
+                        }
                     }
                 }
                 *stats.lock().unwrap() = all;
             }
-            _ = stop.recv() => {
-                let _ = cmd.send(Cmd::Send(json!({"t": "stop"}))).await;
-                break Ok("stopped");
+            c = ctl.recv() => match c {
+                Some(Ctl::Join(mut m, reply)) => {
+                    let Some(g) = gs.as_ref() else {
+                        let _ = reply.send(Err("not playing in a group".into()));
+                        continue;
+                    };
+                    if g.find(&m.who.id).is_some() {
+                        let _ = reply.send(Err(format!("{} is in the group already", m.who.name)));
+                        continue;
+                    }
+                    match join_role(&m.who.role, &m.who.name, t.audio_only, hevc, m.can_hevc) {
+                        Ok(role) => m.who.role = role,
+                        Err(e) => {
+                            let _ = reply.send(Err(e));
+                            continue;
+                        }
+                    }
+                    // Its start, with the group's timeline; the session plays on while it answers.
+                    let start = member_start(&video_block, &m.audio, g.info(), &m.who);
+                    let tx = joined_tx.clone();
+                    tokio::spawn(async move {
+                        let r = match m.cmd.send(Cmd::Send(start)).await {
+                            Ok(()) => await_ready(&mut m.events).await,
+                            Err(_) => Err("control channel closed".into()),
+                        };
+                        let _ = tx.send((m, r, reply)).await;
+                    });
+                }
+                Some(Ctl::Leave(id, reply)) => {
+                    let Some(g) = gs.as_mut() else {
+                        let _ = reply.send(Err("not playing in a group".into()));
+                        continue;
+                    };
+                    let Some(k) = g.find(&id) else {
+                        let _ = reply.send(Err(format!("{id} is not in this group")));
+                        continue;
+                    };
+                    let stop = Cmd::Send(json!({"t": "stop"}));
+                    let _ = match g.cmd(k) {
+                        Some(c) => c.send(stop).await,
+                        None => cmd.send(stop).await,
+                    };
+                    if let Some(id) = g.leave(k, &video, &audio) {
+                        eprintln!("[luchd] {id} left the group");
+                        let _ = t.left.send(id);
+                    }
+                    if k == 0 {
+                        primary_in = false;
+                        input = None;
+                    }
+                    let last = g.playing() == 0;
+                    let _ = reply.send(Ok(last));
+                    if last {
+                        break Ok("the last receiver left the group");
+                    }
+                }
+                Some(Ctl::Stop) | None => {
+                    if primary_in {
+                        let _ = cmd.send(Cmd::Send(json!({"t": "stop"}))).await;
+                    }
+                    break Ok("stopped");
+                }
+            },
+            Some((m, ready, reply)) = joined.recv() => {
+                let name = m.who.name.clone();
+                let Some(g) = gs.as_mut() else { continue };
+                let opened = ready.and_then(|r| {
+                    let seal = || media_key(&r).map(|k| k.as_deref().and_then(Seal::new));
+                    let io = |e: std::io::Error| format!("udp: {e}");
+                    let mut new = Vec::new();
+                    if let (true, Some(vp)) = (m.who.video(), port_of(&r, "video_port")) {
+                        let d = Dest::open(&m.ifname, SocketAddrV4::new(m.address, vp), 40, seal()?).map_err(io)?;
+                        new.push(video.join(d.of_member(&m.who.id)));
+                    }
+                    if let (true, Some(ap)) = (m.who.audio(), port_of(&r, "audio_port")) {
+                        let d = Dest::open(&m.ifname, SocketAddrV4::new(m.address, ap), 48, seal()?).map_err(io)?;
+                        new.push(audio.join(d.of_member(&m.who.id)));
+                    }
+                    Ok(new)
+                });
+                match opened {
+                    Ok(new) => {
+                        if let Some(now) = clock.get() {
+                            new.iter().for_each(|d| answer_clock_on(d, now.clone()));
+                        }
+                        // It starts from the next keyframe and OpusHead, which every member gets anew.
+                        if m.who.video() {
+                            idr.request();
+                            if let Some(k) = &kms {
+                                k.kick();
+                            }
+                        }
+                        need_head.store(true, Ordering::Relaxed);
+                        eprintln!("[luchd] {name} joined the group ({})", m.who.role);
+                        g.add(m.who, m.cmd, m.events);
+                        let _ = reply.send(Ok(()));
+                    }
+                    Err(e) => {
+                        video.drop_member(&m.who.id);
+                        audio.drop_member(&m.who.id);
+                        let _ = m.cmd.send(Cmd::Send(json!({"t": "stop"}))).await;
+                        let _ = reply.send(Err(format!("{name}: {e}")));
+                    }
+                }
             }
-            Some(a) = answers.recv() => {
+            Some(a) = answers.recv(), if primary_in => {
                 if let Some(i) = input.as_mut() {
                     let _ = cmd.send(Cmd::Send(i.answer(a))).await;
                 }
@@ -2114,7 +2382,7 @@ pub async fn run(
                     crate::save_choice(crate::input::ask::CHOICES_FILE, &t.id, "always");
                 }
             }
-            ev = events.recv() => match ev {
+            ev = events.recv(), if primary_in => match ev {
                 Ok(v) if v["t"] == "keyframe" => {
                     idr.request();
                     if let Some(k) = &kms {
@@ -2151,10 +2419,27 @@ pub async fn run(
                 Ok(v) if v["t"] == "_rtt" => rtt = json!(round1(v["ms"].as_f64().unwrap_or(0.0))),
                 Ok(v) if v["t"] == "stop" => {
                     eprintln!("[luchd] {}: receiver sent {v}", t.name);
-                    break Ok(crate::limits::stop_reason(&v));
+                    let Some(g) = gs.as_mut() else { break Ok(crate::limits::stop_reason(&v)) };
+                    // In a group the others play on without it.
+                    if let Some(id) = g.leave(0, &video, &audio) {
+                        let _ = t.left.send(id);
+                    }
+                    (primary_in, input) = (false, None);
+                    if g.playing() == 0 {
+                        break Ok(crate::limits::stop_reason(&v));
+                    }
                 }
                 Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
-                Err(_) => break Ok("control channel closed"),
+                Err(_) => {
+                    let Some(g) = gs.as_mut() else { break Ok("control channel closed") };
+                    if let Some(id) = g.leave(0, &video, &audio) {
+                        let _ = t.left.send(id);
+                    }
+                    (primary_in, input) = (false, None);
+                    if g.playing() == 0 {
+                        break Ok("control channel closed");
+                    }
+                }
             },
             Some((k, v)) = member_rx.recv() => match v["t"].as_str() {
                 Some("keyframe") => {
@@ -2169,24 +2454,29 @@ pub async fn run(
                     }
                 }
                 Some("stop") | Some("_closed") => {
-                    // A member left: the others go on without it.
-                    eprintln!("[luchd] group member {k} left: {v}");
-                    for (tx, of) in [(&video, &video_of), (&audio, &audio_of)] {
-                        of.iter().enumerate().filter(|(_, m)| **m == k).for_each(|(i, _)| tx.drop_dest(i));
+                    // A member left by itself: the others go on without it; the last one out ends the group.
+                    let Some(g) = gs.as_mut() else { continue };
+                    if let Some(id) = g.leave(k, &video, &audio) {
+                        eprintln!("[luchd] group member {id} left: {v}");
+                        let _ = t.left.send(id);
                     }
-                    if let Some(g) = gs.as_mut() {
-                        g.left(k);
+                    if g.playing() == 0 {
+                        break Ok("the last receiver left the group");
                     }
                 }
                 _ => {}
             },
             Some(why) = kms_died.recv() => {
-                let _ = cmd.send(Cmd::Send(json!({"t": "stop"}))).await;
+                if primary_in {
+                    let _ = cmd.send(Cmd::Send(json!({"t": "stop"}))).await;
+                }
                 break Err(why);
             }
             msg = bus.next() => match msg.as_ref().map(|m| m.view()) {
                 Some(gst::MessageView::Error(err)) => {
-                    let _ = cmd.send(Cmd::Send(json!({"t": "stop"}))).await;
+                    if primary_in {
+                        let _ = cmd.send(Cmd::Send(json!({"t": "stop"}))).await;
+                    }
                     break Err(format!("pipeline: {} ({:?})", err.error(), err.debug()));
                 }
                 Some(gst::MessageView::Eos(_)) | None => break Ok("capture ended"),
@@ -2194,7 +2484,7 @@ pub async fn run(
             },
         }
     };
-    for c in &member_cmds {
+    for c in gs.iter().flat_map(|g| g.others()) {
         let _ = c.send(Cmd::Send(json!({"t": "stop"}))).await;
     }
     let _ = p.set_state(gst::State::Null);
@@ -2294,11 +2584,11 @@ mod tests {
         let (rx_b, mut db) = pair();
         da.seal = Seal::new(&keys[0]);
         db.seal = Seal::new(&keys[1]);
+        da.delay = AtomicU16::new(1500);
+        db.delay = AtomicU16::new(40);
         let tx = Tx::udp(KIND_VIDEO, vec![da, db]);
         tx.seq.store(3, Ordering::Relaxed);
         tx.start_timeline();
-        tx.set_delay(0, 1500);
-        tx.set_delay(1, 40);
         let frame: Vec<u8> = (0..SHARD + 10).map(|i| i as u8).collect();
         tx.send_frame(&frame, F_IDR, 1234, 5);
         for (rx, key, delay) in [(&rx_a, keys[0], 1500u16), (&rx_b, keys[1], 40)] {
@@ -2350,22 +2640,24 @@ mod tests {
     }
 
     #[test]
-    fn a_group_gets_the_same_frame_each_with_its_own_delay() {
+    fn a_group_gets_the_same_frame_at_one_delay_and_a_member_that_left_nothing() {
         let (a, da) = pair();
         let (b, db) = pair();
         let (c, dc) = pair();
-        let tx = Tx::udp(KIND_AUDIO, vec![da, db, dc]);
+        let tx = Tx::udp(
+            KIND_AUDIO,
+            vec![da.of_member("a"), db.of_member("b"), dc.of_member("c")],
+        );
         tx.start_timeline();
-        tx.set_delay(0, 1500);
-        tx.set_delay(1, 0); // a receiver that plays at once
-        tx.drop_dest(2); // left the group
+        tx.set_delay(1500);
+        tx.drop_member("c"); // left the group
         tx.send_frame(&[1, 2, 3], 0, 0x1_2345_6789, 4);
         tx.send_frame(&[4], 0, 0x1_2345_6790, 4);
         let mut buf = [0u8; 64];
-        for (rx, delay) in [(&a, 1500u16), (&b, 0)] {
+        for rx in [&a, &b] {
             let n = rx.recv(&mut buf).unwrap();
             assert_eq!(&buf[HEADER..n], &[1, 2, 3]);
-            assert_eq!(u16::from_be_bytes([buf[22], buf[23]]), delay);
+            assert_eq!(u16::from_be_bytes([buf[22], buf[23]]), 1500);
             assert_eq!(
                 buf[1] & crate::sync::F_TIMELINE,
                 crate::sync::F_TIMELINE,
@@ -2383,14 +2675,171 @@ mod tests {
         assert!(c.recv(&mut buf).is_err(), "nothing to a member that left");
     }
 
+    /// The seq and D of every packet `rx` got, until it has been quiet for a moment.
+    fn got(rx: &UdpSocket) -> Vec<(u32, u8, u16)> {
+        rx.set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let (mut buf, mut v) = ([0u8; 64], Vec::new());
+        while rx.recv(&mut buf).is_ok() {
+            let seq = u32::from_be_bytes(buf[8..12].try_into().unwrap());
+            v.push((
+                seq,
+                buf[1] & (F_IDR | F_CONFIG),
+                u16::from_be_bytes([buf[22], buf[23]]),
+            ));
+        }
+        v
+    }
+
+    #[test]
+    fn a_receiver_joining_the_picture_starts_at_the_next_keyframe_at_the_groups_delay() {
+        let (a, da) = pair();
+        let video = Tx::udp(KIND_VIDEO, vec![da.of_member("tv")]);
+        video.set_delay(1500);
+        video.send_frame(b"I", F_IDR, 0, 0);
+        video.send_frame(b"P", 0, 1, 0);
+        let (b, db) = pair();
+        video.join(db.of_member("new"));
+        // The P-frames before the next keyframe would be of a picture it never had: withheld.
+        video.send_frame(b"P", 0, 2, 0);
+        video.send_frame(b"P", 0, 3, 0);
+        video.send_frame(b"I", F_IDR, 4, 0);
+        video.send_frame(b"P", 0, 5, 0);
+        // D rises for everyone at the same frame, the newcomer included.
+        video.set_delay(1800);
+        video.send_frame(b"P", 0, 6, 0);
+        assert_eq!(got(&b), [(4, F_IDR, 1500), (5, 0, 1500), (6, 0, 1800)]);
+        assert_eq!(got(&a).len(), 7, "the others untouched");
+        // Leaving: the others play on.
+        video.drop_member("new");
+        video.send_frame(b"P", 0, 7, 0);
+        assert!(got(&b).is_empty());
+        assert_eq!(got(&a), [(7, 0, 1800)]);
+    }
+
+    #[test]
+    fn a_speaker_joining_the_sound_starts_at_its_opus_head() {
+        let (a, da) = pair();
+        let audio = Tx::udp(KIND_AUDIO, vec![da.of_member("tv")]);
+        audio.send_frame(&opus_head(), F_CONFIG, 0, 0);
+        audio.send_frame(b"o", 0, 1, 0);
+        let (b, db) = pair();
+        audio.join(db.of_member("speaker"));
+        audio.send_frame(b"o", 0, 2, 0);
+        audio.send_frame(&opus_head(), F_CONFIG, 3, 0);
+        audio.send_frame(b"o", 0, 3, 0);
+        assert_eq!(got(&b), [(3, F_CONFIG, 0), (4, 0, 0)]);
+        assert_eq!(got(&a).len(), 5);
+    }
+
+    #[test]
+    fn the_role_of_a_receiver_joining_a_running_group() {
+        let role = |asked, sound_only, hevc, can_hevc| {
+            join_role(asked, "Den TV", sound_only, hevc, can_hevc)
+        };
+        assert_eq!(role("", false, false, false).unwrap(), "both");
+        assert_eq!(role("", true, false, false).unwrap(), "audio");
+        assert_eq!(role("video", false, true, true).unwrap(), "video");
+        // A speaker needs no decoder of the picture.
+        assert_eq!(role("audio", false, true, false).unwrap(), "audio");
+        assert!(role("both", true, false, false)
+            .unwrap_err()
+            .contains("speaker"));
+        assert!(role("", false, true, false).unwrap_err().contains("HEVC"));
+        assert!(role("loud", false, false, false).is_err());
+    }
+
+    fn member(id: &str, role: &str) -> (Member, mpsc::Receiver<Cmd>, broadcast::Sender<Value>) {
+        let (cmd, cmds) = mpsc::channel(8);
+        let (events, _) = broadcast::channel(8);
+        let m = Member {
+            who: MemberId {
+                id: id.into(),
+                name: id.into(),
+                role: role.into(),
+                offset_ms: 0.0,
+            },
+            address: Ipv4Addr::LOCALHOST,
+            ifname: String::new(),
+            audio: None,
+            cmd,
+            events: events.subscribe(),
+            can_hevc: false,
+        };
+        (m, cmds, events)
+    }
+
+    #[tokio::test]
+    async fn members_join_and_leave_a_running_group_until_the_last_one_ends_it() {
+        let primary = MemberId {
+            id: "tv".into(),
+            name: "TV".into(),
+            role: "both".into(),
+            offset_ms: 0.0,
+        };
+        let (spk, _spk_cmds, spk_events) = member("speaker", "audio");
+        let (tx, mut events) = mpsc::channel(8);
+        let mut g = GroupState::new(
+            Group {
+                id: "g".into(),
+                timeline: 7,
+                mode: crate::sync::Mode::Watching,
+                tolerance_ms: 20.0,
+                floor_ms: 150.0,
+                primary,
+                members: vec![spk],
+            },
+            tx,
+        );
+        let (video, audio) = (Tx::udp(KIND_VIDEO, vec![]), Tx::udp(KIND_AUDIO, vec![]));
+        assert_eq!((g.playing(), g.find("speaker")), (2, Some(1)));
+        // A member's events come in with its number.
+        spk_events.send(json!({"t": "keyframe"})).unwrap();
+        assert_eq!(events.recv().await.unwrap(), (1, json!({"t": "keyframe"})));
+
+        // One joins: numbered on, its events too, in the stats with the others.
+        let (den, _den_cmds, den_events) = member("den", "both");
+        let k = g.add(den.who, den.cmd, den.events);
+        assert_eq!((k, g.playing()), (2, 3));
+        den_events
+            .send(json!({"t": "stats", "need_ms": 230.0}))
+            .unwrap();
+        let (k, v) = events.recv().await.unwrap();
+        g.report(k, &v);
+        let s = g.tick(&video, &audio);
+        assert_eq!(s["d_audio_ms"], 240.0, "D rose once for all");
+        let ids = |s: &Value| -> Vec<String> {
+            s["members"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|m| m["id"].as_str().unwrap().into())
+                .collect()
+        };
+        assert_eq!(ids(&s), ["tv", "speaker", "den"]);
+
+        // The first one leaves: the others play on; a second leave of it is nothing.
+        assert_eq!(g.leave(0, &video, &audio).as_deref(), Some("tv"));
+        assert_eq!(g.leave(0, &video, &audio), None);
+        assert!(g.cmd(0).is_none());
+        assert_eq!(ids(&g.tick(&video, &audio)), ["speaker", "den"]);
+        assert_eq!(g.others().count(), 2);
+        g.leave(1, &video, &audio);
+        assert_eq!(g.playing(), 1);
+        // A member that comes back is a new member.
+        let (spk, _c, _e) = member("speaker", "audio");
+        assert_eq!(g.add(spk.who, spk.cmd, spk.events), 3);
+        assert_eq!(g.find("speaker"), Some(3));
+        g.leave(3, &video, &audio);
+        g.leave(2, &video, &audio);
+        assert_eq!(g.playing(), 0, "the last one out: the group ends");
+    }
+
     #[test]
     fn clock_requests_are_answered_on_the_media_socket() {
         let (rx, d) = pair();
         let tx = Arc::new(Tx::udp(KIND_AUDIO, vec![d]));
-        let sender = match &tx.out {
-            Out::Udp(d) => d[0].sock.local_addr().unwrap(),
-            _ => unreachable!(),
-        };
+        let sender = tx.first().unwrap().sock.local_addr().unwrap();
         rx.connect(sender).unwrap();
         let ticks = Arc::new(AtomicU64::new(1_000_000));
         let t = ticks.clone();
