@@ -143,7 +143,10 @@
       video: { currentSrc: v.currentSrc, src: v.src, sources: [...v.querySelectorAll("source")].map((s) => ({ src: s.src, type: s.type })),
         audio: v.tagName === "AUDIO" },
       page: {
-        title: document.title, pageUrl: location.href, userAgent: navigator.userAgent, currentTime: v.currentTime,
+        // A video that has played to its end starts again from the beginning on the TV (a short clip on a loop); a
+        // live stream (no end) from where the TV joins it.
+        title: document.title, pageUrl: location.href, userAgent: navigator.userAgent,
+        currentTime: v.ended || v.duration === Infinity ? 0 : v.currentTime,
         lang: navigator.language,
         // A video the page never started (an iframe player waiting for its first click) plays on the TV; one paused
         // part way stays paused there too.
