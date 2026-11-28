@@ -1,5 +1,6 @@
 //! Which receiver a command means when it names none and there are several: a numbered list on the terminal, a
-//! number or the start of a name to pick, Enter for the one picked last time.
+//! number or the start of a name to pick, Enter for the one picked last time; from a file manager's menu
+//! (`--pick`), the desktop's own list.
 
 use std::io::{BufRead, IsTerminal, Write};
 
@@ -49,10 +50,22 @@ fn last_file() -> Option<std::path::PathBuf> {
 
 /// Asks on the terminal; None when there is none to ask on (a script gets the error instead) or no answer picks one.
 pub fn ask(all: &[(String, String)]) -> Option<String> {
-    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
-        return None;
-    }
     let file = last_file();
+    let remember = |id: &str| {
+        if let Some(f) = &file {
+            let _ = std::fs::create_dir_all(f.parent()?);
+            let _ = std::fs::write(f, format!("{id}\n"));
+        }
+        Some(())
+    };
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        // From a file manager's menu: the desktop's dialog asks instead.
+        let id = crate::desktop::on()
+            .then(|| crate::desktop::pick(all))
+            .flatten()?;
+        remember(&id);
+        return Some(id);
+    }
     let last = file
         .as_ref()
         .and_then(|f| std::fs::read_to_string(f).ok())
@@ -69,10 +82,7 @@ pub fn ask(all: &[(String, String)]) -> Option<String> {
         let _ = std::io::stdout().flush();
         let line = lines.next()?.ok()?;
         if let Some(id) = pick(&line, all, last) {
-            if let Some(f) = &file {
-                let _ = std::fs::create_dir_all(f.parent()?);
-                let _ = std::fs::write(f, format!("{id}\n"));
-            }
+            remember(&id);
             return Some(id);
         }
         println!("no such receiver");

@@ -5,6 +5,7 @@ use luch_proto::ReceiverRow;
 use std::io::IsTerminal;
 
 mod choice;
+mod desktop;
 mod native;
 mod report;
 
@@ -81,7 +82,7 @@ trait Luch1 {
     fn sender_id(&self) -> zbus::Result<String>;
 }
 
-const USAGE: &str = "usage: luchctl [list | refresh | find [auto|all|mdns,scan,ble,sound,qr,direct] | add <link|host[:port]> | connect [r] | disconnect [r] | mirror [r] [fast|monitor|window|virtual] | stop [r] | stats [r] | watch | id
+const USAGE: &str = "usage: luchctl [--pick] [list | refresh | find [auto|all|mdns,scan,ble,sound,qr,direct] | add <link|host[:port]> | connect [r] | disconnect [r] | mirror [r] [fast|monitor|window|virtual] | stop [r] | stats [r] | watch | id
                 | direct [r] | direct off
                 | info [r] | audio [r] auto|on|off|sync | reports | report <n> [open|dismiss]
                 | report [--keep-names] [--send] [what happened]
@@ -94,6 +95,8 @@ const USAGE: &str = "usage: luchctl [list | refresh | find [auto|all|mdns,scan,b
                 | latency [on|off] [r] | latency analyze <video> [--out prefix] [--fps n] [--readout-ms ms]
                 | group interactive|watch <r>[=role] <r>[=role]... [--source S] | offset <r> <ms>]
        r = receiver id or name, optional when there is only one; mirror defaults to fast; no arguments: interactive
+       --pick: for a file manager's menu, with no terminal: the desktop's dialogs ask which receiver (and the files
+       for a cast or present without any), take a pairing code and show what went wrong
        find: when the list stays empty (hotel Wi-Fi, a VPN): every address of the LAN, Bluetooth, then the TV's sound
        through the microphone and its QR code through the camera; add: a receiver by its QR link or address
        direct: when no network joins this computer and the TV (guest Wi-Fi, no common LAN): asked over Bluetooth, the
@@ -1163,10 +1166,32 @@ async fn main() {
         }
         return;
     }
+    let mut args = args;
+    if args.first().is_some_and(|a| a == "--pick") {
+        desktop::enable();
+        args.remove(0);
+        // The launcher's icon, not a file's menu: the files are chosen first.
+        if let [what] = args.as_slice() {
+            if what == "cast" || what == "present" {
+                let title = if what == "cast" {
+                    "Show on TV"
+                } else {
+                    "Present on TV"
+                };
+                let files = desktop::files(title).unwrap_or_default();
+                args.extend(
+                    files
+                        .into_iter()
+                        .take(if what == "cast" { usize::MAX } else { 1 }),
+                );
+            }
+        }
+    }
     let mut result = run(&args).await;
-    // A receiver that asks for pairing: the code is typed here, then the command goes on.
+    // A receiver that asks for pairing: the code is typed here (or in a dialog), then the command goes on.
     if let Err(msg) = &result {
-        if let (Some(id), true) = (pairing_id(msg), std::io::stdin().is_terminal()) {
+        let can_ask = std::io::stdin().is_terminal() || desktop::on();
+        if let (Some(id), true) = (pairing_id(msg), can_ask) {
             if args.first().map(String::as_str) != Some("pair") {
                 let id = id.to_string();
                 result = async {
@@ -1185,6 +1210,9 @@ async fn main() {
     }
     if let Err(msg) = result {
         eprintln!("luchctl: {msg}");
+        if desktop::on() && !std::io::stderr().is_terminal() {
+            desktop::error(&msg);
+        }
         std::process::exit(1);
     }
 }
@@ -1268,6 +1296,8 @@ async fn type_code(p: &Luch1Proxy<'_>, id: &str, code: Option<&str>) -> Result<(
     };
     let typed = match code {
         Some(c) => c.to_string(),
+        None if desktop::on() && !std::io::stdin().is_terminal() => desktop::code(&name)
+            .ok_or("no dialog to type the code in: run `luchctl pair` in a terminal")?,
         None => {
             use std::io::Write;
             print!("Code shown on {name}: ");
