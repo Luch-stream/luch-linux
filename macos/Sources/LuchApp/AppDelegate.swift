@@ -220,7 +220,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 ["id": receiver.id, "name": receiver.name, "model": receiver.model,
                  "address": receiver.address, "iface": receiver.interfaceName,
                  "port": Int(receiver.port), "kind": TVKind.of(receiver.id).rawValue,
-                 "mirroring": engine != nil && currentReceiverID == receiver.id]
+                 "mirroring": engine != nil && currentReceiverID == receiver.id,
+                 "media_types": caster.mediaTypes(receiver.id) ?? finding.finder.cachedWelcome(receiver.id)?["media_types"] ?? NSNull()]
             }]
         case "state":
             return ["state": state, "streaming": engine != nil, "stats": statsDictionary()]

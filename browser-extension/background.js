@@ -191,7 +191,8 @@ async function castFromTab(tabId, frameId, frameUrl, req) {
     const name = (list.find((r) => r.id === receiver) || {}).name || "TV";
     return { receiver, name, app: "youtube" };
   }
-  const src = LuchCore.pickSource(req.video, seen.get(tabId), frameId);
+  const dash = LuchCore.playsDash(list.find((r) => r.id === receiver));
+  const src = LuchCore.pickSource(req.video, seen.get(tabId), frameId, dash);
   if (!src) {
     // A player that has not started yet loads nothing (most iframe players wait for their first click, some
     // show an ad first, from a blob of its own).
@@ -215,11 +216,11 @@ async function castFromTab(tabId, frameId, frameUrl, req) {
     await ask("cast", { receiver, items: [src.url], options });
   } catch (e) {
     casts.delete(receiver);
-    // The Luch receiver plays HLS and files; a DASH-only site (VK Video, ok.ru, Dzen, Vimeo) is said as such.
-    if (src.kind === "dash" && /media_failed|no source/i.test(e.message)) {
+    // An older Luch receiver plays HLS and files only; a DASH-only site (VK Video, ok.ru, Dzen) is said as such.
+    if (src.kind === "dash" && dash !== true && /media_failed|no source/i.test(e.message)) {
       throw new Error(/^ru/i.test((req.page && req.page.lang) || "")
-        ? "Сайт отдаёт видео в DASH, а этот ТВ его пока не играет"
-        : "This site streams in DASH, which this TV cannot play yet");
+        ? "Сайт отдаёт видео в DASH, а Luch на этом ТВ его не играет: обновите его"
+        : "This site streams in DASH, which Luch on this TV does not play: update it");
     }
     throw e;
   }

@@ -308,6 +308,13 @@ public final class Finder {
 
     // MARK: - what a receiver is
 
+    /// The receiver's last welcome as this Mac found it, without asking it again; nil when it was never asked.
+    public func cachedWelcome(_ id: String) -> [String: Any]? {
+        lock.lock()
+        defer { lock.unlock() }
+        return welcomes[id]
+    }
+
     /// luchd's Info: `android` ("Android 5.1", empty when unknown), `limits` in plain words, `audio_latency_ms`.
     public func info(_ r: Receiver) -> [String: Any] {
         lock.lock()

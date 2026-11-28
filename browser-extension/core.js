@@ -143,13 +143,13 @@
 
   /**
    * What to cast for a <video>: its own link when it has one (not a blob: of a page's own player), else what the
-   * page fetched for it: an HLS playlist (a master one first), then a plain file, then DASH (which the Luch
-   * receiver cannot play; a Chromecast can). `video` is {currentSrc, src, sources: [{src, type}], audio}; `seen` the
+   * page fetched for it: an HLS playlist (a master one first), then DASH when the receiver plays it (`dash`: a Luch
+   * receiver with Media3, a Chromecast), then a plain file, and DASH last for a receiver that does not. `video` is {currentSrc, src, sources: [{src, type}], audio}; `seen` the
    * media links the page loaded, oldest first: [{url, kind, type, frameId}]. What the video's own frame loaded wins
    * over other frames' (an ad's player in another iframe); pieces of streams never count as files, nor sounds for a
    * video (a site's interface beeps). Returns {url, kind, mime} or null.
    */
-  function pickSource(video, seen, frameId) {
+  function pickSource(video, seen, frameId, dash) {
     const own = [video && video.currentSrc, video && video.src]
       .concat(((video && video.sources) || []).map((s) => s.src))
       .filter((u) => kindOf(u));
@@ -175,16 +175,14 @@
     const dirs = list.filter((s) => s.kind !== "file").map((s) => dirOf(s.url)).filter((d) => !/^[^/]+\/\/[^/]+\/$/.test(d));
     const files = list.filter((s) => s.kind === "file" && !isSegment(s.url) && !dirs.some((d) => dirOf(s.url).startsWith(d))
       && !(isVideo && /^audio\//.test(mimeOf(s.url, "file", s.type))));
+    const manifests = list.filter((s) => s.kind === "dash");
+    const manifest = manifests.length && { url: manifests[manifests.length - 1].url, kind: "dash", mime: MIME.dash };
+    if (manifest && dash) return manifest;
     if (files.length) {
       const f = files[files.length - 1];
       return { url: f.url, kind: "file", mime: mimeOf(f.url, "file", f.type) };
     }
-    const dash = list.filter((s) => s.kind === "dash");
-    if (dash.length) {
-      const d = dash[dash.length - 1];
-      return { url: d.url, kind: "dash", mime: MIME.dash };
-    }
-    return null;
+    return manifest || null;
   }
 
   /**
@@ -251,6 +249,15 @@
     const subs = (o.subs || []).filter((s) => /^https?:/.test(s));
     if (subs.length) out.subs = subs;
     return out;
+  }
+
+  /**
+   * Whether a receiver plays DASH, from the MIME types its welcome listed (`media_types`): true, false, or null when
+   * its sender has not talked to it yet.
+   */
+  function playsDash(receiver) {
+    const types = receiver && receiver.media_types;
+    return Array.isArray(types) ? types.includes(MIME.dash) : null;
   }
 
   /** After a direct cast: relay instead when the receiver could not fetch the link itself. */
@@ -342,7 +349,7 @@
     return /\.(vtt|srt|ass|ssa)(\?|$)/i.test(pathOf(url)) || c.includes("text/vtt") || c.includes("subrip");
   }
 
-  const api = { youtubeLink, isSegment, mediaElements, chooseVideo, qualityOf, variantLinks, sourcesOf, isSubtitle, kindOf, mimeOf, isPrivateHost, chooseVia, pickSource, castOptions, shouldRetryRelayed, clock,
+  const api = { playsDash, youtubeLink, isSegment, mediaElements, chooseVideo, qualityOf, variantLinks, sourcesOf, isSubtitle, kindOf, mimeOf, isPrivateHost, chooseVia, pickSource, castOptions, shouldRetryRelayed, clock,
     positionNow, MIME };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.LuchCore = api;

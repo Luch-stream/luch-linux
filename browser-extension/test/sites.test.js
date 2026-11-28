@@ -184,3 +184,22 @@ test("without a master, a subtitle or sound-only playlist is not the one cast", 
     { url: "https://cdn.example/live/2081200_576p.m3u8", kind: "hls" }];
   assert.equal(c.pickSource(blob("tv.example"), seen).url, "https://cdn.example/live/2081200_576p.m3u8");
 });
+
+test("a receiver that plays DASH gets the manifest before a loose file; an older one the file", () => {
+  const seen = [
+    { url: "https://cdn.example/m.mpd", kind: "dash" },
+    { url: "https://other.example/720/a.mp4", kind: "file", type: "video/mp4" },
+  ];
+  assert.equal(c.pickSource(blob("x.example"), seen, undefined, true).kind, "dash");
+  assert.equal(c.pickSource(blob("x.example"), seen, undefined, false).kind, "file");
+  assert.equal(c.pickSource(blob("x.example"), seen, undefined, null).kind, "file");
+  // HLS still first, whatever the receiver.
+  assert.equal(c.pickSource(blob("x.example"), seen.concat([{ url: "https://cdn.example/a.m3u8", kind: "hls" }]), undefined, true).kind, "hls");
+});
+
+test("whether a receiver plays DASH comes from its welcome's media_types", () => {
+  assert.equal(c.playsDash({ media_types: ["video/mp4", "application/vnd.apple.mpegurl", "application/dash+xml"] }), true);
+  assert.equal(c.playsDash({ media_types: ["video/mp4", "application/vnd.apple.mpegurl"] }), false);
+  assert.equal(c.playsDash({ media_types: null }), null);
+  assert.equal(c.playsDash(undefined), null);
+});

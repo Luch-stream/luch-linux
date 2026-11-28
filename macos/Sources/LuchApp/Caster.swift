@@ -55,6 +55,13 @@ final class Caster {
     /// Something shown on a receiver started, ended or changed (the menu follows it). Called on any thread.
     var onChange: (() -> Void)?
 
+    /// The MIME types a receiver's media plays (its welcome's `media_types`), once a session has opened; nil before.
+    func mediaTypes(_ id: String) -> [String]? {
+        lock.lock()
+        defer { lock.unlock() }
+        return sessions[id]?.welcome["media_types"] as? [String]
+    }
+
     /// The open session with a receiver, if there is one; none is made.
     func existing(_ id: String) -> CastSession? {
         lock.lock()

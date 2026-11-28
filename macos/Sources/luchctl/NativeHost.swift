@@ -61,7 +61,9 @@ enum NativeHost {
             return pass(local(["cmd": "receivers"])) { r in
                 (r["receivers"] as? [[String: Any]] ?? []).map {
                     ["id": $0["id"] ?? "", "name": $0["name"] ?? "", "model": $0["model"] ?? "",
-                     "connected": false, "mirroring": $0["mirroring"] ?? false, "media": NSNull()]
+                     "connected": false, "mirroring": $0["mirroring"] ?? false, "media": NSNull(),
+                     // What its media plays (DASH or not), once known; null until this Mac has talked to it.
+                     "media_types": $0["media_types"] ?? NSNull()]
                 }
             }
         case "cast":
