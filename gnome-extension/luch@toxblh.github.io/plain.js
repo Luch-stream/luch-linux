@@ -16,9 +16,12 @@ const KINDS = [
     ['codeLate', /no code was entered .* in time/i],
     ['refused', /refused the (direct )?connection/i],
     ['busy', / is busy\b/i],
+    // A group: the receiver plays something of this computer's already, or cannot decode the group's picture.
+    ['playingHere', / is playing already\b/i],
+    ['codec', /cannot decode HEVC/i],
     ['already', /already (mirroring|connected)/i],
     ['update', /: update it\b|cannot \w+ yet: update/i],
-    ['unreachable', /went away|did not answer|channel closed|timed out|connection refused|no route to host|network is unreachable|host is down|connection reset|broken pipe/i],
+    ['unreachable', /went away|did not answer| is not connected|channel closed|timed out|connection refused|no route to host|network is unreachable|host is down|connection reset|broken pipe/i],
 ];
 
 const WORDS = {
@@ -31,6 +34,8 @@ const WORDS = {
         codeLate: 'Код не ввели вовремя. Повторите действие: ТВ покажет новый код.',
         refused: 'На ТВ отказали. Повторите и нажмите на ТВ «Разрешить».',
         busy: 'ТВ сейчас занят показом с другого устройства. Остановите его там или подождите.',
+        playingHere: 'Этот ТВ уже показывает что-то с этого компьютера. Сначала остановите там показ.',
+        codec: 'Этот ТВ не умеет показывать картинку в том виде, в каком её уже получают остальные. Остановите показ и начните снова, отметив и его: тогда выберется вид для всех.',
         already: 'Показ на этот ТВ уже идёт.',
         update: 'Луч на ТВ слишком старый для этого: обновите его.',
         unreachable: 'ТВ не отвечает. Проверьте, что он включён и Луч на нём открыт, и повторите.',
@@ -44,6 +49,8 @@ const WORDS = {
         codeLate: 'The code was not typed in time. Do it again: the TV shows a new code.',
         refused: 'The TV said no. Try again and press Allow on the TV.',
         busy: 'The TV is showing another device. Stop that there, or wait.',
+        playingHere: 'This TV is already showing something from this computer. Stop that first.',
+        codec: 'This TV cannot show the picture the way the others already get it. Stop, then start again with it ticked too: a way for all is chosen then.',
         already: 'Already mirroring to this TV.',
         update: 'Luch on the TV is too old for this: update it.',
         unreachable: 'The TV does not answer. Check that it is on and Luch is open on it, then try again.',

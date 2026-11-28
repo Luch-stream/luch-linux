@@ -136,7 +136,10 @@ pairs again; a receiver with another certificate under a paired TV's id is refus
 **GNOME:** Quick Settings → **Luch**. A tap mirrors the whole screen in `fast` mode to the last or
 only receiver; the arrow opens the list with all modes. While mirroring, the toggle shows the
 estimated latency, and the list starts with **Stop mirroring to …**; do not disturb and the web receiver's address
-are under **More**. A refusal is told in plain words with what to do (`plain.js`). On the TV, press OK on the remote to show the statistics overlay.
+are under **More**. A refusal is told in plain words with what to do (`plain.js`). **Show on several TVs…**
+(with two receivers or more) offers *This screen on all TVs*, *Music in every room* and *Screen here, sound there*
+with every TV ticked; while it plays, its item lists the TVs with **Remove …**, says how far behind the screen they
+are, and has **Add …** for the others (`luchctl group add|remove` too). On the TV, press OK on the remote to show the statistics overlay.
 
 **Terminal:**
 

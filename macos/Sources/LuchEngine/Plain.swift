@@ -18,9 +18,12 @@ public enum Plain {
         ("codeLate", "no code was entered .* in time"),
         ("refused", "refused the (direct )?connection"),
         ("busy", " is busy\\b"),
+        // A group: the receiver plays something of this Mac's already, or cannot decode the group's picture.
+        ("playingHere", " is playing already\\b"),
+        ("codec", "cannot decode HEVC"),
         ("already", "already (mirroring|connected)"),
         ("update", ": update it\\b|cannot \\w+ yet: update"),
-        ("unreachable", "went away|did not answer|channel closed|timed out|connection refused|no route to host"
+        ("unreachable", "went away|did not answer| is not connected|channel closed|timed out|connection refused|no route to host"
             + "|network is unreachable|host is down|connection reset|broken pipe"),
     ].map { ($0.0, try! NSRegularExpression(pattern: $0.1, options: [.caseInsensitive])) }
 
@@ -33,6 +36,8 @@ public enum Plain {
         "codeLate": "The code was not typed in time. Do it again: the TV shows a new code.",
         "refused": "The TV said no. Try again and press Allow on the TV.",
         "busy": "The TV is showing another device. Stop that there, or wait.",
+        "playingHere": "This TV is already showing something from this Mac. Stop that first.",
+        "codec": "This TV cannot show the picture the way the others already get it. Stop, then start again with it ticked too: a way for all is chosen then.",
         "already": "Already mirroring to this TV.",
         "update": "Luch on the TV is too old for this: update it.",
         "unreachable": "The TV does not answer. Check that it is on and Luch is open on it, then try again.",

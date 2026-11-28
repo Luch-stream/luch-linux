@@ -17,6 +17,8 @@ import VirtualCursor from './cursor.js';
 import QuietAsker from './quiet.js';
 import Reporter from './report.js';
 import {plainProblem} from './plain.js';
+import * as Group from './group.js';
+import {chooseGroup} from './groupDialog.js';
 
 const IFACE = `<node>
   <interface name="dev.luch.Luch1">
@@ -42,6 +44,9 @@ const IFACE = `<node>
     <method name="DirectOffers"><arg type="s" direction="out"/></method>
     <method name="Report"><arg name="text" type="s" direction="in"/><arg name="keep_names" type="b" direction="in"/><arg type="s" direction="out"/></method>
     <method name="SendReport"><arg name="path" type="s" direction="in"/><arg type="s" direction="out"/></method>
+    <method name="MirrorGroup"><arg name="ids" type="as" direction="in"/><arg name="roles" type="as" direction="in"/><arg name="source" type="s" direction="in"/><arg name="mode" type="s" direction="in"/></method>
+    <method name="AddToGroup"><arg name="member" type="s" direction="in"/><arg name="id" type="s" direction="in"/><arg name="role" type="s" direction="in"/></method>
+    <method name="RemoveFromGroup"><arg name="id" type="s" direction="in"/></method>
     <property name="WebUrl" type="s" access="read"/>
     <property name="Quiet" type="s" access="readwrite"/>
     <signal name="ReceiversChanged"/>
@@ -57,6 +62,7 @@ let ICON = null; // Gio.Icon from the extension dir, set in enable()
 
 // ponytail: two-language table instead of gettext; switch to gettext when a third language arrives.
 const RU = GLib.get_language_names().some(l => l.startsWith('ru'));
+const G = Group.words(RU); // the words of showing on several TVs (group.js)
 const T = RU ? {
     title: 'Луч',
     header: 'Показ экрана на ТВ',
@@ -467,6 +473,8 @@ class LuchToggle extends QuickMenuToggle {
         this._finding = null; // what the discovery ladder is trying, from FindProgress
         this._direct = {offers: [], leaves: null}; // TVs that offer a direct connection (DirectOffers)
         this._directState = {step: 'idle'}; // where a direct connection stands (DirectChanged)
+        this._group = null; // the group playing (Stats' group part), null when none
+        this._delayItem = null; // its "how far behind" line, refreshed every second
 
         this.menu.setHeader(ICON, T.title, T.header);
         this._section = new PopupMenu.PopupMenuSection();
@@ -599,6 +607,13 @@ class LuchToggle extends QuickMenuToggle {
         } catch (e) {
             this._direct = {offers: [], leaves: null}; // an older luchd
         }
+        this._group = null;
+        const playing = this._mirroring[0];
+        if (playing) {
+            try {
+                this._group = Group.groupOf((await this._proxy.StatsAsync(playing[0]))[0]);
+            } catch (e) {}
+        }
         try {
             const [json] = await this._proxy.KnownAsync();
             this._asleep = JSON.parse(json)
@@ -616,8 +631,18 @@ class LuchToggle extends QuickMenuToggle {
         this._onMirroringChanged(this.checked);
 
         this._section.removeAll();
-        // What is happening now comes first, with the way to stop it: no submenu to open for that.
-        for (const [id, name] of mirroring) {
+        this._delayItem = null;
+        const group = this._group;
+        const inGroup = id => group?.members.some(m => m.id === id) ?? false;
+        // What is happening now comes first, with the way to stop it: no submenu to open for that. A group stops
+        // as one.
+        if (group) {
+            const item = new PopupMenu.PopupImageMenuItem(G.stopAll, 'media-playback-stop-symbolic');
+            const [one] = group.members;
+            item.connect('activate', () => this._proxy.StopMirrorAsync(one.id).catch(e => tell(T.failed(one.name), e)));
+            this._section.addMenuItem(item);
+        }
+        for (const [id, name] of mirroring.filter(r => !inGroup(r[0]))) {
             const item = new PopupMenu.PopupImageMenuItem(T.stopOn(name), 'media-playback-stop-symbolic');
             item.connect('activate', () => this._proxy.StopMirrorAsync(id).catch(e => tell(T.failed(name), e)));
             this._section.addMenuItem(item);
@@ -662,8 +687,12 @@ class LuchToggle extends QuickMenuToggle {
                 sub.icon.gicon = ICON;
             sub.label.text = [name, model, isMirroring ? T.mirroringNow : ''].filter(Boolean).join(' · ');
             const add = (label, fn) => sub.menu.addAction(label, this._guarded(id, name, fn));
-            if (isMirroring) {
+            if (isMirroring && inGroup(id)) {
+                add(G.leave, () => this._proxy.RemoveFromGroupAsync(id));
+            } else if (isMirroring) {
                 add(T.stop, () => this._proxy.StopMirrorAsync(id));
+            } else if (group && Group.candidates([[id]]).length > 0) {
+                add(G.addTo, () => this._proxy.AddToGroupAsync(group.members[0].id, id, ''));
             } else if (!isTv(id)) {
                 add(T.fast, () => this._mirror(id, 'fast'));
                 add(T.monitor, () => this._mirror(id, 'monitor'));
@@ -707,6 +736,8 @@ class LuchToggle extends QuickMenuToggle {
             item.connect('activate', () => this._wake(id));
             this._section.addMenuItem(item);
         }
+
+        this._renderGroup(group);
 
         // The settings and the rarely used, out of the way: do not disturb, and the web receiver's address.
         const mode = this._proxy?.Quiet;
@@ -754,11 +785,46 @@ class LuchToggle extends QuickMenuToggle {
 
         if (mirroring.length > 0) {
             this.subtitle = mirroring[0][1];
-            this._startStats(mirroring[0][0]);
+            this._startStats();
         } else {
             this._stopStats();
             this.subtitle = note ?? (this._rows.length === 1 ? this._rows[0][1] : T.receivers(this._rows.length));
         }
+    }
+
+    // Several TVs at once: while a group plays, who is in it with Remove, how far behind it is, and Add for the
+    // others; else the one entry to start one.
+    _renderGroup(group) {
+        if (!group) {
+            const can = Group.candidates(this._rows);
+            if (can.length >= 2)
+                this._section.addAction(G.entry, () => this._startGroup(can));
+            return;
+        }
+        const sub = new PopupMenu.PopupSubMenuMenuItem(Group.title(group, G), true);
+        sub.icon.icon_name = 'media-playback-start-symbolic';
+        this._delayItem = new PopupMenu.PopupMenuItem(Group.delayLine(group, G), {reactive: false});
+        sub.menu.addMenuItem(this._delayItem);
+        const names = new Map(this._rows.map(r => [r[0], r[1]]));
+        for (const [id, label] of Group.removals(group, G))
+            sub.menu.addAction(label, this._guarded(id, names.get(id) ?? id, () => this._proxy.RemoveFromGroupAsync(id)));
+        const others = Group.addable(this._rows, group);
+        if (others.length > 0)
+            sub.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+        for (const [id, name] of others) {
+            sub.menu.addAction(G.add(name),
+                this._guarded(id, name, () => this._proxy.AddToGroupAsync(group.members[0].id, id, '')));
+        }
+        this._section.addMenuItem(sub);
+    }
+
+    async _startGroup(receivers) {
+        const p = await chooseGroup(receivers, G);
+        if (!p)
+            return;
+        const [first] = receivers.filter(r => r[0] === p.ids[0]);
+        this._guarded(p.ids[0], first?.[1] ?? T.title,
+            () => this._proxy.MirrorGroupAsync(p.ids, p.roles, p.source, p.mode))();
     }
 
     async _wake(id) {
@@ -815,15 +881,28 @@ class LuchToggle extends QuickMenuToggle {
             this.menu.open();
     }
 
-    _startStats(id) {
+    _startStats() {
         if (this._statsTimer)
             return;
         this._statsTimer = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 1, () => {
+            // Whoever plays now: in a group, the first one may have left it meanwhile.
+            const id = this._mirroring[0]?.[0];
+            if (!id || !this._proxy)
+                return GLib.SOURCE_CONTINUE;
             this._proxy.StatsAsync(id).then(([json]) => {
                 const s = JSON.parse(json);
                 const name = this._mirroring[0]?.[1] ?? '';
                 if (s.est_ms)
                     this.subtitle = `${name} · ≈${Math.round(s.est_ms)} ms`;
+                // A group's members come and go: the menu follows; its delay line follows every second.
+                const g = Group.groupOf(s);
+                if (!Group.sameMembers(g, this._group)) {
+                    this._group = g;
+                    this._render(null);
+                } else if (g) {
+                    this._group = g;
+                    this._delayItem?.label.set_text(Group.delayLine(g, G));
+                }
             }).catch(() => {});
             return GLib.SOURCE_CONTINUE;
         });

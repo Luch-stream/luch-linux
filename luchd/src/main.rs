@@ -671,7 +671,10 @@ impl Luch {
             let m = group_member(&s, &id, role)?;
             // Busy from now on: a second join of it, or a session of its own, is refused meanwhile.
             if s.mirrors.contains_key(&id) {
-                return Err(fdo::Error::Failed(format!("{} is busy", m.who.name)));
+                return Err(fdo::Error::Failed(format!(
+                    "{} is playing already: stop it first",
+                    m.who.name
+                )));
             }
             s.mirrors.insert(id.clone(), ctl.clone());
             let (tx, rx) = tokio::sync::oneshot::channel();
