@@ -9,11 +9,11 @@
     ? { cast: "На ТВ", on: "Играет на", stop: "Остановить", speed: "Скорость", sound: "Звук", subs: "Субтитры",
         off: "Выкл.", choose: "Куда показать?", relay: "ТВ не смог открыть ссылку сам — идёт через этот компьютер",
         loading: "Загрузка…", paused: "Пауза", ended: "Закончилось", quality: "Качество", best: "лучшее для ТВ",
-        failed: "ТВ не смог это воспроизвести" }
+        failed: "ТВ не смог это воспроизвести", app: "Открыто в приложении YouTube на" }
     : { cast: "To TV", on: "Playing on", stop: "Stop", speed: "Speed", sound: "Sound", subs: "Subtitles",
         off: "Off", choose: "Show it where?", relay: "The TV could not open the link itself: it goes through this computer",
         loading: "Loading…", paused: "Paused", ended: "Ended", quality: "Quality", best: "best for the TV",
-        failed: "The TV could not play it" };
+        failed: "The TV could not play it", app: "Opened in the YouTube app on" };
   const RATES = [0.5, 0.75, 1, 1.25, 1.5, 1.75, 2];
 
   const send = (msg) => new Promise((res) => B.runtime.sendMessage(msg, (r) => res(r || { ok: false, error: "no answer" })));
@@ -102,7 +102,15 @@
     const r = v.getBoundingClientRect();
     return { area: r.width * r.height, playing: !v.paused && !v.ended && v.readyState > 2, muted: v.muted || v.volume === 0 };
   }
+  // A YouTube player embedded in a page shows its picture before its video element has a place: the whole frame
+  // is its video, and the TV's YouTube app plays it.
+  const youtubeEmbed = window !== window.top && !!LuchCore.youtubeLink(location.href);
+  function rectOf(v) {
+    return youtubeEmbed ? { top: 0, left: 0, right: innerWidth, bottom: innerHeight, width: innerWidth, height: innerHeight }
+      : v.getBoundingClientRect();
+  }
   function videoAt(x, y) {
+    if (youtubeEmbed) return videos()[0] || null;
     for (const v of videos()) {
       const r = v.getBoundingClientRect();
       if (r.width > 160 && r.height > 90 && x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) return v;
@@ -122,7 +130,7 @@
       btn.style.display = "none";
       return;
     }
-    const r = hovered.getBoundingClientRect();
+    const r = rectOf(hovered);
     btn.style.display = "flex";
     btn.style.top = `${Math.max(4, r.top + 10)}px`;
     btn.style.left = `${Math.max(4, r.right - btn.offsetWidth - 10)}px`;
@@ -136,6 +144,7 @@
         audio: v.tagName === "AUDIO" },
       page: {
         title: document.title, pageUrl: location.href, userAgent: navigator.userAgent, currentTime: v.currentTime,
+        lang: navigator.language,
         // A video the page never started (an iframe player waiting for its first click) plays on the TV; one paused
         // part way stays paused there too.
         paused: v.paused && v.played.length > 0 && v.currentTime > 0, playbackRate: v.playbackRate, poster: v.poster,
@@ -153,6 +162,7 @@
     const r = await send(Object.assign({ op: "cast", receiver }, describe(v)));
     if (!r.ok) return toast(r.error);
     if (r.choose) return chooseThen(v, r.choose);
+    if (r.app) return toast(`${T.app} ${r.name}`);
     start(v, r.receiver, r.name);
     cast.src = r.url;
     qualities(r.qualities || []);

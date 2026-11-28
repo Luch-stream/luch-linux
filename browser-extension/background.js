@@ -129,9 +129,10 @@ function onHostMessage(m) {
   else w.resolve(m.ok);
 }
 
-function toTab(tabId, msg) {
+/** To the frame that cast (every frame would show the same note otherwise). */
+function toTab(tabId, msg, frameId) {
   if (tabId == null) return;
-  B.tabs.sendMessage(tabId, msg).catch(() => {});
+  B.tabs.sendMessage(tabId, msg, frameId == null ? {} : { frameId }).catch(() => {});
 }
 
 async function onState(receiver, state) {
@@ -142,16 +143,16 @@ async function onState(receiver, state) {
     // The TV could not fetch it (a VPN, a login): this computer passes it on instead, from the same moment.
     c.retried = true;
     c.via = "sender";
-    toTab(c.tabId, { luch: "note", text: "relay" });
+    toTab(c.tabId, { luch: "note", text: "relay" }, c.frameId);
     const options = LuchCore.castOptions(Object.assign({}, c.request, { via: "sender", cookie: await cookieFor(c.request.url) }));
     try {
       await ask("cast", { receiver, items: [c.request.url], options });
     } catch (e) {
-      toTab(c.tabId, { luch: "error", text: e.message });
+      toTab(c.tabId, { luch: "error", text: e.message }, c.frameId);
     }
     return;
   }
-  toTab(c.tabId, { luch: "state", receiver, state, at: Date.now() });
+  toTab(c.tabId, { luch: "state", receiver, state, at: Date.now() }, c.frameId);
   if (state.state === "stopped") casts.delete(receiver);
 }
 
@@ -181,8 +182,23 @@ async function castFromTab(tabId, frameId, frameUrl, req) {
   const list = await receivers();
   const receiver = req.receiver || (await chosenReceiver(list));
   if (!receiver) return { choose: list };
+  const yt = LuchCore.youtubeLink(frameUrl || (req.page && req.page.pageUrl));
+  if (yt) {
+    // The TV's own YouTube app, from the same moment; the page's player stays as it is.
+    const start = Math.floor((req.page && req.page.currentTime) || 0);
+    await ask("cast", { receiver, items: [yt], options: { start, title: (req.page && req.page.title) || "" } });
+    await B.storage.local.set({ receiver });
+    const name = (list.find((r) => r.id === receiver) || {}).name || "TV";
+    return { receiver, name, app: "youtube" };
+  }
   const src = LuchCore.pickSource(req.video, seen.get(tabId), frameId);
-  if (!src) throw new Error("no link to this video (it may be protected)");
+  if (!src) {
+    // A player that has not started yet loads nothing (most iframe players wait for their first click).
+    if (!req.video.currentSrc) throw new Error(req.page && /^ru/i.test(req.page.lang || "")
+      ? "Видео ещё не загрузилось: запустите его на странице и нажмите снова"
+      : "The video has not loaded yet: start it on the page, then send it again");
+    throw new Error("no link to this video (it may be protected)");
+  }
   const { relay, trusted = [] } = await B.storage.local.get(["relay", "trusted"]);
   const via = LuchCore.chooseVia(src.url, relay);
   const trust = trusted.includes(receiver);
@@ -193,7 +209,7 @@ async function castFromTab(tabId, frameId, frameUrl, req) {
   const cookie = via === "sender" || trust ? await cookieFor(src.url) : "";
   const options = LuchCore.castOptions(Object.assign({}, request, { cookie }));
   if (sources.length > 1) options.sources = sources;
-  casts.set(receiver, { tabId, frameUrl, via, request, sources, state: null, retried: false });
+  casts.set(receiver, { tabId, frameId, frameUrl, via, request, sources, state: null, retried: false });
   await ask("cast", { receiver, items: [src.url], options });
   await B.storage.local.set({ receiver });
   const name = (list.find((r) => r.id === receiver) || {}).name || "TV";
@@ -270,7 +286,11 @@ B.runtime.onMessage.addListener((msg, sender, reply) => {
         return {};
       case "active": {
         // Only the frame that cast, reloaded: another page in the tab (the next episode) starts afresh.
-        for (const [receiver, c] of casts) if (c.tabId === tabId && c.frameUrl === sender.url) return { receiver, state: c.state };
+        for (const [receiver, c] of casts) {
+          if (c.tabId !== tabId || c.frameUrl !== sender.url) continue;
+          c.frameId = sender.frameId; // a reloaded iframe has a new one
+          return { receiver, state: c.state };
+        }
         return {};
       }
       case "seen":

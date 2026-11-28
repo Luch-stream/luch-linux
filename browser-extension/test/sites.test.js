@@ -120,3 +120,49 @@ test("'send this page's video' means the video with its sound on, else the bigge
   assert.equal(c.chooseVideo([{ area: 120 * 68, playing: true, muted: false }, null]), -1);
   assert.equal(c.chooseVideo([]), -1);
 });
+
+test("a live DASH stream's numbered pieces next to its manifest are not files (1tv's)", () => {
+  const dir = "https://edge.tv.example/dash-live2/streams/ch-dvr/";
+  const seen = [
+    { url: dir + "chdash.mpd?e=1", kind: "dash", frameId: 3 },
+    { url: dir + "chdash1-12hFrag-hd-audio-lowres-20260917T112934init.mp4", kind: "file", frameId: 3 },
+    { url: dir + "chdash1-12hFrag-hd-1-20260917T112934_001236492.mp4", kind: "file", frameId: 3 },
+  ];
+  assert.equal(c.pickSource(blob("static.tv.example"), seen, 3).kind, "dash");
+  // A whole file whose name ends in a long number, elsewhere, still counts (euronews' own <video>).
+  const own = { currentSrc: "https://video.news.example/mp4/SHD/62/SHD_PYR_6242280_20261127211550.mp4", src: "", sources: [] };
+  assert.equal(c.pickSource(own, seen).kind, "file");
+});
+
+test("YouTube pages and embeds open the TV's YouTube app", () => {
+  const id = "aqz-KE-bpKQ";
+  for (const u of [`https://www.youtube.com/watch?v=${id}&t=42`, `https://www.youtube.com/embed/${id}?feature=oembed&autoplay=1`,
+    `https://youtu.be/${id}`, `https://m.youtube.com/shorts/${id}`, `https://www.youtube-nocookie.com/embed/${id}`]) {
+    assert.equal(c.youtubeLink(u), `https://www.youtube.com/watch?v=${id}`, u);
+  }
+  for (const u of ["https://www.youtube.com/", "https://www.youtube.com/@channel", "https://notyoutube.example/watch?v=aqz-KE-bpKQ",
+    "https://www.youtube.com/embed/<script>"]) {
+    assert.equal(c.youtubeLink(u), null, u);
+  }
+});
+
+test("a DASH stream's whole-track files in folders under its manifest are pieces too (CNN's)", () => {
+  const base = "https://media.news.example/global/cdb0f1e8/";
+  const seen = [
+    { url: base + "dash.mpd?manifest-params=r1", kind: "dash" },
+    { url: base + "v/3_0171f8/v2.mp4", kind: "file", type: "video/mp4" },
+    { url: base + "a/3_fafe45/a0.mp4", kind: "file", type: "video/mp4" },
+  ];
+  assert.equal(c.pickSource(blob("news.example"), seen).kind, "dash");
+  assert.equal(c.isSegment(base + "v/3_0171f8/v2.mp4?CMCD=br%3D271%2Ccid%3D%22x%22"), true);
+  // A manifest at a host's root does not make every file there a piece.
+  const root = [{ url: "https://cdn.example/live.m3u8", kind: "hls" }, { url: "https://cdn.example/films/a.mp4", kind: "file" }];
+  assert.equal(c.pickSource(blob("x.example"), root.slice(1).concat([{ url: "https://cdn.example/d.mpd", kind: "dash" }])).kind, "file");
+});
+
+test("a '.m3u8' that answers with XML is an ad schedule, not a playlist (Dailymotion's VMAP)", () => {
+  assert.equal(c.kindOf("https://ads.example/cdn/manifest/video/x1.m3u8?af=2", "application/xml"), null);
+  assert.equal(c.kindOf("https://cdn.example/a.m3u8", "text/html; charset=utf-8"), null);
+  assert.equal(c.kindOf("https://cdn.example/a.m3u8", "text/plain"), "hls");
+  assert.equal(c.kindOf("https://cdn.example/a.m3u8"), "hls");
+});

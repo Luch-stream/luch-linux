@@ -35,6 +35,9 @@
     if (!/^https?:/i.test(url || "")) return null;
     const c = (contentType || "").toLowerCase().split(";")[0].trim();
     const ext = extension(url);
+    // A link named like a playlist that answered with a page or a document is something else (Dailymotion's ad
+    // schedule, VMAP XML, behind a ".m3u8").
+    if (/^(text\/html|application\/(xml|json)|text\/xml)/.test(c)) return null;
     if (c.includes("mpegurl") || ext === "m3u8") return "hls";
     if (c === "application/dash+xml" || ext === "mpd") return "dash";
     if (FILE_TYPES[ext] || /^(video|audio)\//.test(c)) return "file";
@@ -99,10 +102,43 @@
     if (/(^|[-_])(seg|segment|chunk|frag|fragment)[-_]?\d+[^/]*\.(mp4|m4v|m4a|webm)$/.test(name)) return true;
     try {
       const q = new URL(url).searchParams;
-      return ["bytes", "range"].some((k) => /^\d+-\d*$/.test(q.get(k) || ""));
+      // CMCD: the data a DASH or HLS player adds to every piece it asks for (CTA-5004).
+      return ["bytes", "range"].some((k) => /^\d+-\d*$/.test(q.get(k) || "")) || q.has("CMCD");
     } catch (e) {
       return false;
     }
+  }
+
+  /** The link's origin and folder: "https://cdn.example/a/b/" for "https://cdn.example/a/b/c.mp4?x". */
+  function dirOf(url) {
+    try {
+      const u = new URL(url);
+      return u.origin + u.pathname.slice(0, u.pathname.lastIndexOf("/") + 1);
+    } catch (e) {
+      return "";
+    }
+  }
+
+  /**
+   * A YouTube video's link in the form both senders open in the TV's own YouTube app, from a watch, shorts, embed
+   * or youtu.be page; null for anything else. The site hides its streams from a page's video element.
+   */
+  function youtubeLink(pageUrl) {
+    let u;
+    try {
+      u = new URL(pageUrl);
+    } catch (e) {
+      return null;
+    }
+    const host = u.hostname.replace(/^(www|m|music)\./, "");
+    const parts = u.pathname.split("/").filter(Boolean);
+    let id = null;
+    if (host === "youtu.be") id = parts[0];
+    else if (host === "youtube.com" || host === "youtube-nocookie.com") {
+      if (parts[0] === "watch") id = u.searchParams.get("v");
+      else if (["embed", "shorts", "live", "v"].includes(parts[0])) id = parts[1];
+    }
+    return id && /^[\w-]{6,20}$/.test(id) ? `https://www.youtube.com/watch?v=${id}` : null;
   }
 
   /**
@@ -131,7 +167,10 @@
       return { url: master.url, kind: "hls", mime: MIME.hls };
     }
     const isVideo = !(video && video.audio);
-    const files = list.filter((s) => s.kind === "file" && !isSegment(s.url)
+    // A file next to a playlist the page loaded, or in a folder under it, is one of its pieces, whatever its name (a
+    // live DASH stream's "…_001236492.mp4", a DASH track's "v/3_0171f8/v2.mp4").
+    const dirs = list.filter((s) => s.kind !== "file").map((s) => dirOf(s.url)).filter((d) => !/^[^/]+\/\/[^/]+\/$/.test(d));
+    const files = list.filter((s) => s.kind === "file" && !isSegment(s.url) && !dirs.some((d) => dirOf(s.url).startsWith(d))
       && !(isVideo && /^audio\//.test(mimeOf(s.url, "file", s.type))));
     if (files.length) {
       const f = files[files.length - 1];
@@ -298,7 +337,7 @@
     return /\.(vtt|srt|ass|ssa)(\?|$)/i.test(pathOf(url)) || c.includes("text/vtt") || c.includes("subrip");
   }
 
-  const api = { isSegment, mediaElements, chooseVideo, qualityOf, variantLinks, sourcesOf, isSubtitle, kindOf, mimeOf, isPrivateHost, chooseVia, pickSource, castOptions, shouldRetryRelayed, clock,
+  const api = { youtubeLink, isSegment, mediaElements, chooseVideo, qualityOf, variantLinks, sourcesOf, isSubtitle, kindOf, mimeOf, isPrivateHost, chooseVia, pickSource, castOptions, shouldRetryRelayed, clock,
     positionNow, MIME };
   if (typeof module !== "undefined" && module.exports) module.exports = api;
   else root.LuchCore = api;

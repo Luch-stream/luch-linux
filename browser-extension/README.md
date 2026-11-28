@@ -43,12 +43,19 @@ How the video gets to the TV:
 
 - A `<video>` with its own link: MP4, WebM and the like.
 - Players that stream with HLS: the playlist the page loaded is cast, so the TV picks its own quality.
-- DASH (`.mpd`) is found, but Android receivers cannot play it yet.
+- Players in an iframe (Kodik, Playerjs and the like on film and anime sites): what that frame loaded is cast,
+  not the teaser or ad playing in another one. Most of them load nothing before their first click: start the video
+  on the page, then send it.
+- Players built as web components (VK Video): their video is found inside the component.
+- YouTube, on its own pages and embedded in others: the TV's own YouTube app opens the video, from the same moment.
+- DASH (`.mpd`, VK Video, ok.ru, CNN, BBC) is found, but the Luch receiver cannot play it yet (a Chromecast can).
+  Nor can it play HLS whose pieces are fragmented MP4 instead of MPEG-TS (Dailymotion's).
 - Sites with DRM (Netflix and the like) cannot be cast this way.
-- On YouTube the player hides its links. Opening the TV's own YouTube app instead is planned.
 
 ## Tests
 
-`node --test browser-extension/test/*.test.js` checks the decisions (`core.js`) and the two manifests.
+`node --test browser-extension/test/*.test.js` checks the decisions (`core.js`) and the two manifests;
+`test/sites.test.js` holds the player structures met on real sites (which frame loaded what, shadow roots, segment
+names), as small made-up fixtures.
 `browser-extension/test/host_e2e.py <receiver id>` runs the native host the way a browser does, against a running
 luchd and a real TV.
