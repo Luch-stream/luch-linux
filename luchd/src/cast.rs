@@ -43,6 +43,12 @@ pub enum Item {
         url: String,
         headers: Vec<(String, String)>,
     },
+    /// A folder at the origin: our link's path after the token is fetched from under `base` (a DASH manifest's
+    /// pieces, whose names the player makes from templates).
+    RelayFolder {
+        base: String,
+        headers: Vec<(String, String)>,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -105,8 +111,18 @@ impl Server {
         self.port
     }
 
-    /// Makes `item` fetchable by `client`; returns its token.
+    /// Makes `item` fetchable by `client`; returns its token. A folder already shared with the client keeps its
+    /// token (a live manifest names the same ones every few seconds).
     pub fn share(&self, item: Item, client: IpAddr, mime: &str) -> String {
+        if matches!(item, Item::RelayFolder { .. }) {
+            let shared = self.shared.lock().unwrap();
+            if let Some((t, _)) = shared
+                .iter()
+                .find(|(_, e)| e.item == item && e.client == client)
+            {
+                return t.clone();
+            }
+        }
         let token = uuid::Uuid::new_v4().simple().to_string();
         self.shared.lock().unwrap().insert(
             token.clone(),
@@ -235,6 +251,14 @@ impl Server {
                     self.relay(&mut wr, url, headers, &req, entry.client, local, &extra)
                         .await?
                 }
+                Item::RelayFolder { base, headers } => {
+                    // "/<token>/<path under the folder>?<query>"
+                    let rest = req.path.trim_start_matches('/');
+                    let rest = rest.split_once('/').map(|(_, r)| r).unwrap_or("");
+                    let url = format!("{base}{rest}");
+                    self.relay(&mut wr, &url, headers, &req, entry.client, local, &extra)
+                        .await?
+                }
             };
             if !keep || req.close {
                 return Ok(());
@@ -277,6 +301,29 @@ impl Server {
             .and_then(|v| v.to_str().ok())
             .unwrap_or("")
             .to_string();
+        if is_dash(&final_url, &ctype) && status < 300 {
+            let body = res.bytes().await.map_err(io::Error::other)?;
+            let Some(body) = playlist_text(&body, false) else {
+                respond(wr, 502, &[], b"").await?;
+                return Ok(true);
+            };
+            let text = String::from_utf8_lossy(&body);
+            let out = rewrite_mpd(&text, &final_url, |dir| {
+                let t = self.share(
+                    Item::RelayFolder {
+                        base: dir.to_string(),
+                        headers: headers.to_vec(),
+                    },
+                    client,
+                    "",
+                );
+                format!("http://{}/{t}/", SocketAddr::new(local, self.port))
+            });
+            let mut h: Vec<(&str, &str)> = vec![("Content-Type", "application/dash+xml")];
+            h.extend(extra.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+            respond(wr, 200, &h, if req.head { b"" } else { out.as_bytes() }).await?;
+            return Ok(true);
+        }
         if is_playlist(&final_url, &ctype) && status < 300 {
             let gzip = res
                 .headers()
@@ -628,6 +675,97 @@ pub fn is_playlist(url: &str, ctype: &str) -> bool {
             .unwrap_or("")
             .to_ascii_lowercase()
             .ends_with(".m3u8")
+}
+
+pub fn is_dash(url: &str, ctype: &str) -> bool {
+    ctype.to_ascii_lowercase().contains("dash+xml")
+        || url
+            .split(['?', '#'])
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .ends_with(".mpd")
+}
+
+/// `url` cut where a folder ends: after the last "/" ahead of any template ("$Number$", filled in by the player, so
+/// it must stay out of a shared folder's fixed part) or query. Returns (folder ending in "/", the rest).
+fn split_folder(url: &str) -> (&str, &str) {
+    let head = url.find(['$', '?']).unwrap_or(url.len());
+    match url[..head].rfind('/') {
+        Some(i) => url.split_at(i + 1),
+        None => (url, ""),
+    }
+}
+
+/// A DASH manifest at `base` with its links made ours (the Mac's Dash.swift does the same): absolute BaseURLs,
+/// Locations and piece links (`media`, `initialization`, `sourceURL`, `index`) through `folder` (an origin folder →
+/// our link for it, ending in "/"), a relative BaseURL at the top made absolute first, and a BaseURL of the
+/// manifest's own folder added when there is none at the top. Nested relative bases follow the one above them.
+pub fn rewrite_mpd(text: &str, base: &str, mut folder: impl FnMut(&str) -> String) -> String {
+    let mut ours = |link: &str| {
+        let abs = resolve(base, link);
+        let (dir, rest) = split_folder(&abs);
+        format!("{}{rest}", folder(dir))
+    };
+    let mut out = text.to_string();
+    let period = out.find("<Period");
+    let mut top_base = false;
+    for tag in ["BaseURL", "Location"] {
+        let mut from = 0;
+        while let Some(i) = out[from..].find(&format!("<{tag}")) {
+            let open = from + i;
+            let Some(gt) = out[open..].find('>').map(|g| open + g) else {
+                break;
+            };
+            let Some(close) = out[gt..].find(&format!("</{tag}>")).map(|c| gt + c) else {
+                break;
+            };
+            let value = out[gt + 1..close].trim().to_string();
+            let top = match period {
+                Some(p) => open < p,
+                None => true,
+            };
+            if tag == "BaseURL" && top {
+                top_base = true;
+            }
+            let absolute = value.contains("://") || value.starts_with("//");
+            let mut next = close;
+            if !value.is_empty() && (absolute || top) {
+                let new = ours(&value);
+                out.replace_range(gt + 1..close, &new);
+                next = gt + 1 + new.len();
+            }
+            from = next;
+        }
+    }
+    for attr in ["media", "initialization", "sourceURL", "index"] {
+        let pat = format!(" {attr}=\"");
+        let mut from = 0;
+        while let Some(i) = out[from..].find(&pat) {
+            let s = from + i + pat.len();
+            let Some(e) = out[s..].find('"').map(|e| s + e) else {
+                break;
+            };
+            let value = out[s..e].to_string();
+            let mut next = e + 1;
+            if value.contains("://") || value.starts_with("//") {
+                let new = ours(&value);
+                out.replace_range(s..e, &new);
+                next = s + new.len() + 1;
+            }
+            from = next;
+        }
+    }
+    if !top_base {
+        if let Some(gt) = out
+            .find("<MPD")
+            .and_then(|m| out[m..].find('>').map(|g| m + g))
+        {
+            let own = folder(split_folder(base).0);
+            out.insert_str(gt + 1, &format!("<BaseURL>{own}</BaseURL>"));
+        }
+    }
+    out
 }
 
 /// `rel` resolved against `base` (enough of RFC 3986 for playlists: absolute, scheme-relative, root-relative, relative).
@@ -1289,6 +1427,9 @@ mod tests {
                     } else if path == "/v/index.m3u8" {
                         (200, "application/vnd.apple.mpegurl",
                          b"#EXTM3U\n#EXT-X-KEY:METHOD=AES-128,URI=\"key.bin\"\n#EXTINF:4,\nseg0.ts\n#EXTINF:4,\n/v/seg1.ts?x=1\n".to_vec())
+                    } else if path == "/v/clip.mpd" {
+                        (200, "application/dash+xml",
+                         b"<MPD type=\"static\"><Period><SegmentTemplate media=\"seg$Number$.m4s\" initialization=\"seg0.m4s\"/></Period></MPD>".to_vec())
                     } else if path == "/v/gz.m3u8" {
                         let mut gz = flate2::write::GzEncoder::new(
                             Vec::new(),
@@ -1372,6 +1513,38 @@ mod tests {
         assert!(text.starts_with("#EXTM3U\n"), "{text}");
         assert!(text.lines().nth(2).unwrap().starts_with(&ours), "{text}");
 
+        // A DASH manifest: its folder shared, a piece under it fetched from the origin's folder with the cookie.
+        let headers = vec![("Cookie".to_string(), "s=1".to_string())];
+        let dash = srv.share(
+            Item::Relay {
+                url: format!("http://{up}/v/clip.mpd"),
+                headers: headers.clone(),
+            },
+            me,
+            "",
+        );
+        let (code, _, body) = get(addr, &format!("/{dash}/clip.mpd"), None).await;
+        assert_eq!(code, 200);
+        let text = String::from_utf8(body).unwrap();
+        let base = text
+            .split("<BaseURL>")
+            .nth(1)
+            .and_then(|b| b.split("</BaseURL>").next())
+            .unwrap()
+            .to_string();
+        assert!(base.starts_with(&ours), "{text}");
+        assert!(
+            !text.contains(&up.to_string()),
+            "the origin leaks through: {text}"
+        );
+        let (code, _, body) =
+            get(addr, &format!("{}seg3.m4s", &base[ours.len() - 1..]), None).await;
+        assert_eq!(code, 200);
+        assert_eq!(String::from_utf8(body).unwrap(), "data /v/seg3.m4s ");
+        // Fetched anew (a live manifest), the folder keeps its token.
+        let (_, _, again) = get(addr, &format!("/{dash}/clip.mpd"), None).await;
+        assert!(String::from_utf8(again).unwrap().contains(&base));
+
         // Without the page's cookie the origin refuses, and that is passed on.
         let bare = srv.share(
             Item::Relay {
@@ -1383,6 +1556,42 @@ mod tests {
         );
         let (code, _, _) = get(addr, &format!("/{bare}/seg0.ts"), None).await;
         assert_eq!(code, 403);
+    }
+
+    /// The same manifests as the Mac's CastTests.testDashManifestsPointBackHere, so both senders agree.
+    #[test]
+    fn dash_manifests_point_back_here() {
+        let folder = |dir: &str| format!("http://192.168.1.2:47810/T[{dir}]/");
+        let plain = "<?xml version=\"1.0\"?>\n<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\" type=\"static\"><Period><AdaptationSet><Representation id=\"0\"><SegmentTemplate initialization=\"init-$RepresentationID$.m4s\" media=\"chunk-$RepresentationID$-$Number%05d$.m4s\"/></Representation></AdaptationSet></Period></MPD>";
+        let a = rewrite_mpd(plain, "https://cdn.example/v/1/clip.mpd?tok=9", folder);
+        assert!(a.contains("type=\"static\"><BaseURL>http://192.168.1.2:47810/T[https://cdn.example/v/1/]/</BaseURL><Period>"), "{a}");
+        assert!(
+            a.contains("media=\"chunk-$RepresentationID$-$Number%05d$.m4s\""),
+            "{a}"
+        );
+        let abs = "<MPD><BaseURL>https://media.example/a/</BaseURL><Period><AdaptationSet><BaseURL>audio/</BaseURL><SegmentTemplate media=\"https://seg.example/x/$RepresentationID$/$Number$.m4s\"/></AdaptationSet></Period></MPD>";
+        let b = rewrite_mpd(abs, "https://cdn.example/m.mpd", folder);
+        assert!(
+            b.contains(
+                "<MPD><BaseURL>http://192.168.1.2:47810/T[https://media.example/a/]/</BaseURL>"
+            ),
+            "{b}"
+        );
+        assert!(b.contains("<BaseURL>audio/</BaseURL>"), "{b}");
+        assert!(b.contains("media=\"http://192.168.1.2:47810/T[https://seg.example/x/]/$RepresentationID$/$Number$.m4s\""), "{b}");
+        assert_eq!(b.matches("<BaseURL>").count(), 2, "{b}");
+        let top = rewrite_mpd(
+            "<MPD><BaseURL>video/</BaseURL><Period/></MPD>",
+            "https://cdn.example/d/m.mpd",
+            folder,
+        );
+        assert_eq!(top, "<MPD><BaseURL>http://192.168.1.2:47810/T[https://cdn.example/d/video/]/</BaseURL><Period/></MPD>");
+        assert!(is_dash("https://x.example/a/m.mpd?x=1", ""));
+        assert!(is_dash("https://x.example/?id=1", "application/dash+xml"));
+        assert!(!is_dash(
+            "https://x.example/a.m3u8",
+            "application/vnd.apple.mpegurl"
+        ));
     }
 
     async fn raw(addr: SocketAddr, req: &str) -> String {

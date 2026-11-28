@@ -9,6 +9,8 @@ import Foundation
 public enum CastItem: Equatable {
     case file(URL)
     case relay(url: String, headers: [String: String])
+    /// A folder at the origin: our link's path after the token is fetched from under `base` (a DASH manifest's pieces).
+    case relayFolder(base: String, headers: [String: String])
 }
 
 public final class FileServer {
@@ -77,10 +79,15 @@ public final class FileServer {
         listenFD = -1
     }
 
-    /// Makes `item` fetchable by `client` (its IPv4 address); returns its token.
+    /// Makes `item` fetchable by `client` (its IPv4 address); returns its token. A folder already shared with the
+    /// client keeps its token (a live manifest names the same ones every few seconds).
     public func share(_ item: CastItem, client: String, mime: String) -> String {
         let token = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
         lock.lock()
+        if case .relayFolder = item, let (old, _) = shared.first(where: { $0.value.item == item && $0.value.client == client }) {
+            lock.unlock()
+            return old
+        }
         shared[token] = Entry(item: item, client: client, mime: mime)
         lock.unlock()
         return token
@@ -257,6 +264,10 @@ public final class FileServer {
             case .file(let url): keep = FileServer.sendFile(fd, url: url, mime: entry.mime, req: req, extra: extra)
             case .relay(let url, let headers):
                 keep = relay(fd, url: url, headers: headers, req: req, client: entry.client, extra: extra)
+            case .relayFolder(let base, let headers):
+                // "/<token>/<path under the folder>?<query>"
+                let rest = req.path.dropFirst(token.count + 2)
+                keep = relay(fd, url: base + rest, headers: headers, req: req, client: entry.client, extra: extra)
             }
             if !keep || req.close { return }
         }
@@ -371,6 +382,16 @@ public final class FileServer {
         task.resume()
         pipe.done.wait()
         if pipe.failed && !pipe.wroteHead { return FileServer.respond(fd, 502) }
+        if let manifest = pipe.manifest {
+            let me = localAddress(fd)
+            let base = pipe.finalURL ?? url
+            let out = Dash.rewrite(String(decoding: manifest, as: UTF8.self), base: base) { dir in
+                let t = self.share(.relayFolder(base: dir, headers: headers), client: client, mime: "")
+                return "http://\(me):\(self.port)/\(t)/"
+            }
+            return FileServer.respond(fd, 200, headers: [("Content-Type", "application/dash+xml")] + extra,
+                                      body: req.head ? Data() : Data(out.utf8))
+        }
         if let playlist = pipe.playlist {
             let me = localAddress(fd)
             let base = pipe.finalURL ?? url
@@ -396,6 +417,8 @@ final class RelayPipe: NSObject, URLSessionDataDelegate {
     var failed = false
     var keepAlive = true
     var playlist: Data?
+    /// A DASH manifest, kept whole like a playlist to be rewritten.
+    var manifest: Data?
     var finalURL: String?
 
     init(fd: Int32, head: Bool, extra: [(String, String)]) {
@@ -412,6 +435,11 @@ final class RelayPipe: NSObject, URLSessionDataDelegate {
         let type = (http?.value(forHTTPHeaderField: "Content-Type") ?? "").lowercased()
         if status < 300 && Playlist.isPlaylist(url: finalURL ?? "", contentType: type) {
             playlist = Data()
+            completionHandler(.allow)
+            return
+        }
+        if status < 300 && Dash.isManifest(url: finalURL ?? "", contentType: type) {
+            manifest = Data()
             completionHandler(.allow)
             return
         }
@@ -442,6 +470,11 @@ final class RelayPipe: NSObject, URLSessionDataDelegate {
         if playlist != nil {
             playlist!.append(data)
             if playlist!.count > 4 * 1024 * 1024 { failed = true; dataTask.cancel() }
+            return
+        }
+        if manifest != nil {
+            manifest!.append(data)
+            if manifest!.count > 4 * 1024 * 1024 { failed = true; dataTask.cancel() }
             return
         }
         if !FileServer.write(fd, data) {

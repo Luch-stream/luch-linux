@@ -108,6 +108,59 @@ final class CastTests: XCTestCase {
         XCTAssertEqual(String(decoding: body, as: UTF8.self), text)
     }
 
+    /// The same manifests as luchd's tests (cast.rs, rewrite_mpd), so both senders agree.
+    func testDashManifestsPointBackHere() {
+        let folder = { (dir: String) in "http://192.168.1.2:47810/T[" + dir + "]/" }
+        // Relative pieces only: a base of the manifest's own folder goes first.
+        let plain = "<?xml version=\"1.0\"?>\n<MPD xmlns=\"urn:mpeg:dash:schema:mpd:2011\" type=\"static\">"
+            + "<Period><AdaptationSet><Representation id=\"0\"><SegmentTemplate initialization=\"init-$RepresentationID$.m4s\" "
+            + "media=\"chunk-$RepresentationID$-$Number%05d$.m4s\"/></Representation></AdaptationSet></Period></MPD>"
+        let a = Dash.rewrite(plain, base: "https://cdn.example/v/1/clip.mpd?tok=9", folder: folder)
+        XCTAssertTrue(a.contains("type=\"static\"><BaseURL>http://192.168.1.2:47810/T[https://cdn.example/v/1/]/</BaseURL><Period>"), a)
+        XCTAssertTrue(a.contains("media=\"chunk-$RepresentationID$-$Number%05d$.m4s\""), a)
+        // Absolute links: each folder shared, templates kept out of it; nested relative bases left to follow.
+        let abs = "<MPD><BaseURL>https://media.example/a/</BaseURL><Period><AdaptationSet><BaseURL>audio/</BaseURL>"
+            + "<SegmentTemplate media=\"https://seg.example/x/$RepresentationID$/$Number$.m4s\"/></AdaptationSet></Period></MPD>"
+        let b = Dash.rewrite(abs, base: "https://cdn.example/m.mpd", folder: folder)
+        XCTAssertTrue(b.contains("<MPD><BaseURL>http://192.168.1.2:47810/T[https://media.example/a/]/</BaseURL>"), b)
+        XCTAssertTrue(b.contains("<BaseURL>audio/</BaseURL>"), b)
+        XCTAssertTrue(b.contains("media=\"http://192.168.1.2:47810/T[https://seg.example/x/]/$RepresentationID$/$Number$.m4s\""), b)
+        XCTAssertEqual(b.components(separatedBy: "<BaseURL>").count, 3, b)
+        // A relative base at the top would resolve against our own link: it is made absolute and ours too.
+        let top = Dash.rewrite("<MPD><BaseURL>video/</BaseURL><Period/></MPD>", base: "https://cdn.example/d/m.mpd", folder: folder)
+        XCTAssertEqual(top, "<MPD><BaseURL>http://192.168.1.2:47810/T[https://cdn.example/d/video/]/</BaseURL><Period/></MPD>")
+        XCTAssertTrue(Dash.isManifest(url: "https://x.example/a/m.mpd?x=1", contentType: ""))
+        XCTAssertTrue(Dash.isManifest(url: "https://x.example/?id=1", contentType: "application/dash+xml"))
+        XCTAssertFalse(Dash.isManifest(url: "https://x.example/a.m3u8", contentType: "application/vnd.apple.mpegurl"))
+    }
+
+    /// A relayed manifest's pieces come through this Mac too: its folder is shared, and a piece under it is fetched
+    /// from the origin's folder.
+    func testRelayedDashManifestFetchesItsPiecesHere() throws {
+        let origin = try server()
+        let piece = origin.share(.file(temp("chunk-1.m4s", Data("piece".utf8))), client: "127.0.0.1", mime: "video/mp4")
+        // Any path under the piece's token answers with it: a folder at the origin.
+        let mpd = "<MPD><BaseURL>http://127.0.0.1:\(origin.port)/\(piece)/</BaseURL><Period><SegmentTemplate "
+            + "media=\"chunk-$Number$.m4s\"/></Period></MPD>"
+        let mt = origin.share(.file(temp("clip.mpd", Data(mpd.utf8))), client: "127.0.0.1", mime: "application/dash+xml")
+        let relay = try server()
+        let rt = relay.share(.relay(url: origin.url(host: "127.0.0.1", token: mt, name: "clip.mpd"), headers: [:]),
+                             client: "127.0.0.1", mime: "")
+        let (code, headers, body) = get(relay.url(host: "127.0.0.1", token: rt, name: "clip.mpd"))
+        XCTAssertEqual(code, 200)
+        XCTAssertEqual(headers["content-type"], "application/dash+xml")
+        let text = String(decoding: body, as: UTF8.self)
+        let ours = "http://127.0.0.1:\(relay.port)/"
+        guard let start = text.range(of: "<BaseURL>"), let end = text.range(of: "</BaseURL>") else { return XCTFail(text) }
+        let folderLink = String(text[start.upperBound..<end.lowerBound])
+        XCTAssertTrue(folderLink.hasPrefix(ours), text)
+        XCTAssertFalse(text.contains(":\(origin.port)/"), "the origin leaks through: \(text)")
+        XCTAssertEqual(String(decoding: get(folderLink + "chunk-1.m4s").2, as: UTF8.self), "piece")
+        // The same folder again (a live manifest fetched anew) keeps its token.
+        let again = String(decoding: get(relay.url(host: "127.0.0.1", token: rt, name: "clip.mpd")).2, as: UTF8.self)
+        XCTAssertTrue(again.contains(folderLink), again)
+    }
+
     func testPlaylistLinksResolve() {
         let b = "https://cdn.example/a/b/index.m3u8?t=1"
         XCTAssertEqual(Playlist.resolve(base: b, "seg.ts"), "https://cdn.example/a/b/seg.ts")

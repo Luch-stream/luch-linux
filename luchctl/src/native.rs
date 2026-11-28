@@ -1,7 +1,8 @@
 //! `luchctl native-host`: the browser extension's way to luchd (Chrome and Firefox native messaging). The browser
 //! starts it and speaks over stdin/stdout, each message a 4-byte native-endian length and then JSON.
 //!
-//! In:  {"id":1,"op":"receivers"}                         → {"id":1,"ok":[{"id","name","model","connected","kind"}]}
+//! In:  {"id":1,"op":"receivers"}                         → {"id":1,"ok":[{"id","name","model","connected","kind",
+//!                                                             "media_types"}]}
 //!      {"id":2,"op":"cast","receiver":R,"items":[url],"options":{...Cast options}} → {"id":2,"ok":"media"}
 //!      {"id":3,"op":"cmd","receiver":R,"cmd":{"do":"pause"}} → {"id":3,"ok":true}
 //!      {"id":4,"op":"state","receiver":R}                → {"id":4,"ok":{media_state or {}}}
@@ -79,9 +80,12 @@ pub async fn handle(p: &Luch1Proxy<'_>, req: &Value) -> Result<Value, String> {
                     .map(|m| json!(m.iter().any(|x| x == "media")))
                     .unwrap_or(Value::Null);
                 let kind = crate::kind_of(&id);
+                // What its media plays (DASH or not), from the same welcome.
+                let types = w["media_types"].clone();
                 list.push(
                     json!({"id": id, "name": name, "model": model, "connected": connected,
-                                 "mirroring": mirroring, "media": media, "kind": kind}),
+                                 "mirroring": mirroring, "media": media, "kind": kind,
+                                 "media_types": types}),
                 );
             }
             Ok(Value::Array(list))
